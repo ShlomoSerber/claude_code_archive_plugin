@@ -20,7 +20,10 @@ import { BugError } from './errors.ts';
  * is not: it is what `.` and `..` start with, and those are the values that
  * escape the directory.
  */
-const SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+// 254 total: Claude Code truncates an encoded directory at 200 characters and
+// then appends a hash, and most filesystems cap a single name at 255 bytes.
+// A shorter cap here silently excluded whole projects from the archive.
+const SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,253}$/;
 
 export function isSafePathSegment(value: string): boolean {
   if (!SAFE_SEGMENT.test(value)) return false;

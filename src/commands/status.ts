@@ -27,6 +27,7 @@ export async function runStatus(
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const signedIn = await runtime.tokenStore
     .read()
     .then((tokens) => tokens !== null)
@@ -51,6 +52,7 @@ export async function runStatus(
       config: runtime.config,
       cleanupPeriodDays,
       competingCleanupSettings: competing,
+      unarchivable: skipped,
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -95,6 +97,10 @@ export async function runStatus(
   print(`  Data directory:     ${runtime.paths.dataDir}`);
   print(`  Log:                ${runtime.paths.logFile}`);
 
+  if (skipped > 0) {
+    print(`  WARNING:            ${String(skipped)} project(s) or session(s) cannot be archived`);
+    print(`                      Their names are unusable as paths; see the log.`);
+  }
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
     print(`                      That file outranks the one this plugin wrote.`);

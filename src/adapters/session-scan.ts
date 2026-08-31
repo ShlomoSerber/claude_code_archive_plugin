@@ -10,6 +10,8 @@ import type { ArchivePaths } from '../core/paths.ts';
  * directory of the same name holding tool results and subagent transcripts.
  */
 
+export type ScanSkip = { kind: 'project' | 'session'; name: string };
+
 export type LocalSession = {
   sessionId: string;
   encodedDir: string;
@@ -58,7 +60,10 @@ export async function statSession(
  * A generator, not an array: a four-week-old install already holds hundreds of
  * sessions, and the sweep processes them one at a time anyway.
  */
-export async function* scanSessions(paths: ArchivePaths): AsyncGenerator<LocalSession> {
+export async function* scanSessions(
+  paths: ArchivePaths,
+  skipped?: ScanSkip[],
+): AsyncGenerator<LocalSession> {
   let projectDirs: string[];
   try {
     projectDirs = await fsp.readdir(paths.projectsDir);
@@ -67,7 +72,12 @@ export async function* scanSessions(paths: ArchivePaths): AsyncGenerator<LocalSe
   }
   for (const encodedDir of projectDirs) {
     // A directory name that is not a plain segment cannot be joined safely.
-    if (!isSafeEncodedDir(encodedDir)) continue;
+    // Recorded rather than dropped: a silent skip means a whole project is
+    // absent from the archive with nothing anywhere saying so.
+    if (!isSafeEncodedDir(encodedDir)) {
+      skipped?.push({ kind: 'project', name: encodedDir });
+      continue;
+    }
     let entries: string[];
     try {
       entries = await fsp.readdir(path.join(paths.projectsDir, encodedDir));
@@ -79,7 +89,10 @@ export async function* scanSessions(paths: ArchivePaths): AsyncGenerator<LocalSe
       const sessionId = entry.slice(0, -'.jsonl'.length);
       // `...jsonl` yields `..`, and `.jsonl` yields the empty string. Both
       // join into the parent directory, which the reaper would then delete.
-      if (!isSafeSessionId(sessionId)) continue;
+      if (!isSafeSessionId(sessionId)) {
+        skipped?.push({ kind: 'session', name: entry });
+        continue;
+      }
       const session = await statSession(paths, encodedDir, sessionId);
       if (session !== null) yield session;
     }

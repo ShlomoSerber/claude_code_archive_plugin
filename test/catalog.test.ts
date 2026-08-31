@@ -130,6 +130,7 @@ describe('the backup lifecycle', () => {
         localMtime: 2000,
         localBytes: 600,
         bundleSha256: 'abc',
+        transcriptSha256: 't1',
       },
       3000,
     );
@@ -149,7 +150,14 @@ describe('the backup lifecycle', () => {
     markVerified(
       db,
       's1',
-      { fileId: 'drive-1', path: 'p', localMtime: 2000, localBytes: 600, bundleSha256: 'abc' },
+      {
+        fileId: 'drive-1',
+        path: 'p',
+        localMtime: 2000,
+        localBytes: 600,
+        bundleSha256: 'abc',
+        transcriptSha256: 't1',
+      },
       3000,
     );
     markBundled(
@@ -158,7 +166,13 @@ describe('the backup lifecycle', () => {
       { bundleName: 'b2.tar.zst', bundleBytes: 130, bundleSha256: 'def', archiverVersion: '0.1.0' },
       4000,
     );
-    assert.equal(getSession(db, 's1')?.verifiedAt, null, 'the new bundle is not verified yet');
+    const rebuilt = getSession(db, 's1');
+    assert.equal(rebuilt?.verifiedAt, null, 'the new bundle is not verified yet');
+    assert.notEqual(
+      rebuilt?.verifiedLocalBytes,
+      null,
+      'but what Drive already holds is still described, or the shrink guard has no evidence',
+    );
   });
 
   it('marks a restored session present again', () => {
@@ -189,7 +203,14 @@ describe('listReapable', () => {
     markVerified(
       db,
       'verified-old',
-      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
+      {
+        fileId: 'f',
+        path: 'p',
+        localMtime: 1000,
+        localBytes: 600,
+        bundleSha256: 'h',
+        transcriptSha256: 't1',
+      },
       1,
     );
 
@@ -208,7 +229,14 @@ describe('listReapable', () => {
     markVerified(
       db,
       'verified-recent',
-      { fileId: 'f', path: 'p', localMtime: 90_000, localBytes: 600, bundleSha256: 'h' },
+      {
+        fileId: 'f',
+        path: 'p',
+        localMtime: 90_000,
+        localBytes: 600,
+        bundleSha256: 'h',
+        transcriptSha256: 't1',
+      },
       1,
     );
 
@@ -255,7 +283,14 @@ describe('listUnverified', () => {
     markVerified(
       db,
       'done',
-      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
+      {
+        fileId: 'f',
+        path: 'p',
+        localMtime: 1000,
+        localBytes: 600,
+        bundleSha256: 'h',
+        transcriptSha256: 't1',
+      },
       1,
     );
     assert.deepEqual(
@@ -291,7 +326,14 @@ describe('catalogStats', () => {
     markVerified(
       db,
       'reaped',
-      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
+      {
+        fileId: 'f',
+        path: 'p',
+        localMtime: 1000,
+        localBytes: 600,
+        bundleSha256: 'h',
+        transcriptSha256: 't1',
+      },
       1,
     );
     markLocalDeleted(db, 'reaped', 2);

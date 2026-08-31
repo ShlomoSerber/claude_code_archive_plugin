@@ -105,6 +105,17 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE sessions ADD COLUMN verified_bundle_sha256 TEXT;
   `,
+
+  // 4 — the transcript hash belonging to the copy Drive holds.
+  //
+  // `transcript_sha256` is written by every indexing pass, before a bundle
+  // exists and whether or not the upload ever lands. Restoring against it meant
+  // one failed upload made a session permanently unrestorable: the pointer
+  // described the archived copy, the hash described the newer local one, and
+  // every restore attempt failed the check and deleted what it had unpacked.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

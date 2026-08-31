@@ -10,15 +10,15 @@ import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.t
 import { RetryableError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import { listJobs } from '../src/core/queue.ts';
-import { runSweep } from '../src/worker/sweep.ts';
+import { catalogFileName, runSweep } from '../src/worker/sweep.ts';
 import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
 import { competingCleanupSettings } from '../src/adapters/claude-settings.ts';
 import { createExtractor } from '../src/core/transcript.ts';
-import { kvSetNumber } from '../src/adapters/db.ts';
-import { activeSessionKey } from '../src/core/state-keys.ts';
+import { kvGetNumber, kvSetNumber } from '../src/adapters/db.ts';
+import { KV, activeSessionKey } from '../src/core/state-keys.ts';
 import { FakeDrive } from './fakes/fake-drive.ts';
 import { fakeClock, tempDir } from './helpers.ts';
 
@@ -156,7 +156,8 @@ describe('a full sweep', () => {
     const harness = makeHarness();
     const report = await runSweep(harness.ctx);
     assert.equal(report.catalogUploaded, true);
-    assert.ok(harness.drive.fileByName('catalog.sqlite'));
+    // One copy per machine, so two machines on one Drive do not overwrite each other.
+    assert.ok(harness.drive.fileByName(catalogFileName()));
   });
 
   it('leaves no staged bundles behind', async () => {
@@ -924,5 +925,132 @@ describe('deletion safety, fourth pass', () => {
     );
     const summary = extractor.finish();
     assert.ok(Number.isInteger(summary.startedAt));
+  });
+});
+
+/**
+ * Fifth round. The red team's point: guards added by earlier rounds fired once,
+ * logged, and then disarmed themselves.
+ */
+describe('deletion safety, fifth pass', () => {
+  async function archivedThenShrunk() {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    fs.writeFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    return { harness, original };
+  }
+
+  it('keeps refusing a shrunken session on every later sweep', async () => {
+    // The guard used to read verified_local_bytes, which markBundled cleared on
+    // the very attempt the guard rejected — so the second sweep sailed through
+    // and archived the damage over the good copy.
+    const { harness, original } = await archivedThenShrunk();
+
+    for (const pass of [1, 2, 3]) {
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.verified, 0, `sweep ${String(pass)} must not archive the remains`);
+      assert.equal(
+        harness.drive.files.has(original),
+        true,
+        `sweep ${String(pass)} must leave the fuller archive alone`,
+      );
+      harness.clock.advance(60_000);
+    }
+  });
+
+  it('still describes what Drive holds after a failed rebuild', async () => {
+    const { harness } = await archivedThenShrunk();
+    await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    assert.equal(record?.verifiedAt, null, 'deletion authority is withdrawn');
+    assert.notEqual(record?.verifiedLocalBytes, null, 'the description of the archive survives');
+    assert.notEqual(record?.verifiedBundleSha256, null);
+  });
+
+  it('records the transcript hash of the archived copy, not of the newer disk', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const archived = getSession(harness.ctx.db, SESSION_A)?.verifiedTranscriptSha256;
+    assert.notEqual(archived, null);
+
+    // A failed re-upload used to leave transcript_sha256 describing bytes Drive
+    // never received, making every later restore fail its own check forever.
+    harness.drive.options = { ...harness.drive.options, failUploadsAfter: 0 };
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    assert.equal(
+      getSession(harness.ctx.db, SESSION_A)?.verifiedTranscriptSha256,
+      archived,
+      'the verified hash still describes the copy on Drive',
+    );
+  });
+
+  it('restores after a failed re-upload instead of refusing forever', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.drive.options = { ...harness.drive.options, failUploadsAfter: 0 };
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    fs.rmSync(harness.transcriptOf(SESSION_A));
+    const restored = await restoreSession(harness.ctx, SESSION_A);
+    assert.equal(restored.alreadyLocal, false);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('archives a project whose encoded directory is near the length limit', async () => {
+    // Claude Code encodes a working directory up to 200 characters. A shorter
+    // cap here made every session under a deep path invisible: never archived,
+    // never mentioned by status.
+    const harness = makeHarness();
+    const longDir = `-home-a-${'x'.repeat(185)}`;
+    assert.ok(longDir.length > 190);
+    fs.mkdirSync(path.join(harness.ctx.paths.projectsDir, longDir), { recursive: true });
+    fs.writeFileSync(
+      path.join(
+        harness.ctx.paths.projectsDir,
+        longDir,
+        'eeeeeeee-1111-2222-3333-444444444444.jsonl',
+      ),
+      '{"type":"user","message":{"role":"user","content":"deep"}}\n',
+    );
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.discovered, 3, 'the deep project is seen');
+    assert.ok(getSession(harness.ctx.db, 'eeeeeeee-1111-2222-3333-444444444444'));
+  });
+
+  it('counts a session it cannot archive instead of dropping it in silence', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(path.join(harness.projectDir, '...jsonl'), '{}\n');
+    await runSweep(harness.ctx);
+    assert.equal(kvGetNumber(harness.ctx.db, KV.skippedCount), 1);
+  });
+
+  it('treats a Drive rate limit as a delay, not as a missing archive', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.clock.advance(31 * DAY_MS);
+    harness.drive.getFile = () =>
+      Promise.reject(new RetryableError('HTTP 403: rateLimitExceeded', { status: 403 }));
+
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+    assert.notEqual(
+      getSession(harness.ctx.db, SESSION_A)?.verifiedAt,
+      null,
+      'a rate limit must not withdraw a good verification',
+    );
   });
 });

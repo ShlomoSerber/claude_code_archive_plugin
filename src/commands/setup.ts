@@ -16,6 +16,7 @@ import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
 import type { Runtime } from '../composition.ts';
 import { commandContext } from './context.ts';
 import { runNow } from './now.ts';
+import { catalogFileName } from '../worker/sweep.ts';
 import { formatBytes, print, printJson, warn } from './output.ts';
 
 /**
@@ -137,11 +138,18 @@ export async function importCatalogIfEmpty(runtime: Runtime): Promise<number> {
   try {
     const ctx = commandContext(runtime);
     const parentId = await ctx.drive.ensureFolder([runtime.config.driveRootFolder], ctx.signal);
-    const remote = await ctx.drive.findFile({ name: 'catalog.sqlite', parentId }, ctx.signal);
-    if (remote === null) return 0;
-
-    await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
-    return importCatalogFile(runtime, staged);
+    // This machine's own copy first, then the legacy shared name. Both are
+    // plain files in the archive root, and importing the union is what makes a
+    // replacement machine see the whole history rather than one machine's share.
+    let imported = 0;
+    for (const name of [catalogFileName(), 'catalog.sqlite']) {
+      const remote = await ctx.drive.findFile({ name, parentId }, ctx.signal);
+      if (remote === null) continue;
+      await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
+      imported += importCatalogFile(runtime, staged);
+      await fsp.rm(staged, { force: true }).catch(() => undefined);
+    }
+    return imported;
   } catch (err) {
     warn(
       `Could not recover the catalog from Drive: ${err instanceof Error ? err.message : 'unknown error'}`,

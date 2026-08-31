@@ -426,6 +426,16 @@ var MIGRATIONS = [
   // markVerified, so it always describes the copy Drive holds.
   `
   ALTER TABLE sessions ADD COLUMN verified_bundle_sha256 TEXT;
+  `,
+  // 4 — the transcript hash belonging to the copy Drive holds.
+  //
+  // `transcript_sha256` is written by every indexing pass, before a bundle
+  // exists and whether or not the upload ever lands. Restoring against it meant
+  // one failed upload made a session permanently unrestorable: the pointer
+  // described the archived copy, the hash described the newer local one, and
+  // every restore attempt failed the check and deleted what it had unpacked.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1086,6 +1096,9 @@ function createDriveTransport(deps) {
     if (response.status === 403 && isQuotaExhausted(body)) {
       throw new FatalError(message, "Free space in Google Drive, then run /archive:now.");
     }
+    if (response.status === 403 && isRateLimited(body)) {
+      throw new RetryableError(message, { status: response.status });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, "Run /archive:status for details.");
     }
@@ -1341,6 +1354,10 @@ function asNumber(value) {
   if (typeof value !== "string") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+function isRateLimited(body) {
+  const text = JSON.stringify(body ?? "");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -1773,6 +1790,8 @@ function writeCache(file, found) {
 
 // src/worker/sweep.ts
 import fsp11 from "node:fs/promises";
+import os5 from "node:os";
+import { createHash as createHash3 } from "node:crypto";
 import path15 from "node:path";
 
 // src/adapters/session-scan.ts
@@ -1781,7 +1800,7 @@ import path11 from "node:path";
 
 // src/core/identifiers.ts
 import path10 from "node:path";
-var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,253}$/;
 function isSafePathSegment(value) {
   if (!SAFE_SEGMENT.test(value)) return false;
   if (value === "." || value === "..") return false;
@@ -1825,7 +1844,7 @@ async function statSession(paths, encodedDir, sessionId) {
     mtimeMs: Math.max(transcript.mtimeMs, sidecar?.mtimeMs ?? 0)
   };
 }
-async function* scanSessions(paths) {
+async function* scanSessions(paths, skipped) {
   let projectDirs;
   try {
     projectDirs = await fsp6.readdir(paths.projectsDir);
@@ -1833,7 +1852,10 @@ async function* scanSessions(paths) {
     return;
   }
   for (const encodedDir of projectDirs) {
-    if (!isSafeEncodedDir(encodedDir)) continue;
+    if (!isSafeEncodedDir(encodedDir)) {
+      skipped?.push({ kind: "project", name: encodedDir });
+      continue;
+    }
     let entries;
     try {
       entries = await fsp6.readdir(path11.join(paths.projectsDir, encodedDir));
@@ -1843,7 +1865,10 @@ async function* scanSessions(paths) {
     for (const entry of entries) {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionId = entry.slice(0, -".jsonl".length);
-      if (!isSafeSessionId(sessionId)) continue;
+      if (!isSafeSessionId(sessionId)) {
+        skipped?.push({ kind: "session", name: entry });
+        continue;
+      }
       const session = await statSession(paths, encodedDir, sessionId);
       if (session !== null) yield session;
     }
@@ -1891,7 +1916,8 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   started_at, ended_at, message_count, transcript_bytes, transcript_sha256, sidecar_bytes,
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
-  verified_local_mtime, verified_local_bytes, verified_bundle_sha256, created_at, updated_at`;
+  verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
+  verified_transcript_sha256, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -1911,6 +1937,8 @@ function upsertSession(db, session, now) {
                                    THEN sessions.verified_local_bytes ELSE NULL END,
        verified_bundle_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                      THEN sessions.verified_bundle_sha256 ELSE NULL END,
+       verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                         THEN sessions.verified_transcript_sha256 ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -1966,8 +1994,7 @@ function markBundled(db, sessionId, backup, now) {
   db.prepare(
     `UPDATE sessions
         SET bundle_name = ?, bundle_bytes = ?, bundle_sha256 = ?, archiver_version = ?,
-            verified_at = NULL, verified_local_mtime = NULL, verified_local_bytes = NULL,
-            updated_at = ?
+            verified_at = NULL, updated_at = ?
       WHERE session_id = ?`
   ).run(
     backup.bundleName,
@@ -1983,7 +2010,7 @@ function markVerified(db, sessionId, remote, now) {
     `UPDATE sessions
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
-            updated_at = ?
+            verified_transcript_sha256 = ?, updated_at = ?
       WHERE session_id = ?`
   ).run(
     remote.fileId,
@@ -1993,6 +2020,7 @@ function markVerified(db, sessionId, remote, now) {
     remote.localMtime,
     remote.localBytes,
     remote.bundleSha256,
+    remote.transcriptSha256,
     now,
     sessionId
   );
@@ -2093,6 +2121,7 @@ function toRecord(row) {
     verifiedLocalMtime: row.verified_local_mtime,
     verifiedLocalBytes: row.verified_local_bytes,
     verifiedBundleSha256: row.verified_bundle_sha256,
+    verifiedTranscriptSha256: row.verified_transcript_sha256,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2231,6 +2260,8 @@ var KV = {
   catalogFileId: "catalog.file_id",
   /** Sessions counted at the last full scan, shown by /archive:status. */
   lastScanAt: "scan.last_at",
+  /** Sessions or projects the last scan could not archive, for /archive:status. */
+  skippedCount: "scan.skipped_count",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
@@ -5950,11 +5981,17 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       path: `${folderPath.join("/")}/${bundle.name}`,
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
-      bundleSha256: bundle.sha256
+      bundleSha256: bundle.sha256,
+      // From the same hashing pass that verifyBundleContents checked the
+      // bundle against, so it describes the archived bytes. Hashing the file
+      // separately opens a window in which a live session appends between the
+      // hash and the read, leaving a row that verifies but cannot be restored.
+      transcriptSha256: files.find((file) => file.path === `${session.sessionId}.jsonl`)?.sha256 ?? null
     },
     ctx.clock.now()
   );
-  if (supersededId !== null && supersededId !== remote.id) {
+  const sameProject = previous?.encodedDir === session.encodedDir;
+  if (supersededId !== null && supersededId !== remote.id && sameProject) {
     try {
       await ctx.drive.deleteFile(supersededId, ctx.signal);
     } catch (err) {
@@ -5964,9 +6001,15 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   return remote;
 }
 async function verifyRemote(ctx, sessionId, uploaded, bundle) {
-  const meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
-  const problem = compareChecksums(meta, bundle);
+  let meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+  let problem = compareChecksums(meta, bundle);
   if (problem === null) return;
+  if (meta.sha256 === null && meta.md5 === null) {
+    await ctx.clock.sleep(2e3);
+    meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+    problem = compareChecksums(meta, bundle);
+    if (problem === null) return;
+  }
   ctx.logger.error("backup.verification_failed", { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
@@ -6187,7 +6230,8 @@ async function runSweep(ctx, options = {}) {
 async function discover(ctx, now) {
   let discovered = 0;
   let enqueued = 0;
-  for await (const session of scanSessions(ctx.paths)) {
+  const skipped = [];
+  for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
     const mtime = Math.trunc(session.mtimeMs);
@@ -6223,6 +6267,15 @@ async function discover(ctx, now) {
     }
   }
   kvSetNumber(ctx.db, KV.lastScanAt, now, now);
+  if (skipped.length > 0) {
+    ctx.logger.error("sweep.skipped_unarchivable", {
+      count: skipped.length,
+      first: skipped[0]?.name ?? ""
+    });
+    kvSetNumber(ctx.db, KV.skippedCount, skipped.length, now);
+  } else {
+    kvSetNumber(ctx.db, KV.skippedCount, 0, now);
+  }
   return { discovered, enqueued };
 }
 async function drain(ctx, deadline, report) {
@@ -6317,6 +6370,10 @@ function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;
 }
+function catalogFileName(hostname = os5.hostname()) {
+  const tag = createHash3("sha256").update(hostname).digest("hex").slice(0, 8);
+  return `catalog-${tag}.sqlite`;
+}
 async function uploadCatalogCopy(ctx) {
   const destination = path15.join(ctx.paths.stagingDir, "catalog.sqlite");
   try {
@@ -6324,11 +6381,12 @@ async function uploadCatalogCopy(ctx) {
     await fsp11.rm(destination, { force: true });
     await getSqlite().backup(ctx.db, destination);
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
-    const existingId = kvGet(ctx.db, KV.catalogFileId);
-    const existing = existingId ?? (await ctx.drive.findFile({ name: "catalog.sqlite", parentId }, ctx.signal))?.id;
+    const cached2 = kvGet(ctx.db, KV.catalogFileId);
+    const existingId = cached2 === void 0 || cached2 === "" ? void 0 : cached2;
+    const existing = existingId ?? (await ctx.drive.findFile({ name: catalogFileName(), parentId }, ctx.signal))?.id;
     const uploaded = await ctx.drive.uploadSmallFile(
       {
-        name: "catalog.sqlite",
+        name: catalogFileName(),
         parentId,
         mimeType: "application/vnd.sqlite3",
         body: await fsp11.readFile(destination),
@@ -6342,6 +6400,7 @@ async function uploadCatalogCopy(ctx) {
     ctx.logger.info("catalog.uploaded", { file_id: uploaded.id });
     return true;
   } catch (err) {
+    kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
     ctx.logger.warn("catalog.upload_failed", {}, err);
     return false;
   } finally {

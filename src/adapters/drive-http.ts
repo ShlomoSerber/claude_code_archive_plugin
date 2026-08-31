@@ -68,6 +68,11 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
     if (response.status === 403 && isQuotaExhausted(body)) {
       throw new FatalError(message, 'Free space in Google Drive, then run /archive:now.');
     }
+    // 403 is how Drive signals a rate limit as well as a refusal. Classing the
+    // former as fatal made the reaper read "slow down" as "the archive is gone".
+    if (response.status === 403 && isRateLimited(body)) {
+      throw new RetryableError(message, { status: response.status });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, 'Run /archive:status for details.');
     }
@@ -370,6 +375,15 @@ function asNumber(value: unknown): number | null {
   if (typeof value !== 'string') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isRateLimited(body: unknown): boolean {
+  const text = JSON.stringify(body ?? '');
+  return (
+    text.includes('rateLimitExceeded') ||
+    text.includes('userRateLimitExceeded') ||
+    text.includes('sharingRateLimitExceeded')
+  );
 }
 
 function isQuotaExhausted(body: unknown): boolean {

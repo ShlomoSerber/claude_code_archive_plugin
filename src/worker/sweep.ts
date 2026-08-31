@@ -1,9 +1,11 @@
 import fsp from 'node:fs/promises';
+import os from 'node:os';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { getSqlite } from '../adapters/sqlite.ts';
 import { removePartials } from '../adapters/atomic.ts';
 import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
-import { scanSessions } from '../adapters/session-scan.ts';
+import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, upsertSession } from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
 import { FatalError, isRetryableNetworkError, toErrorInfo } from '../core/errors.ts';
@@ -139,8 +141,9 @@ async function discover(
 ): Promise<{ discovered: number; enqueued: number }> {
   let discovered = 0;
   let enqueued = 0;
+  const skipped: ScanSkip[] = [];
 
-  for await (const session of scanSessions(ctx.paths)) {
+  for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
     const mtime = Math.trunc(session.mtimeMs);
@@ -185,6 +188,15 @@ async function discover(
   }
 
   kvSetNumber(ctx.db, KV.lastScanAt, now, now);
+  if (skipped.length > 0) {
+    ctx.logger.error('sweep.skipped_unarchivable', {
+      count: skipped.length,
+      first: skipped[0]?.name ?? '',
+    });
+    kvSetNumber(ctx.db, KV.skippedCount, skipped.length, now);
+  } else {
+    kvSetNumber(ctx.db, KV.skippedCount, 0, now);
+  }
   return { discovered, enqueued };
 }
 
@@ -324,6 +336,19 @@ function catalogCopyIsStale(ctx: WorkerContext): boolean {
  * `sqlite.backup()`, never `fs.copyFile`: copying a live WAL database is a
  * documented way to produce a file that opens and is quietly wrong.
  */
+/**
+ * One catalog copy per machine.
+ *
+ * A single shared name meant a laptop and a desktop on one Google account
+ * overwrote each other every sweep, so the disaster-recovery index described
+ * only whichever swept last. The bundles were all still there; the promise that
+ * a dead laptop loses nothing was not.
+ */
+export function catalogFileName(hostname: string = os.hostname()): string {
+  const tag = createHash('sha256').update(hostname).digest('hex').slice(0, 8);
+  return `catalog-${tag}.sqlite`;
+}
+
 export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
   const destination = path.join(ctx.paths.stagingDir, 'catalog.sqlite');
   try {
@@ -332,14 +357,15 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
     await getSqlite().backup(ctx.db, destination);
 
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
-    const existingId = kvGet(ctx.db, KV.catalogFileId);
+    const cached = kvGet(ctx.db, KV.catalogFileId);
+    const existingId = cached === undefined || cached === '' ? undefined : cached;
     const existing =
       existingId ??
-      (await ctx.drive.findFile({ name: 'catalog.sqlite', parentId }, ctx.signal))?.id;
+      (await ctx.drive.findFile({ name: catalogFileName(), parentId }, ctx.signal))?.id;
 
     const uploaded = await ctx.drive.uploadSmallFile(
       {
-        name: 'catalog.sqlite',
+        name: catalogFileName(),
         parentId,
         mimeType: 'application/vnd.sqlite3',
         body: await fsp.readFile(destination),
@@ -356,6 +382,10 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
   } catch (err) {
     // The catalog copy is a convenience for a lost laptop; failing to refresh
     // it must never fail the sweep that archived real sessions.
+    // Most often a stale file id: the copy was removed on Drive and every
+    // later attempt targets an id that no longer exists. Forget it so the next
+    // sweep creates a fresh one instead of failing forever.
+    kvSet(ctx.db, KV.catalogFileId, '', ctx.clock.now());
     ctx.logger.warn('catalog.upload_failed', {}, err);
     return false;
   } finally {

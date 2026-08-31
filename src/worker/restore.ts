@@ -105,8 +105,12 @@ export async function restoreSession(
     // is worse than none: the next sweep would archive it over the good copy.
     const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
     if (problem !== null) {
-      await removePartialRestore(targetDir, sessionId);
-      throw new RetryableError(`the restored session is incomplete: ${problem}`);
+      const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
+      ctx.logger.error('restore.quarantined', { session_id: sessionId, path: quarantine });
+      throw new RetryableError(
+        `the restored session is incomplete: ${problem}. What was unpacked has been ` +
+          `moved to ${quarantine} rather than deleted.`,
+      );
     }
 
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
@@ -142,10 +146,11 @@ async function describeRestoreProblem(
   const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
   if (restored === null) return 'the transcript is not there';
 
-  if (record.transcriptSha256 !== null) {
+  const expected = record.verifiedTranscriptSha256;
+  if (expected !== null) {
     const hash = await sha256File(path.join(targetDir, `${sessionId}.jsonl`)).catch(() => null);
     if (hash === null) return 'the transcript could not be read back';
-    if (hash !== record.transcriptSha256) return 'the transcript does not match its recorded hash';
+    if (hash !== expected) return 'the transcript does not match the hash of the archived copy';
   }
 
   const bytes = restored.transcriptBytes + restored.sidecarBytes;
@@ -155,12 +160,26 @@ async function describeRestoreProblem(
   return null;
 }
 
-/** Remove a half-written restore so nothing downstream mistakes it for data. */
-async function removePartialRestore(targetDir: string, sessionId: string): Promise<void> {
-  await fsp
-    .rm(path.join(targetDir, sessionId), { recursive: true, force: true })
-    .catch(() => undefined);
-  await fsp.rm(path.join(targetDir, `${sessionId}.jsonl`), { force: true }).catch(() => undefined);
+/**
+ * Move a rejected restore out of the way under a name Claude Code ignores.
+ *
+ * It must not stay where it is, or the next sweep would archive it over the
+ * good copy. It must not be deleted either: it came off Drive and matched the
+ * bundle hash, so it is the best evidence available about what went wrong.
+ */
+async function removePartialRestore(
+  targetDir: string,
+  sessionId: string,
+  stamp: number,
+): Promise<string> {
+  const quarantine = path.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
+  await fsp.mkdir(quarantine, { recursive: true });
+  for (const name of [`${sessionId}.jsonl`, sessionId]) {
+    await fsp
+      .rename(path.join(targetDir, name), path.join(quarantine, name))
+      .catch(() => undefined);
+  }
+  return quarantine;
 }
 
 async function isDirectory(candidate: string): Promise<boolean> {

@@ -82,12 +82,29 @@ export async function setCleanupPeriodDays(
  * is a claim that has to be checked against all of them, not asserted from the
  * one we control.
  */
+/**
+ * Where a cleanupPeriodDays that outranks ours can live.
+ *
+ * Managed settings are installed by an administrator at fixed OS paths, not
+ * under the Claude config directory, and CLAUDE_CONFIG_DIR does not move them.
+ * Looking in the wrong place is worse than not looking: it produces a clean
+ * report that means nothing.
+ */
+export function competingSettingsPaths(claudeDir: string): string[] {
+  const managed =
+    process.platform === 'darwin'
+      ? '/Library/Application Support/ClaudeCode/managed-settings.json'
+      : process.platform === 'win32'
+        ? 'C:\\Program Files\\ClaudeCode\\managed-settings.json'
+        : '/etc/claude-code/managed-settings.json';
+  return [path.join(claudeDir, 'settings.local.json'), managed];
+}
+
 export async function competingCleanupSettings(
   claudeDir: string,
 ): Promise<{ file: string; value: number }[]> {
   const found: { file: string; value: number }[] = [];
-  for (const name of ['settings.local.json', 'managed-settings.json']) {
-    const file = path.join(claudeDir, name);
+  for (const file of competingSettingsPaths(claudeDir)) {
     const read = await readSettings(file);
     if (read.status !== 'ok') continue;
     const value = read.settings['cleanupPeriodDays'];

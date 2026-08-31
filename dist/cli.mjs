@@ -272,6 +272,16 @@ var MIGRATIONS = [
   // markVerified, so it always describes the copy Drive holds.
   `
   ALTER TABLE sessions ADD COLUMN verified_bundle_sha256 TEXT;
+  `,
+  // 4 — the transcript hash belonging to the copy Drive holds.
+  //
+  // `transcript_sha256` is written by every indexing pass, before a bundle
+  // exists and whether or not the upload ever lands. Restoring against it meant
+  // one failed upload made a session permanently unrestorable: the pointer
+  // described the archived copy, the hash described the newer local one, and
+  // every restore attempt failed the check and deleted what it had unpacked.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1229,6 +1239,9 @@ function createDriveTransport(deps) {
     if (response.status === 403 && isQuotaExhausted(body)) {
       throw new FatalError(message, "Free space in Google Drive, then run /archive:now.");
     }
+    if (response.status === 403 && isRateLimited(body)) {
+      throw new RetryableError(message, { status: response.status });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, "Run /archive:status for details.");
     }
@@ -1484,6 +1497,10 @@ function asNumber(value) {
   if (typeof value !== "string") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+function isRateLimited(body) {
+  const text = JSON.stringify(body ?? "");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -1917,6 +1934,8 @@ function writeCache(file, found) {
 
 // src/worker/sweep.ts
 import fsp11 from "node:fs/promises";
+import os4 from "node:os";
+import { createHash as createHash4 } from "node:crypto";
 import path14 from "node:path";
 
 // src/adapters/session-scan.ts
@@ -1925,7 +1944,7 @@ import path10 from "node:path";
 
 // src/core/identifiers.ts
 import path9 from "node:path";
-var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,253}$/;
 function isSafePathSegment(value) {
   if (!SAFE_SEGMENT.test(value)) return false;
   if (value === "." || value === "..") return false;
@@ -1969,7 +1988,7 @@ async function statSession(paths, encodedDir, sessionId) {
     mtimeMs: Math.max(transcript.mtimeMs, sidecar?.mtimeMs ?? 0)
   };
 }
-async function* scanSessions(paths) {
+async function* scanSessions(paths, skipped) {
   let projectDirs;
   try {
     projectDirs = await fsp6.readdir(paths.projectsDir);
@@ -1977,7 +1996,10 @@ async function* scanSessions(paths) {
     return;
   }
   for (const encodedDir of projectDirs) {
-    if (!isSafeEncodedDir(encodedDir)) continue;
+    if (!isSafeEncodedDir(encodedDir)) {
+      skipped?.push({ kind: "project", name: encodedDir });
+      continue;
+    }
     let entries;
     try {
       entries = await fsp6.readdir(path10.join(paths.projectsDir, encodedDir));
@@ -1987,7 +2009,10 @@ async function* scanSessions(paths) {
     for (const entry of entries) {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionId = entry.slice(0, -".jsonl".length);
-      if (!isSafeSessionId(sessionId)) continue;
+      if (!isSafeSessionId(sessionId)) {
+        skipped?.push({ kind: "session", name: entry });
+        continue;
+      }
       const session = await statSession(paths, encodedDir, sessionId);
       if (session !== null) yield session;
     }
@@ -2035,7 +2060,8 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   started_at, ended_at, message_count, transcript_bytes, transcript_sha256, sidecar_bytes,
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
-  verified_local_mtime, verified_local_bytes, verified_bundle_sha256, created_at, updated_at`;
+  verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
+  verified_transcript_sha256, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -2055,6 +2081,8 @@ function upsertSession(db, session, now) {
                                    THEN sessions.verified_local_bytes ELSE NULL END,
        verified_bundle_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                      THEN sessions.verified_bundle_sha256 ELSE NULL END,
+       verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                         THEN sessions.verified_transcript_sha256 ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -2110,8 +2138,7 @@ function markBundled(db, sessionId, backup, now) {
   db.prepare(
     `UPDATE sessions
         SET bundle_name = ?, bundle_bytes = ?, bundle_sha256 = ?, archiver_version = ?,
-            verified_at = NULL, verified_local_mtime = NULL, verified_local_bytes = NULL,
-            updated_at = ?
+            verified_at = NULL, updated_at = ?
       WHERE session_id = ?`
   ).run(
     backup.bundleName,
@@ -2127,7 +2154,7 @@ function markVerified(db, sessionId, remote, now) {
     `UPDATE sessions
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
-            updated_at = ?
+            verified_transcript_sha256 = ?, updated_at = ?
       WHERE session_id = ?`
   ).run(
     remote.fileId,
@@ -2137,6 +2164,7 @@ function markVerified(db, sessionId, remote, now) {
     remote.localMtime,
     remote.localBytes,
     remote.bundleSha256,
+    remote.transcriptSha256,
     now,
     sessionId
   );
@@ -2250,6 +2278,7 @@ function toRecord(row) {
     verifiedLocalMtime: row.verified_local_mtime,
     verifiedLocalBytes: row.verified_local_bytes,
     verifiedBundleSha256: row.verified_bundle_sha256,
+    verifiedTranscriptSha256: row.verified_transcript_sha256,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2388,6 +2417,8 @@ var KV = {
   catalogFileId: "catalog.file_id",
   /** Sessions counted at the last full scan, shown by /archive:status. */
   lastScanAt: "scan.last_at",
+  /** Sessions or projects the last scan could not archive, for /archive:status. */
+  skippedCount: "scan.skipped_count",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
@@ -6131,11 +6162,17 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       path: `${folderPath.join("/")}/${bundle.name}`,
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
-      bundleSha256: bundle.sha256
+      bundleSha256: bundle.sha256,
+      // From the same hashing pass that verifyBundleContents checked the
+      // bundle against, so it describes the archived bytes. Hashing the file
+      // separately opens a window in which a live session appends between the
+      // hash and the read, leaving a row that verifies but cannot be restored.
+      transcriptSha256: files.find((file) => file.path === `${session.sessionId}.jsonl`)?.sha256 ?? null
     },
     ctx.clock.now()
   );
-  if (supersededId !== null && supersededId !== remote.id) {
+  const sameProject = previous?.encodedDir === session.encodedDir;
+  if (supersededId !== null && supersededId !== remote.id && sameProject) {
     try {
       await ctx.drive.deleteFile(supersededId, ctx.signal);
     } catch (err) {
@@ -6145,9 +6182,15 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   return remote;
 }
 async function verifyRemote(ctx, sessionId, uploaded, bundle) {
-  const meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
-  const problem = compareChecksums(meta, bundle);
+  let meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+  let problem = compareChecksums(meta, bundle);
   if (problem === null) return;
+  if (meta.sha256 === null && meta.md5 === null) {
+    await ctx.clock.sleep(2e3);
+    meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+    problem = compareChecksums(meta, bundle);
+    if (problem === null) return;
+  }
   ctx.logger.error("backup.verification_failed", { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
@@ -6368,7 +6411,8 @@ async function runSweep(ctx, options = {}) {
 async function discover(ctx, now) {
   let discovered = 0;
   let enqueued = 0;
-  for await (const session of scanSessions(ctx.paths)) {
+  const skipped = [];
+  for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
     const mtime = Math.trunc(session.mtimeMs);
@@ -6404,6 +6448,15 @@ async function discover(ctx, now) {
     }
   }
   kvSetNumber(ctx.db, KV.lastScanAt, now, now);
+  if (skipped.length > 0) {
+    ctx.logger.error("sweep.skipped_unarchivable", {
+      count: skipped.length,
+      first: skipped[0]?.name ?? ""
+    });
+    kvSetNumber(ctx.db, KV.skippedCount, skipped.length, now);
+  } else {
+    kvSetNumber(ctx.db, KV.skippedCount, 0, now);
+  }
   return { discovered, enqueued };
 }
 async function drain(ctx, deadline, report) {
@@ -6498,6 +6551,10 @@ function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;
 }
+function catalogFileName(hostname = os4.hostname()) {
+  const tag = createHash4("sha256").update(hostname).digest("hex").slice(0, 8);
+  return `catalog-${tag}.sqlite`;
+}
 async function uploadCatalogCopy(ctx) {
   const destination = path14.join(ctx.paths.stagingDir, "catalog.sqlite");
   try {
@@ -6505,11 +6562,12 @@ async function uploadCatalogCopy(ctx) {
     await fsp11.rm(destination, { force: true });
     await getSqlite().backup(ctx.db, destination);
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
-    const existingId = kvGet(ctx.db, KV.catalogFileId);
-    const existing = existingId ?? (await ctx.drive.findFile({ name: "catalog.sqlite", parentId }, ctx.signal))?.id;
+    const cached2 = kvGet(ctx.db, KV.catalogFileId);
+    const existingId = cached2 === void 0 || cached2 === "" ? void 0 : cached2;
+    const existing = existingId ?? (await ctx.drive.findFile({ name: catalogFileName(), parentId }, ctx.signal))?.id;
     const uploaded = await ctx.drive.uploadSmallFile(
       {
-        name: "catalog.sqlite",
+        name: catalogFileName(),
         parentId,
         mimeType: "application/vnd.sqlite3",
         body: await fsp11.readFile(destination),
@@ -6523,6 +6581,7 @@ async function uploadCatalogCopy(ctx) {
     ctx.logger.info("catalog.uploaded", { file_id: uploaded.id });
     return true;
   } catch (err) {
+    kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
     ctx.logger.warn("catalog.upload_failed", {}, err);
     return false;
   } finally {
@@ -6577,7 +6636,7 @@ async function readStatusFile(file) {
 
 // src/adapters/lock.ts
 import fs8 from "node:fs";
-import os4 from "node:os";
+import os5 from "node:os";
 import path15 from "node:path";
 var META_FILE = "owner.json";
 var DEFAULT_HEARTBEAT_MS = 5e3;
@@ -6587,7 +6646,7 @@ function acquireLock(dir, options = {}) {
   const logger = options.logger ?? nullLogger;
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const staleMs = Math.max(MIN_STALE_MS, options.staleMs ?? heartbeatMs * 4);
-  const owner = { pid: process.pid, hostname: os4.hostname(), startedAt: clock.now() };
+  const owner = { pid: process.pid, hostname: os5.hostname(), startedAt: clock.now() };
   if (!tryMkdir(dir)) {
     const existing = readOwner(dir);
     if (!isStale(dir, staleMs, clock, existing)) {
@@ -6659,7 +6718,7 @@ function isStale(dir, staleMs, clock, owner) {
   }
   const age = clock.now() - mtimeMs;
   if (age > staleMs) return true;
-  if (owner !== null && owner.hostname === os4.hostname() && !isPidAlive(owner.pid)) return true;
+  if (owner !== null && owner.hostname === os5.hostname() && !isPidAlive(owner.pid)) return true;
   return false;
 }
 function isPidAlive(pid) {
@@ -7114,8 +7173,11 @@ async function restoreSession(ctx, sessionId) {
     }
     const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
     if (problem !== null) {
-      await removePartialRestore(targetDir, sessionId);
-      throw new RetryableError(`the restored session is incomplete: ${problem}`);
+      const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
+      ctx.logger.error("restore.quarantined", { session_id: sessionId, path: quarantine });
+      throw new RetryableError(
+        `the restored session is incomplete: ${problem}. What was unpacked has been moved to ${quarantine} rather than deleted.`
+      );
     }
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
     const now = ctx.clock.now();
@@ -7137,10 +7199,11 @@ async function restoreSession(ctx, sessionId) {
 async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
   const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
   if (restored === null) return "the transcript is not there";
-  if (record.transcriptSha256 !== null) {
+  const expected = record.verifiedTranscriptSha256;
+  if (expected !== null) {
     const hash = await sha256File(path16.join(targetDir, `${sessionId}.jsonl`)).catch(() => null);
     if (hash === null) return "the transcript could not be read back";
-    if (hash !== record.transcriptSha256) return "the transcript does not match its recorded hash";
+    if (hash !== expected) return "the transcript does not match the hash of the archived copy";
   }
   const bytes = restored.transcriptBytes + restored.sidecarBytes;
   if (record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes) {
@@ -7148,9 +7211,13 @@ async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
   }
   return null;
 }
-async function removePartialRestore(targetDir, sessionId) {
-  await fsp13.rm(path16.join(targetDir, sessionId), { recursive: true, force: true }).catch(() => void 0);
-  await fsp13.rm(path16.join(targetDir, `${sessionId}.jsonl`), { force: true }).catch(() => void 0);
+async function removePartialRestore(targetDir, sessionId, stamp) {
+  const quarantine = path16.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
+  await fsp13.mkdir(quarantine, { recursive: true });
+  for (const name of [`${sessionId}.jsonl`, sessionId]) {
+    await fsp13.rename(path16.join(targetDir, name), path16.join(quarantine, name)).catch(() => void 0);
+  }
+  return quarantine;
 }
 async function isDirectory(candidate) {
   try {
@@ -7342,10 +7409,13 @@ async function setCleanupPeriodDays(file, days = CLEANUP_PERIOD_DAYS) {
   });
   return { changed: true, previous, current: days };
 }
+function competingSettingsPaths(claudeDir) {
+  const managed = process.platform === "darwin" ? "/Library/Application Support/ClaudeCode/managed-settings.json" : process.platform === "win32" ? "C:\\Program Files\\ClaudeCode\\managed-settings.json" : "/etc/claude-code/managed-settings.json";
+  return [path17.join(claudeDir, "settings.local.json"), managed];
+}
 async function competingCleanupSettings(claudeDir) {
   const found = [];
-  for (const name of ["settings.local.json", "managed-settings.json"]) {
-    const file = path17.join(claudeDir, name);
+  for (const file of competingSettingsPaths(claudeDir)) {
     const read = await readSettings(file);
     if (read.status !== "ok") continue;
     const value = read.settings["cleanupPeriodDays"];
@@ -7470,10 +7540,15 @@ async function importCatalogIfEmpty(runtime) {
   try {
     const ctx = commandContext(runtime);
     const parentId = await ctx.drive.ensureFolder([runtime.config.driveRootFolder], ctx.signal);
-    const remote = await ctx.drive.findFile({ name: "catalog.sqlite", parentId }, ctx.signal);
-    if (remote === null) return 0;
-    await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
-    return importCatalogFile(runtime, staged);
+    let imported = 0;
+    for (const name of [catalogFileName(), "catalog.sqlite"]) {
+      const remote = await ctx.drive.findFile({ name, parentId }, ctx.signal);
+      if (remote === null) continue;
+      await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
+      imported += importCatalogFile(runtime, staged);
+      await fsp15.rm(staged, { force: true }).catch(() => void 0);
+    }
+    return imported;
   } catch (err) {
     warn(
       `Could not recover the catalog from Drive: ${err instanceof Error ? err.message : "unknown error"}`
@@ -7545,6 +7620,7 @@ async function runStatus(runtime, options) {
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
   let quota = null;
@@ -7563,6 +7639,7 @@ async function runStatus(runtime, options) {
       config: runtime.config,
       cleanupPeriodDays,
       competingCleanupSettings: competing,
+      unarchivable: skipped,
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -7602,6 +7679,10 @@ async function runStatus(runtime, options) {
   print();
   print(`  Data directory:     ${runtime.paths.dataDir}`);
   print(`  Log:                ${runtime.paths.logFile}`);
+  if (skipped > 0) {
+    print(`  WARNING:            ${String(skipped)} project(s) or session(s) cannot be archived`);
+    print(`                      Their names are unusable as paths; see the log.`);
+  }
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
     print(`                      That file outranks the one this plugin wrote.`);

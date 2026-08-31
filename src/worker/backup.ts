@@ -303,13 +303,20 @@ async function publish(
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
       bundleSha256: bundle.sha256,
+      // From the same hashing pass that verifyBundleContents checked the
+      // bundle against, so it describes the archived bytes. Hashing the file
+      // separately opens a window in which a live session appends between the
+      // hash and the read, leaving a row that verifies but cannot be restored.
+      transcriptSha256:
+        files.find((file) => file.path === `${session.sessionId}.jsonl`)?.sha256 ?? null,
     },
     ctx.clock.now(),
   );
 
   // Only now, with the replacement verified and recorded, is the previous
   // bundle safe to retire. Failing to remove it wastes space and loses nothing.
-  if (supersededId !== null && supersededId !== remote.id) {
+  const sameProject = previous?.encodedDir === session.encodedDir;
+  if (supersededId !== null && supersededId !== remote.id && sameProject) {
     try {
       await ctx.drive.deleteFile(supersededId, ctx.signal);
     } catch (err) {
@@ -332,9 +339,19 @@ export async function verifyRemote(
   uploaded: RemoteFile,
   bundle: { bytes: number; sha256: string; md5: string },
 ): Promise<void> {
-  const meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
-  const problem = compareChecksums(meta, bundle);
+  let meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+  let problem = compareChecksums(meta, bundle);
   if (problem === null) return;
+
+  // Drive computes checksums asynchronously, so a read taken immediately after
+  // an upload can legitimately come back without one. Ask a second time before
+  // concluding the file is wrong, because the conclusion deletes it.
+  if (meta.sha256 === null && meta.md5 === null) {
+    await ctx.clock.sleep(2_000);
+    meta = await ctx.drive.getFile(uploaded.id, ctx.signal);
+    problem = compareChecksums(meta, bundle);
+    if (problem === null) return;
+  }
 
   ctx.logger.error('backup.verification_failed', { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());

@@ -273,6 +273,16 @@ var MIGRATIONS = [
   // markVerified, so it always describes the copy Drive holds.
   `
   ALTER TABLE sessions ADD COLUMN verified_bundle_sha256 TEXT;
+  `,
+  // 4 — the transcript hash belonging to the copy Drive holds.
+  //
+  // `transcript_sha256` is written by every indexing pass, before a bundle
+  // exists and whether or not the upload ever lands. Restoring against it meant
+  // one failed upload made a session permanently unrestorable: the pointer
+  // described the archived copy, the hash described the newer local one, and
+  // every restore attempt failed the check and deleted what it had unpacked.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -903,6 +913,9 @@ function createDriveTransport(deps) {
     if (response.status === 403 && isQuotaExhausted(body)) {
       throw new FatalError(message, "Free space in Google Drive, then run /archive:now.");
     }
+    if (response.status === 403 && isRateLimited(body)) {
+      throw new RetryableError(message, { status: response.status });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, "Run /archive:status for details.");
     }
@@ -1154,6 +1167,10 @@ function asNumber(value) {
   if (typeof value !== "string") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+function isRateLimited(body) {
+  const text = JSON.stringify(body ?? "");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -1458,7 +1475,7 @@ function enqueue(db, args, now) {
 }
 
 // src/core/identifiers.ts
-var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,253}$/;
 function isSafePathSegment(value) {
   if (!SAFE_SEGMENT.test(value)) return false;
   if (value === "." || value === "..") return false;
