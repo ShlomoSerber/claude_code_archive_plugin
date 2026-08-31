@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { UploadSessionExpired } from '../../src/core/errors.ts';
+import { FatalError, UploadSessionExpired } from '../../src/core/errors.ts';
 import type {
   DriveTransport,
   RemoteFile,
@@ -43,6 +43,8 @@ export type FakeDriveOptions = {
   corruptChecksums?: boolean;
   /** Return no checksum at all, as Drive does for some files. */
   omitSha256?: boolean;
+  /** Start failing uploads once this many have succeeded, to model a bad day. */
+  failUploadsAfter?: number;
 };
 
 export class FakeDrive implements DriveTransport {
@@ -53,6 +55,7 @@ export class FakeDrive implements DriveTransport {
 
   private sessions = new Map<string, Session>();
   private nextId = 1;
+  private completedUploads = 0;
 
   constructor(options: FakeDriveOptions = {}) {
     this.options = options;
@@ -136,6 +139,14 @@ export class FakeDrive implements DriveTransport {
     if (session.received.length < session.totalBytes) {
       return Promise.resolve({ confirmedBytes: session.received.length, done: false, file: null });
     }
+    if (
+      this.options.failUploadsAfter !== undefined &&
+      this.completedUploads >= this.options.failUploadsAfter
+    ) {
+      this.sessions.delete(args.uploadUri);
+      throw new Error('Drive is having a bad day');
+    }
+    this.completedUploads++;
     const stored = this.store(session);
     this.sessions.delete(args.uploadUri);
     return Promise.resolve({ confirmedBytes: session.totalBytes, done: true, file: stored });
@@ -177,7 +188,12 @@ export class FakeDrive implements DriveTransport {
   getFile(fileId: string): Promise<RemoteFile> {
     this.calls.push(`getFile:${fileId}`);
     const file = this.files.get(fileId);
-    if (file === undefined) throw new Error(`no such file ${fileId}`);
+    // The real transport turns Drive 4xx, including 404, into a FatalError.
+    // A fake that throws something else lets code pass tests it would fail
+    // against Google.
+    if (file === undefined) {
+      throw new FatalError(`no such file ${fileId}`, 'Run /archive:now to re-upload it.');
+    }
     return Promise.resolve(this.describe(file));
   }
 
@@ -190,7 +206,9 @@ export class FakeDrive implements DriveTransport {
   async downloadToFile(args: { fileId: string; destination: string }): Promise<void> {
     this.calls.push(`downloadToFile:${args.fileId}`);
     const file = this.files.get(args.fileId);
-    if (file === undefined) throw new Error(`no such file ${args.fileId}`);
+    if (file === undefined) {
+      throw new FatalError(`no such file ${args.fileId}`, 'Run /archive:now to re-upload it.');
+    }
     await fsp.mkdir(path.dirname(args.destination), { recursive: true });
     await fsp.writeFile(args.destination, file.content);
   }

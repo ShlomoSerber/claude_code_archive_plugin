@@ -244,10 +244,18 @@ async function publish(
     ctx.signal,
   );
 
+  // The state recorded here is what the reaper will later compare the disk
+  // against. It must describe the files this bundle was actually made from, so
+  // it is taken from the same stat the bundling used, not from a fresh one.
   markVerified(
     ctx.db,
     session.sessionId,
-    { fileId: remote.id, path: `${folderPath.join('/')}/${bundle.name}` },
+    {
+      fileId: remote.id,
+      path: `${folderPath.join('/')}/${bundle.name}`,
+      localMtime: Math.trunc(session.mtimeMs),
+      localBytes: session.transcriptBytes + session.sidecarBytes,
+    },
     ctx.clock.now(),
   );
   return remote;

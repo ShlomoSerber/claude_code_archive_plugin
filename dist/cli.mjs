@@ -252,6 +252,16 @@ var MIGRATIONS = [
     value      TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   ) STRICT;
+  `,
+  // 2 — record the local state that was actually archived.
+  //
+  // Change detection used to compare against `last_local_mtime`, which several
+  // writers touch for reasons that have nothing to do with a successful backup.
+  // These two columns are written only by markVerified, so "has this file
+  // changed since the copy on Drive was made" has an honest answer.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_local_mtime INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_local_bytes INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1842,15 +1852,39 @@ function writeCache(file, found) {
 
 // src/worker/sweep.ts
 import fsp11 from "node:fs/promises";
-import path12 from "node:path";
+import path14 from "node:path";
 
 // src/adapters/session-scan.ts
 import fsp6 from "node:fs/promises";
+import path10 from "node:path";
+
+// src/core/identifiers.ts
 import path9 from "node:path";
+var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+function isSafePathSegment(value) {
+  if (!SAFE_SEGMENT.test(value)) return false;
+  if (value === "." || value === "..") return false;
+  if (value.includes("/") || value.includes("\\")) return false;
+  return true;
+}
+var isSafeSessionId = isSafePathSegment;
+var isSafeEncodedDir = isSafePathSegment;
+function assertInside(root, target, what) {
+  const resolvedRoot = path9.resolve(root);
+  const resolvedTarget = path9.resolve(target);
+  if (resolvedTarget === resolvedRoot) {
+    throw new BugError(`${what} resolved to the root itself: ${resolvedTarget}`);
+  }
+  if (!resolvedTarget.startsWith(resolvedRoot + path9.sep)) {
+    throw new BugError(`${what} escaped ${resolvedRoot}: ${resolvedTarget}`);
+  }
+}
+
+// src/adapters/session-scan.ts
 async function statSession(paths, encodedDir, sessionId) {
-  const dir = path9.join(paths.projectsDir, encodedDir);
-  const transcriptPath = path9.join(dir, `${sessionId}.jsonl`);
-  const sidecarDir = path9.join(dir, sessionId);
+  const dir = path10.join(paths.projectsDir, encodedDir);
+  const transcriptPath = path10.join(dir, `${sessionId}.jsonl`);
+  const sidecarDir = path10.join(dir, sessionId);
   let transcript;
   try {
     transcript = await fsp6.stat(transcriptPath);
@@ -1878,15 +1912,17 @@ async function* scanSessions(paths) {
     return;
   }
   for (const encodedDir of projectDirs) {
+    if (!isSafeEncodedDir(encodedDir)) continue;
     let entries;
     try {
-      entries = await fsp6.readdir(path9.join(paths.projectsDir, encodedDir));
+      entries = await fsp6.readdir(path10.join(paths.projectsDir, encodedDir));
     } catch {
       continue;
     }
     for (const entry of entries) {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionId = entry.slice(0, -".jsonl".length);
+      if (!isSafeSessionId(sessionId)) continue;
       const session = await statSession(paths, encodedDir, sessionId);
       if (session !== null) yield session;
     }
@@ -1901,7 +1937,7 @@ async function measureDirectory(dir) {
   }
   let bytes = 0;
   let mtimeMs = 0;
-  const stack = entries.map((entry) => path9.join(dir, entry));
+  const stack = entries.map((entry) => path10.join(dir, entry));
   while (stack.length > 0) {
     const current = stack.pop();
     if (current === void 0) break;
@@ -1914,7 +1950,7 @@ async function measureDirectory(dir) {
     mtimeMs = Math.max(mtimeMs, stat.mtimeMs);
     if (stat.isDirectory()) {
       try {
-        for (const child of await fsp6.readdir(current)) stack.push(path9.join(current, child));
+        for (const child of await fsp6.readdir(current)) stack.push(path10.join(current, child));
       } catch {
       }
     } else if (stat.isFile()) {
@@ -1934,7 +1970,7 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   started_at, ended_at, message_count, transcript_bytes, transcript_sha256, sidecar_bytes,
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
-  created_at, updated_at`;
+  verified_local_mtime, verified_local_bytes, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -1998,7 +2034,8 @@ function markBundled(db, sessionId, backup, now) {
   db.prepare(
     `UPDATE sessions
         SET bundle_name = ?, bundle_bytes = ?, bundle_sha256 = ?, archiver_version = ?,
-            verified_at = NULL, updated_at = ?
+            verified_at = NULL, verified_local_mtime = NULL, verified_local_bytes = NULL,
+            updated_at = ?
       WHERE session_id = ?`
   ).run(
     backup.bundleName,
@@ -2012,13 +2049,17 @@ function markBundled(db, sessionId, backup, now) {
 function markVerified(db, sessionId, remote, now) {
   db.prepare(
     `UPDATE sessions
-        SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?, updated_at = ?
+        SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
+            verified_local_mtime = ?, verified_local_bytes = ?, updated_at = ?
       WHERE session_id = ?`
-  ).run(remote.fileId, remote.path, now, now, now, sessionId);
+  ).run(remote.fileId, remote.path, now, now, remote.localMtime, remote.localBytes, now, sessionId);
 }
 function clearVerification(db, sessionId, now) {
   db.prepare(
-    "UPDATE sessions SET verified_at = NULL, remote_file_id = NULL, updated_at = ? WHERE session_id = ?"
+    `UPDATE sessions
+        SET verified_at = NULL, remote_file_id = NULL,
+            verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
+      WHERE session_id = ?`
   ).run(now, sessionId);
 }
 function markLocalDeleted(db, sessionId, now) {
@@ -2047,8 +2088,10 @@ function listReapable(db, idleBefore, limit = 500) {
         WHERE local_present = 1
           AND verified_at IS NOT NULL
           AND bundle_sha256 IS NOT NULL
-          AND COALESCE(last_local_mtime, ended_at, 0) < ?
-        ORDER BY COALESCE(last_local_mtime, ended_at, 0) ASC
+          AND remote_file_id IS NOT NULL
+          AND verified_local_mtime IS NOT NULL
+          AND verified_local_mtime < ?
+        ORDER BY verified_local_mtime ASC
         LIMIT ?`
   ).all(idleBefore, limit);
   return rows.map(toRecord);
@@ -2117,6 +2160,8 @@ function toRecord(row) {
     localPresent: row.local_present !== 0,
     localDeletedAt: row.local_deleted_at,
     lastLocalMtime: row.last_local_mtime,
+    verifiedLocalMtime: row.verified_local_mtime,
+    verifiedLocalBytes: row.verified_local_bytes,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2261,12 +2306,12 @@ var KV = {
 
 // src/worker/backup.ts
 import fsp9 from "node:fs/promises";
-import path11 from "node:path";
+import path12 from "node:path";
 
 // src/adapters/bundle.ts
 import fsp7 from "node:fs/promises";
 import fs7 from "node:fs";
-import path10 from "node:path";
+import path11 from "node:path";
 import zlib from "node:zlib";
 import { pipeline as pipeline3 } from "node:stream/promises";
 
@@ -5281,7 +5326,7 @@ function createHashTee(algorithms = ["sha256", "md5"]) {
 var DEFAULT_ZSTD_LEVEL = 19;
 async function createBundle(input) {
   const level = input.compressionLevel ?? DEFAULT_ZSTD_LEVEL;
-  await fsp7.mkdir(path10.dirname(input.outputPath), { recursive: true });
+  await fsp7.mkdir(path11.dirname(input.outputPath), { recursive: true });
   const temp = siblingTempPath(input.outputPath);
   const tee = createHashTee();
   try {
@@ -5345,7 +5390,7 @@ async function describeSessionFiles(args) {
   return described;
 }
 async function describeInto(out, cwd, relative, signal) {
-  const absolute = path10.join(cwd, relative);
+  const absolute = path11.join(cwd, relative);
   let stat;
   try {
     stat = await fsp7.stat(absolute);
@@ -5363,11 +5408,11 @@ async function describeInto(out, cwd, relative, signal) {
   if (!stat.isDirectory()) return;
   const children = await fsp7.readdir(absolute);
   for (const child of children) {
-    await describeInto(out, cwd, path10.join(relative, child), signal);
+    await describeInto(out, cwd, path11.join(relative, child), signal);
   }
 }
 function toPosix(relative) {
-  return relative.split(path10.sep).join("/");
+  return relative.split(path11.sep).join("/");
 }
 
 // src/adapters/transcript-file.ts
@@ -5832,9 +5877,9 @@ async function buildBundle(ctx, session, index, now) {
   const date = isoDate(stamp);
   const base = bundleBaseName({ date, title, sessionId: session.sessionId });
   const name = `${base}.tar.zst`;
-  const outputPath = path11.join(ctx.paths.stagingDir, name);
+  const outputPath = path12.join(ctx.paths.stagingDir, name);
   const result = await createBundle({
-    cwd: path11.dirname(session.transcriptPath),
+    cwd: path12.dirname(session.transcriptPath),
     entries: bundleEntries(session),
     outputPath,
     compressionLevel: ctx.config.zstdLevel,
@@ -5876,7 +5921,7 @@ async function publish(ctx, job, session, bundle, index, now) {
   });
   await verifyRemote(ctx, session.sessionId, remote, bundle);
   const files = await describeSessionFiles({
-    cwd: path11.dirname(session.transcriptPath),
+    cwd: path12.dirname(session.transcriptPath),
     entries: bundleEntries(session),
     ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
   });
@@ -5912,7 +5957,12 @@ async function publish(ctx, job, session, bundle, index, now) {
   markVerified(
     ctx.db,
     session.sessionId,
-    { fileId: remote.id, path: `${folderPath.join("/")}/${bundle.name}` },
+    {
+      fileId: remote.id,
+      path: `${folderPath.join("/")}/${bundle.name}`,
+      localMtime: Math.trunc(session.mtimeMs),
+      localBytes: session.transcriptBytes + session.sidecarBytes
+    },
     ctx.clock.now()
   );
   return remote;
@@ -5941,14 +5991,24 @@ function compareChecksums(remote, bundle) {
 
 // src/worker/reap.ts
 import fsp10 from "node:fs/promises";
+import path13 from "node:path";
 async function reapLocalCopies(ctx, now) {
-  const report = { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0 };
-  if (ctx.config.keepLocalForever) return report;
+  const report = { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 };
+  if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
   const cutoff = reapCutoff(now, ctx.config.retentionDays);
   for (const record of listReapable(ctx.db, cutoff)) {
     ctx.signal?.throwIfAborted();
     const log = ctx.logger.child({ session_id: record.sessionId });
-    if (record.verifiedAt === null || record.bundleSha256 === null || record.remoteFileId === null) {
+    const target = safeTarget(ctx, record);
+    if (target === null) {
+      log.error("reap.unsafe_identifiers", {
+        encoded_dir: record.encodedDir,
+        reason: "identifier or path failed validation"
+      });
+      report.skipped++;
+      continue;
+    }
+    if (!hasVerifiedState(record)) {
       report.skipped++;
       continue;
     }
@@ -5957,7 +6017,7 @@ async function reapLocalCopies(ctx, now) {
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;
     }
-    if (Math.trunc(onDisk.mtimeMs) > (record.lastLocalMtime ?? 0)) {
+    if (changedSinceVerification(record, onDisk)) {
       markLocalPresent(ctx.db, record.sessionId, Math.trunc(onDisk.mtimeMs), now);
       enqueue(
         ctx.db,
@@ -5968,17 +6028,27 @@ async function reapLocalCopies(ctx, now) {
       report.requeued++;
       continue;
     }
-    if (onDisk.mtimeMs >= cutoff) {
+    if (Math.trunc(onDisk.mtimeMs) >= cutoff) {
       report.skipped++;
       continue;
     }
-    try {
-      await fsp10.rm(onDisk.transcriptPath, { force: true });
-      if (onDisk.hasSidecar) {
-        await fsp10.rm(onDisk.sidecarDir, { recursive: true, force: true });
-      }
-    } catch (err) {
-      log.warn("reap.delete_failed", {}, err);
+    const remote = await confirmRemote(ctx, record);
+    if (remote === "gone") {
+      log.warn("reap.remote_no_longer_valid");
+      clearVerification(ctx.db, record.sessionId, now);
+      enqueue(
+        ctx.db,
+        { kind: "backup", sessionId: record.sessionId, payload: { encodedDir: record.encodedDir } },
+        now
+      );
+      report.unverified++;
+      continue;
+    }
+    if (remote === "unavailable") {
+      report.skipped++;
+      continue;
+    }
+    if (!await removeLocalCopy(ctx, onDisk, target)) {
       report.skipped++;
       continue;
     }
@@ -5988,6 +6058,63 @@ async function reapLocalCopies(ctx, now) {
     log.info("reap.deleted", { bytes: onDisk.transcriptBytes + onDisk.sidecarBytes });
   }
   return report;
+}
+function safeTarget(ctx, record) {
+  if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) return null;
+  const projectDir = path13.join(ctx.paths.projectsDir, record.encodedDir);
+  const target = {
+    transcriptPath: path13.join(projectDir, `${record.sessionId}.jsonl`),
+    sidecarDir: path13.join(projectDir, record.sessionId)
+  };
+  try {
+    assertInside(ctx.paths.projectsDir, projectDir, "project directory");
+    assertInside(projectDir, target.transcriptPath, "transcript");
+    assertInside(projectDir, target.sidecarDir, "sidecar directory");
+  } catch {
+    return null;
+  }
+  return target;
+}
+function hasVerifiedState(record) {
+  return record.verifiedAt !== null && record.bundleSha256 !== null && record.remoteFileId !== null && record.verifiedLocalMtime !== null;
+}
+function changedSinceVerification(record, onDisk) {
+  if (Math.trunc(onDisk.mtimeMs) !== record.verifiedLocalMtime) return true;
+  const bytes = onDisk.transcriptBytes + onDisk.sidecarBytes;
+  return record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes;
+}
+async function confirmRemote(ctx, record) {
+  if (record.remoteFileId === null) return "gone";
+  try {
+    const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
+    if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
+      return "gone";
+    }
+    if (remote.sha256 === null) return "gone";
+    return remote.sha256.toLowerCase() === record.bundleSha256?.toLowerCase() ? "ok" : "gone";
+  } catch (err) {
+    if (err instanceof FatalError) return "gone";
+    ctx.logger.warn("reap.remote_check_failed", { session_id: record.sessionId }, err);
+    return "unavailable";
+  }
+}
+async function removeLocalCopy(ctx, onDisk, target) {
+  const log = ctx.logger.child({ session_id: onDisk.sessionId });
+  if (onDisk.hasSidecar) {
+    try {
+      await fsp10.rm(target.sidecarDir, { recursive: true, force: true });
+    } catch (err) {
+      log.warn("reap.sidecar_delete_failed", {}, err);
+      return false;
+    }
+  }
+  try {
+    await fsp10.rm(target.transcriptPath, { force: true });
+    return true;
+  } catch (err) {
+    log.warn("reap.delete_failed", {}, err);
+    return false;
+  }
 }
 
 // src/worker/sweep.ts
@@ -6002,12 +6129,17 @@ async function runSweep(ctx, options = {}) {
     verified: 0,
     failed: 0,
     blocked: 0,
-    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0 },
+    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 },
     catalogUploaded: false,
     cooledDown: false,
     budgetExhausted: false,
     lastError: null
   };
+  if (!ctx.config.enabled) {
+    ctx.logger.info("sweep.disabled");
+    report.durationMs = ctx.clock.now() - startedAt;
+    return report;
+  }
   const cooldownUntil = kvGetNumber(ctx.db, KV.circuitUntil) ?? 0;
   if (options.force !== true && cooldownUntil > startedAt) {
     ctx.logger.info("sweep.cooling_down", { until: cooldownUntil });
@@ -6064,7 +6196,8 @@ async function discover(ctx, now) {
     } else if (!known.localPresent || (known.lastLocalMtime ?? 0) !== mtime) {
       markLocalPresent(ctx.db, session.sessionId, mtime, now);
     }
-    const needsBackup = known?.verifiedAt == null || (known.lastLocalMtime ?? 0) < mtime;
+    const bytes = session.transcriptBytes + session.sidecarBytes;
+    const needsBackup = known?.verifiedAt == null || known.verifiedLocalMtime !== mtime || known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes;
     if (needsBackup) {
       enqueue(
         ctx.db,
@@ -6160,7 +6293,7 @@ function catalogCopyIsStale(ctx) {
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;
 }
 async function uploadCatalogCopy(ctx) {
-  const destination = path12.join(ctx.paths.stagingDir, "catalog.sqlite");
+  const destination = path14.join(ctx.paths.stagingDir, "catalog.sqlite");
   try {
     await fsp11.mkdir(ctx.paths.stagingDir, { recursive: true });
     await fsp11.rm(destination, { force: true });
@@ -6239,7 +6372,7 @@ async function readStatusFile(file) {
 // src/adapters/lock.ts
 import fs8 from "node:fs";
 import os4 from "node:os";
-import path13 from "node:path";
+import path15 from "node:path";
 var META_FILE = "owner.json";
 var DEFAULT_HEARTBEAT_MS = 5e3;
 var MIN_STALE_MS = 1e4;
@@ -6260,7 +6393,7 @@ function acquireLock(dir, options = {}) {
     if (!tryMkdir(dir)) return null;
   }
   try {
-    fs8.writeFileSync(path13.join(dir, META_FILE), JSON.stringify(owner), { mode: 384 });
+    fs8.writeFileSync(path15.join(dir, META_FILE), JSON.stringify(owner), { mode: 384 });
   } catch {
   }
   const timer = setInterval(() => {
@@ -6286,7 +6419,7 @@ function tryMkdir(dir) {
   } catch (err) {
     if (err.code === "EEXIST") return false;
     if (err.code === "ENOENT") {
-      fs8.mkdirSync(path13.dirname(dir), { recursive: true });
+      fs8.mkdirSync(path15.dirname(dir), { recursive: true });
       return tryMkdir(dir);
     }
     throw err;
@@ -6301,7 +6434,7 @@ function heartbeat(dir, clock) {
 }
 function readOwner(dir) {
   try {
-    const raw = fs8.readFileSync(path13.join(dir, META_FILE), "utf8");
+    const raw = fs8.readFileSync(path15.join(dir, META_FILE), "utf8");
     const parsed = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
     const { pid, hostname, startedAt } = parsed;
@@ -6713,7 +6846,7 @@ function addMonths(epochMs, months) {
 
 // src/worker/restore.ts
 import fsp13 from "node:fs/promises";
-import path14 from "node:path";
+import path16 from "node:path";
 async function restoreSession(ctx, sessionId) {
   const record = getSession(ctx.db, sessionId);
   if (record === null) {
@@ -6722,7 +6855,14 @@ async function restoreSession(ctx, sessionId) {
       "Run /archive:search to find the session id, or /archive:now to rescan."
     );
   }
-  const targetDir = path14.join(ctx.paths.projectsDir, record.encodedDir);
+  if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+    throw new FatalError(
+      `the catalog entry for ${sessionId} has an unusable project or session id`,
+      "Run /archive:now to rebuild the catalog from the sessions on disk."
+    );
+  }
+  const targetDir = path16.join(ctx.paths.projectsDir, record.encodedDir);
+  assertInside(ctx.paths.projectsDir, targetDir, "restore target");
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
   if (existing !== null) {
     markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
@@ -6737,7 +6877,7 @@ async function restoreSession(ctx, sessionId) {
     };
   }
   const remoteFileId = requireRemote(record);
-  const staged = path14.join(ctx.paths.stagingDir, `${sessionId}.restore.tar.zst`);
+  const staged = path16.join(ctx.paths.stagingDir, `${sessionId}.restore.tar.zst`);
   try {
     await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
     if (record.bundleSha256 !== null) {
@@ -6761,7 +6901,7 @@ async function restoreSession(ctx, sessionId) {
       sessionId,
       encodedDir: record.encodedDir,
       projectCwd: record.projectCwd,
-      transcriptPath: path14.join(targetDir, `${sessionId}.jsonl`),
+      transcriptPath: path16.join(targetDir, `${sessionId}.jsonl`),
       entries,
       alreadyLocal: false,
       resumeCommand: resumeCommand(sessionId)
@@ -6794,9 +6934,14 @@ async function verifyArchive(ctx, records) {
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
       const reason = describeMismatch(record, remote.size, remote.sha256);
-      if (reason === null) report.ok++;
-      else report.mismatched.push({ sessionId: record.sessionId, reason });
+      if (reason === null) {
+        report.ok++;
+      } else {
+        clearVerification(ctx.db, record.sessionId, ctx.clock.now());
+        report.mismatched.push({ sessionId: record.sessionId, reason });
+      }
     } catch (err) {
+      clearVerification(ctx.db, record.sessionId, ctx.clock.now());
       report.mismatched.push({
         sessionId: record.sessionId,
         reason: err instanceof Error ? err.message : "unreadable"
@@ -6908,25 +7053,36 @@ function resolveSessionId(runtime, query) {
 
 // src/commands/setup.ts
 import fsp15 from "node:fs/promises";
-import path15 from "node:path";
+import path17 from "node:path";
 
 // src/adapters/claude-settings.ts
 import fsp14 from "node:fs/promises";
 async function readCleanupPeriodDays(file) {
-  const settings = await readSettings(file);
-  const value = settings?.["cleanupPeriodDays"];
+  const read = await readSettings(file);
+  if (read.status !== "ok") return null;
+  const value = read.settings["cleanupPeriodDays"];
   return typeof value === "number" ? value : null;
 }
 async function setCleanupPeriodDays(file, days = CLEANUP_PERIOD_DAYS) {
   if (days <= 0 || days > 365e3) {
     throw new RangeError(`refusing to write cleanupPeriodDays=${String(days)}`);
   }
-  const settings = await readSettings(file) ?? {};
+  const read = await readSettings(file);
+  if (read.status === "unparseable") {
+    throw new FatalError(
+      `${file} is not valid JSON, so the plugin will not modify it`,
+      `Fix the JSON in ${file}, or move it aside, then run /archive:setup again. Until then Claude Code's own 30-day transcript cleanup stays in charge.`
+    );
+  }
+  const settings = read.status === "ok" ? read.settings : {};
   const previous = typeof settings["cleanupPeriodDays"] === "number" ? settings["cleanupPeriodDays"] : null;
   if (previous === days) return { changed: false, previous, current: days };
   settings["cleanupPeriodDays"] = days;
-  await writeFileAtomic(file, `${JSON.stringify(settings, null, 2)}
-`, { mode: 420 });
+  const target = await resolveLink(file);
+  await writeFileAtomic(target, `${JSON.stringify(settings, null, 2)}
+`, {
+    mode: await currentMode(target, 384)
+  });
   return { changed: true, previous, current: days };
 }
 async function readSettings(file) {
@@ -6934,15 +7090,33 @@ async function readSettings(file) {
   try {
     raw = await fsp14.readFile(file, "utf8");
   } catch (err) {
-    if (err.code === "ENOENT") return null;
+    if (err.code === "ENOENT") return { status: "absent" };
     throw err;
   }
+  const text = raw.replace(/^﻿/, "").trim();
+  if (text.length === 0) return { status: "absent" };
   try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-    return parsed;
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { status: "unparseable" };
+    }
+    return { status: "ok", settings: parsed };
   } catch {
-    return null;
+    return { status: "unparseable" };
+  }
+}
+async function resolveLink(file) {
+  try {
+    return await fsp14.realpath(file);
+  } catch {
+    return file;
+  }
+}
+async function currentMode(file, fallback) {
+  try {
+    return (await fsp14.stat(file)).mode & 511;
+  } catch {
+    return fallback;
   }
 }
 
@@ -7016,7 +7190,7 @@ async function importCatalogIfEmpty(runtime) {
   const db = runtime.db();
   if (catalogStats(db).sessions > 0) return 0;
   if ((kvGetNumber(db, KV.catalogUploadedAt) ?? 0) > 0) return 0;
-  const staged = path15.join(runtime.paths.stagingDir, "catalog-recovered.sqlite");
+  const staged = path17.join(runtime.paths.stagingDir, "catalog-recovered.sqlite");
   try {
     const ctx = commandContext(runtime);
     const parentId = await ctx.drive.ensureFolder([runtime.config.driveRootFolder], ctx.signal);
@@ -7054,6 +7228,10 @@ function importCatalogFile(runtime, file) {
     const selectFiles = source.prepare("SELECT path FROM session_files WHERE session_id = ?");
     for (const row of rows) {
       const record = toRecord(row);
+      if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+        warn(`Skipped a recovered catalog row with an unusable id: ${record.sessionId}`);
+        continue;
+      }
       const values = row;
       insertSession.run(...columnNames.map((name) => values[name] ?? null));
       db.prepare("UPDATE sessions SET local_present = 0 WHERE session_id = ?").run(

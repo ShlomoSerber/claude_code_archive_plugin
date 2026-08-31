@@ -73,12 +73,18 @@ export async function runSweep(
     verified: 0,
     failed: 0,
     blocked: 0,
-    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0 },
+    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 },
     catalogUploaded: false,
     cooledDown: false,
     budgetExhausted: false,
     lastError: null,
   };
+
+  if (!ctx.config.enabled) {
+    ctx.logger.info('sweep.disabled');
+    report.durationMs = ctx.clock.now() - startedAt;
+    return report;
+  }
 
   const cooldownUntil = kvGetNumber(ctx.db, KV.circuitUntil) ?? 0;
   if (options.force !== true && cooldownUntil > startedAt) {
@@ -156,7 +162,14 @@ async function discover(
       markLocalPresent(ctx.db, session.sessionId, mtime, now);
     }
 
-    const needsBackup = known?.verifiedAt == null || (known.lastLocalMtime ?? 0) < mtime;
+    // Any difference counts, not only a later mtime: restores, rsync and
+    // clock corrections all move a timestamp backwards, and a coarse
+    // filesystem can leave it identical across a real edit — hence the size.
+    const bytes = session.transcriptBytes + session.sidecarBytes;
+    const needsBackup =
+      known?.verifiedAt == null ||
+      known.verifiedLocalMtime !== mtime ||
+      (known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes);
     if (needsBackup) {
       enqueue(
         ctx.db,

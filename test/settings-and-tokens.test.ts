@@ -10,6 +10,7 @@ import {
 } from '../src/adapters/claude-settings.ts';
 import { createFileTokenStore, createMemoryTokenStore } from '../src/adapters/token-file.ts';
 import { CLEANUP_PERIOD_DAYS } from '../src/core/config.ts';
+import { FatalError } from '../src/core/errors.ts';
 import { buildManifest, parseManifest, MANIFEST_VERSION } from '../src/core/manifest.ts';
 import { tempDir } from './helpers.ts';
 
@@ -33,10 +34,12 @@ describe('setCleanupPeriodDays', () => {
       }),
     );
     await setCleanupPeriodDays(file);
-    const settings = await readSettings(file);
-    assert.equal(settings?.['model'], 'opus');
-    assert.deepEqual(settings?.['permissions'], { allow: ['Bash(ls:*)'] });
-    assert.equal(settings?.['cleanupPeriodDays'], CLEANUP_PERIOD_DAYS);
+    const read = await readSettings(file);
+    assert.equal(read.status, 'ok');
+    const settings = read.status === 'ok' ? read.settings : {};
+    assert.equal(settings['model'], 'opus');
+    assert.deepEqual(settings['permissions'], { allow: ['Bash(ls:*)'] });
+    assert.equal(settings['cleanupPeriodDays'], CLEANUP_PERIOD_DAYS);
   });
 
   it('does not rewrite a file that already says the right thing', async () => {
@@ -59,11 +62,65 @@ describe('setCleanupPeriodDays', () => {
 
   it('never overwrites settings it could not parse', async () => {
     const file = path.join(tempDir(), 'settings.json');
-    await fsp.writeFile(file, '{ this is not json');
-    await setCleanupPeriodDays(file);
-    // The plugin writes a fresh file rather than losing content it understood,
-    // and readSettings reports the unreadable original as absent.
+    const original = '{ "model": "opus", }';
+    await fsp.writeFile(file, original);
+
+    await assert.rejects(setCleanupPeriodDays(file), FatalError);
+    assert.equal(await fsp.readFile(file, 'utf8'), original, 'the file is untouched');
+  });
+
+  it('refuses every shape of unparseable file rather than replacing it', async () => {
+    for (const content of [
+      '{ "model": "opus", }', // trailing comma
+      '{ // a comment\n "model": "opus" }',
+      '\uFEFF{ "model": "opus" ', // BOM plus truncation
+      '[1, 2, 3]', // valid JSON, wrong shape
+      'null',
+    ]) {
+      const file = path.join(tempDir(), 'settings.json');
+      await fsp.writeFile(file, content);
+      await assert.rejects(setCleanupPeriodDays(file), FatalError, content);
+      assert.equal(await fsp.readFile(file, 'utf8'), content);
+    }
+  });
+
+  it('treats an empty file as absent, since there is nothing to lose', async () => {
+    const file = path.join(tempDir(), 'settings.json');
+    await fsp.writeFile(file, '   \n');
+    const result = await setCleanupPeriodDays(file);
+    assert.equal(result.changed, true);
     assert.equal(await readCleanupPeriodDays(file), CLEANUP_PERIOD_DAYS);
+  });
+
+  it('writes through a symlink instead of replacing it', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('symlinks need elevation on Windows');
+      return;
+    }
+    const dir = tempDir();
+    const real = path.join(dir, 'real-settings.json');
+    const link = path.join(dir, 'settings.json');
+    await fsp.writeFile(real, JSON.stringify({ model: 'opus' }));
+    await fsp.symlink(real, link);
+
+    await setCleanupPeriodDays(link);
+
+    assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link survives');
+    const settings = JSON.parse(await fsp.readFile(real, 'utf8')) as Record<string, unknown>;
+    assert.equal(settings['model'], 'opus');
+    assert.equal(settings['cleanupPeriodDays'], CLEANUP_PERIOD_DAYS);
+  });
+
+  it('keeps the permissions the user had on the file', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permissions do not apply on Windows');
+      return;
+    }
+    const file = path.join(tempDir(), 'settings.json');
+    await fsp.writeFile(file, '{}', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    await setCleanupPeriodDays(file);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   });
 });
 

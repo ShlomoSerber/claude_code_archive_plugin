@@ -5,6 +5,8 @@ import { sha256File } from '../adapters/hashing.ts';
 import { statSession } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, type SessionRecord } from '../core/catalog.ts';
 import { FatalError, RetryableError } from '../core/errors.ts';
+import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
+import { clearVerification } from '../core/catalog.ts';
 import type { WorkerContext } from './context.ts';
 
 /**
@@ -38,7 +40,14 @@ export async function restoreSession(
     );
   }
 
+  if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+    throw new FatalError(
+      `the catalog entry for ${sessionId} has an unusable project or session id`,
+      'Run /archive:now to rebuild the catalog from the sessions on disk.',
+    );
+  }
   const targetDir = path.join(ctx.paths.projectsDir, record.encodedDir);
+  assertInside(ctx.paths.projectsDir, targetDir, 'restore target');
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
   if (existing !== null) {
     // Already on disk. Restoring over it could only lose the newer copy.
@@ -134,9 +143,17 @@ export async function verifyArchive(
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
       const reason = describeMismatch(record, remote.size, remote.sha256);
-      if (reason === null) report.ok++;
-      else report.mismatched.push({ sessionId: record.sessionId, reason });
+      if (reason === null) {
+        report.ok++;
+      } else {
+        // A check that only reports is decoration. Withdrawing verification is
+        // what stops the reaper deleting the local copy of a bundle that Drive
+        // no longer holds intact.
+        clearVerification(ctx.db, record.sessionId, ctx.clock.now());
+        report.mismatched.push({ sessionId: record.sessionId, reason });
+      }
     } catch (err) {
+      clearVerification(ctx.db, record.sessionId, ctx.clock.now());
       report.mismatched.push({
         sessionId: record.sessionId,
         reason: err instanceof Error ? err.message : 'unreadable',

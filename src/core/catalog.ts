@@ -31,6 +31,14 @@ export type SessionRecord = {
   localPresent: boolean;
   localDeletedAt: number | null;
   lastLocalMtime: number | null;
+  /**
+   * The mtime and total byte count of the local files at the moment the Drive
+   * copy was verified. Written only by {@link markVerified}. Change detection
+   * must compare against these, never against `lastLocalMtime`, which is
+   * advanced by scans and by indexing passes that never completed a backup.
+   */
+  verifiedLocalMtime: number | null;
+  verifiedLocalBytes: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -59,6 +67,8 @@ type SessionRow = {
   local_present: number;
   local_deleted_at: number | null;
   last_local_mtime: number | null;
+  verified_local_mtime: number | null;
+  verified_local_bytes: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -67,7 +77,7 @@ const SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, g
   started_at, ended_at, message_count, transcript_bytes, transcript_sha256, sidecar_bytes,
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
-  created_at, updated_at`;
+  verified_local_mtime, verified_local_bytes, created_at, updated_at`;
 
 /** The fields extraction knows about. Backup and verification fill the rest. */
 export type SessionUpsert = {
@@ -167,7 +177,8 @@ export function markBundled(db: Db, sessionId: string, backup: BackupRecord, now
   db.prepare(
     `UPDATE sessions
         SET bundle_name = ?, bundle_bytes = ?, bundle_sha256 = ?, archiver_version = ?,
-            verified_at = NULL, updated_at = ?
+            verified_at = NULL, verified_local_mtime = NULL, verified_local_bytes = NULL,
+            updated_at = ?
       WHERE session_id = ?`,
   ).run(
     backup.bundleName,
@@ -188,20 +199,30 @@ export function markBundled(db: Db, sessionId: string, backup: BackupRecord, now
 export function markVerified(
   db: Db,
   sessionId: string,
-  remote: { fileId: string; path: string },
+  remote: {
+    fileId: string;
+    path: string;
+    /** State of the local files that this Drive copy was made from. */
+    localMtime: number | null;
+    localBytes: number | null;
+  },
   now: number,
 ): void {
   db.prepare(
     `UPDATE sessions
-        SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?, updated_at = ?
+        SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
+            verified_local_mtime = ?, verified_local_bytes = ?, updated_at = ?
       WHERE session_id = ?`,
-  ).run(remote.fileId, remote.path, now, now, now, sessionId);
+  ).run(remote.fileId, remote.path, now, now, remote.localMtime, remote.localBytes, now, sessionId);
 }
 
 /** Verification failed or the remote copy is gone: the session must not be reaped. */
 export function clearVerification(db: Db, sessionId: string, now: number): void {
   db.prepare(
-    'UPDATE sessions SET verified_at = NULL, remote_file_id = NULL, updated_at = ? WHERE session_id = ?',
+    `UPDATE sessions
+        SET verified_at = NULL, remote_file_id = NULL,
+            verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
+      WHERE session_id = ?`,
   ).run(now, sessionId);
 }
 
@@ -251,8 +272,10 @@ export function listReapable(db: Db, idleBefore: number, limit = 500): SessionRe
         WHERE local_present = 1
           AND verified_at IS NOT NULL
           AND bundle_sha256 IS NOT NULL
-          AND COALESCE(last_local_mtime, ended_at, 0) < ?
-        ORDER BY COALESCE(last_local_mtime, ended_at, 0) ASC
+          AND remote_file_id IS NOT NULL
+          AND verified_local_mtime IS NOT NULL
+          AND verified_local_mtime < ?
+        ORDER BY verified_local_mtime ASC
         LIMIT ?`,
     )
     .all(idleBefore, limit) as SessionRow[];
@@ -342,6 +365,8 @@ export function toRecord(row: SessionRow): SessionRecord {
     localPresent: row.local_present !== 0,
     localDeletedAt: row.local_deleted_at,
     lastLocalMtime: row.last_local_mtime,
+    verifiedLocalMtime: row.verified_local_mtime,
+    verifiedLocalBytes: row.verified_local_bytes,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

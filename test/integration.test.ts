@@ -7,6 +7,7 @@ import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import { getSession } from '../src/core/catalog.ts';
 import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.ts';
+import { RetryableError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import { listJobs } from '../src/core/queue.ts';
 import { runSweep } from '../src/worker/sweep.ts';
@@ -388,5 +389,152 @@ describe('bundle naming', () => {
     await runSweep(harness.ctx);
     // No timestamps to read, so the name comes from mtime and still parses.
     assert.match(getSession(harness.ctx.db, broken)?.bundleName ?? '', /^\d{4}-\d\d-\d\d_/);
+  });
+});
+
+/**
+ * Regression tests for an independent safety audit that found three ways this
+ * plugin could delete conversations that were not safely stored anywhere.
+ *
+ * Each test below reproduces one of those findings. They exist because 313
+ * passing tests did not catch any of them.
+ */
+describe('deletion safety', () => {
+  const DAY = DAY_MS;
+
+  async function archived(overrides: Partial<ArchiveConfig> = {}, drive = new FakeDrive()) {
+    const harness = makeHarness({ retentionDays: 30, ...overrides }, drive);
+    await runSweep(harness.ctx);
+    return harness;
+  }
+
+  it('does not delete a session whose re-upload failed after it was indexed', async () => {
+    // The original defect: indexing advanced the recorded mtime before the
+    // upload was attempted, so a failure in between left a row claiming to be
+    // verified with an mtime matching the changed file on disk.
+    const drive = new FakeDrive({ failUploadsAfter: 2 });
+    const harness = await archived({}, drive);
+
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), later, later);
+
+    harness.clock.advance(60_000);
+    const second = await runSweep(harness.ctx);
+    assert.ok(second.failed > 0, 'the re-upload really did fail');
+
+    harness.clock.advance(400 * DAY);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.localPresent, true);
+  });
+
+  it('detects a change that leaves the mtime unchanged', async () => {
+    const harness = await archived();
+    const file = harness.transcriptOf(SESSION_A);
+    const before = fs.statSync(file);
+
+    fs.appendFileSync(file, '{"type":"user","content":"added"}\n');
+    // Put the timestamp back exactly: a coarse filesystem, an rsync or a
+    // restore all produce this, and mtime alone would see nothing.
+    fs.utimesSync(file, before.atime, before.mtime);
+
+    harness.clock.advance(400 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.requeued, 1);
+    assert.equal(fs.existsSync(file), true);
+  });
+
+  it('does not delete when Drive no longer holds the bundle', async () => {
+    const harness = await archived();
+    const record = getSession(harness.ctx.db, SESSION_A);
+    harness.drive.files.delete(record?.remoteFileId ?? '');
+
+    harness.clock.advance(400 * DAY);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null, 'trust withdrawn');
+  });
+
+  it('does not delete when the remote bundle no longer matches', async () => {
+    const harness = await archived();
+    const record = getSession(harness.ctx.db, SESSION_A);
+    const file = harness.drive.files.get(record?.remoteFileId ?? '');
+    if (file !== undefined) file.content = Buffer.from('something else entirely');
+
+    harness.clock.advance(400 * DAY);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('leaves everything alone when a Drive check cannot be made at all', async () => {
+    const harness = await archived();
+    harness.drive.getFile = () => Promise.reject(new RetryableError('network down'));
+
+    harness.clock.advance(400 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 0);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+    assert.notEqual(
+      getSession(harness.ctx.db, SESSION_A)?.verifiedAt,
+      null,
+      'a transient failure must not withdraw a good verification',
+    );
+  });
+
+  it('ignores a transcript whose name would escape its directory', async () => {
+    const harness = makeHarness();
+    // `...jsonl` strips to `..`, and `.jsonl` strips to the empty string.
+    // Both used to resolve to a parent directory that the reaper deletes.
+    for (const name of ['...jsonl', '.jsonl']) {
+      fs.writeFileSync(path.join(harness.projectDir, name), '{"type":"user"}\n');
+    }
+    const report = await runSweep(harness.ctx);
+
+    assert.equal(report.discovered, 2, 'only the two real sessions were seen');
+    for (const id of ['..', '']) {
+      assert.equal(getSession(harness.ctx.db, id), null);
+    }
+  });
+
+  it('refuses to reap a catalog row whose identifiers escape the projects tree', async () => {
+    const harness = await archived();
+    const outside = path.join(harness.ctx.paths.claudeDir, 'not-a-session.jsonl');
+    fs.writeFileSync(outside, 'precious');
+
+    // A row like this can arrive from a catalog downloaded off Drive.
+    harness.ctx.db
+      .prepare("UPDATE sessions SET encoded_dir = '../..' WHERE session_id = ?")
+      .run(SESSION_A);
+
+    harness.clock.advance(400 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    assert.ok(report.skipped >= 1, 'the traversing row was refused');
+    assert.equal(fs.existsSync(outside), true, 'the file outside the tree survives');
+    assert.equal(fs.existsSync(harness.ctx.paths.projectsDir), true);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('deletes nothing at all when the plugin is disabled', async () => {
+    const harness = await archived();
+    harness.ctx.config = { ...harness.ctx.config, enabled: false };
+
+    harness.clock.advance(400 * DAY);
+    const sweep = await runSweep(harness.ctx);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    assert.equal(sweep.reap.deleted, 0);
+    assert.equal(report.deleted, 0);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('still deletes a session that is genuinely safe, so the guards are not vacuous', async () => {
+    const harness = await archived();
+    harness.clock.advance(31 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 2);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false);
   });
 });

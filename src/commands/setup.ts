@@ -10,6 +10,7 @@ import {
 import { catalogStats, SESSION_COLUMNS, toRecord, type SessionRow } from '../core/catalog.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
+import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { KV } from '../core/state-keys.ts';
 import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
 import type { Runtime } from '../composition.ts';
@@ -168,6 +169,13 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
 
     for (const row of rows) {
       const record = toRecord(row);
+      // These strings become filesystem paths for the reaper and for restore.
+      // They arrived over the network, so they get the same scrutiny as a
+      // filename found on disk.
+      if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+        warn(`Skipped a recovered catalog row with an unusable id: ${record.sessionId}`);
+        continue;
+      }
       const values = row as unknown as Record<string, string | number | null | undefined>;
       insertSession.run(...columnNames.map((name) => values[name] ?? null));
       // The bytes live on Drive, not here: a recovered session is not local.

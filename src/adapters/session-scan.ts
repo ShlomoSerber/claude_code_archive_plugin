@@ -1,5 +1,6 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import type { ArchivePaths } from '../core/paths.ts';
 
 /**
@@ -65,6 +66,8 @@ export async function* scanSessions(paths: ArchivePaths): AsyncGenerator<LocalSe
     return;
   }
   for (const encodedDir of projectDirs) {
+    // A directory name that is not a plain segment cannot be joined safely.
+    if (!isSafeEncodedDir(encodedDir)) continue;
     let entries: string[];
     try {
       entries = await fsp.readdir(path.join(paths.projectsDir, encodedDir));
@@ -74,6 +77,9 @@ export async function* scanSessions(paths: ArchivePaths): AsyncGenerator<LocalSe
     for (const entry of entries) {
       if (!entry.endsWith('.jsonl')) continue;
       const sessionId = entry.slice(0, -'.jsonl'.length);
+      // `...jsonl` yields `..`, and `.jsonl` yields the empty string. Both
+      // join into the parent directory, which the reaper would then delete.
+      if (!isSafeSessionId(sessionId)) continue;
       const session = await statSession(paths, encodedDir, sessionId);
       if (session !== null) yield session;
     }

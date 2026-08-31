@@ -83,6 +83,17 @@ export const MIGRATIONS: readonly string[] = [
     updated_at INTEGER NOT NULL
   ) STRICT;
   `,
+
+  // 2 — record the local state that was actually archived.
+  //
+  // Change detection used to compare against `last_local_mtime`, which several
+  // writers touch for reasons that have nothing to do with a successful backup.
+  // These two columns are written only by markVerified, so "has this file
+  // changed since the copy on Drive was made" has an honest answer.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_local_mtime INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_local_bytes INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
