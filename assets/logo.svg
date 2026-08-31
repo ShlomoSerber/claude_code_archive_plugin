@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#D97757"/>
+  <!-- Material Design Icons "archive" (Apache-2.0). The glyph is symmetric on
+       both axes, so its bounding box centre is also its optical centre: the
+       24-unit grid is placed so unit (12,12) lands on the canvas centre. -->
+  <g transform="translate(100.08 100.08) scale(12.9932)">
+    <path d="M3,3H21V7H3V3M4,8H20V21H4V8M9.5,11A0.5,0.5 0 0,0 9,11.5V13H15V11.5A0.5,0.5 0 0,0 14.5,11H9.5Z"
+          fill="#ffffff" stroke="#000000" stroke-width="0.7"
+          stroke-linejoin="round" stroke-linecap="round"/>
+  </g>
+</svg>

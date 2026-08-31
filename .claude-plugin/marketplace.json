@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-archive",
+  "description": "Claude Code Archive: keep every session forever in Google Drive while the disk holds only the recent ones.",
+  "owner": {
+    "name": "Shlomo Serber",
+    "url": "https://github.com/ShlomoSerber"
+  },
+  "plugins": [
+    {
+      "name": "archive",
+      "source": "./",
+      "description": "Archives every Claude Code session to Google Drive when it closes, hash-verifies it, deletes the local copy only after 30 idle days, and makes the whole history searchable offline and restorable on any machine."
+    }
+  ]
+}

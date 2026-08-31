@@ -1,0 +1,88 @@
+/**
+ * Schema migrations (ARCHITECTURE §8).
+ *
+ * An ordered, append-only list. `PRAGMA user_version` records how many have
+ * run. Never edit an entry that has shipped; add a new one.
+ */
+export const MIGRATIONS: readonly string[] = [
+  // 1 — catalog, queue and key/value state.
+  `
+  CREATE TABLE sessions (
+    session_id        TEXT PRIMARY KEY,
+    encoded_dir       TEXT NOT NULL,
+    project_cwd       TEXT,
+    title             TEXT,
+    summary           TEXT,
+    git_branch        TEXT,
+    started_at        INTEGER,
+    ended_at          INTEGER,
+    message_count     INTEGER,
+    transcript_bytes  INTEGER,
+    transcript_sha256 TEXT,
+    sidecar_bytes     INTEGER,
+    bundle_name       TEXT,
+    bundle_bytes      INTEGER,
+    bundle_sha256     TEXT,
+    remote_file_id    TEXT,
+    remote_path       TEXT,
+    backed_up_at      INTEGER,
+    verified_at       INTEGER,
+    archiver_version  TEXT,
+    local_present     INTEGER NOT NULL DEFAULT 1,
+    local_deleted_at  INTEGER,
+    last_local_mtime  INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE INDEX sessions_encoded_dir ON sessions (encoded_dir);
+  CREATE INDEX sessions_ended_at    ON sessions (ended_at DESC);
+  CREATE INDEX sessions_pending     ON sessions (verified_at) WHERE verified_at IS NULL;
+  CREATE INDEX sessions_reapable    ON sessions (last_local_mtime)
+    WHERE local_present = 1 AND verified_at IS NOT NULL;
+
+  -- Every user prompt, verbatim. This is what natural-language search reads.
+  CREATE TABLE prompts (
+    session_id TEXT NOT NULL REFERENCES sessions (session_id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    ts         INTEGER,
+    text       TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+  ) STRICT;
+
+  CREATE TABLE session_files (
+    session_id TEXT NOT NULL REFERENCES sessions (session_id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    PRIMARY KEY (session_id, path)
+  ) STRICT;
+
+  -- At-least-once work queue with a visibility timeout. One live row per
+  -- (kind, session): repeated hook fires coalesce instead of piling up.
+  CREATE TABLE jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key  TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL,
+    session_id  TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    not_before  INTEGER NOT NULL DEFAULT 0,
+    visible_at  INTEGER NOT NULL DEFAULT 0,
+    blocked     INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT,
+    payload     TEXT,
+    upload_uri  TEXT,
+    last_error  TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE INDEX jobs_claimable ON jobs (not_before, id) WHERE blocked = 0;
+
+  CREATE TABLE kv (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+  `,
+];
+
+export const SCHEMA_VERSION = MIGRATIONS.length;

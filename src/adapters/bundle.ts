@@ -1,0 +1,179 @@
+import fsp from 'node:fs/promises';
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
+import * as tar from 'tar';
+import { renameWithRetry, siblingTempPath } from './atomic.ts';
+import { createHashTee, sha256File } from './hashing.ts';
+import type { ManifestFile } from '../core/manifest.ts';
+
+/**
+ * Bundling (ARCHITECTURE §5): one session becomes one `.tar.zst`.
+ *
+ * The bundle is written to a `.partial` sibling and renamed only once the
+ * bytes are on disk. An interrupted bundle is therefore never mistaken for a
+ * finished one, and rebuilding it is cheap enough that resuming a half-written
+ * zstd stream is not worth attempting.
+ */
+
+export const DEFAULT_ZSTD_LEVEL = 19;
+
+export type BundleInput = {
+  /** Directory the tar paths are relative to: the encoded project directory. */
+  cwd: string;
+  /** Entries relative to `cwd`, `/`-separated. Directories are added whole. */
+  entries: string[];
+  outputPath: string;
+  compressionLevel?: number;
+  signal?: AbortSignal;
+};
+
+export type BundleResult = {
+  path: string;
+  bytes: number;
+  sha256: string;
+  /** Drive does not return sha256 for every file, so md5 is the fallback. */
+  md5: string;
+  compressionLevel: number;
+};
+
+export async function createBundle(input: BundleInput): Promise<BundleResult> {
+  const level = input.compressionLevel ?? DEFAULT_ZSTD_LEVEL;
+  await fsp.mkdir(path.dirname(input.outputPath), { recursive: true });
+  const temp = siblingTempPath(input.outputPath);
+  const tee = createHashTee();
+
+  try {
+    const pack = tar.create(
+      {
+        cwd: input.cwd,
+        // Portable mode drops uid/gid/atime, so the same session bundles to the
+        // same bytes on macOS, Windows and Linux.
+        portable: true,
+        follow: false,
+        noDirRecurse: false,
+      },
+      input.entries,
+    );
+    const compress = zlib.createZstdCompress({
+      params: { [zlib.constants.ZSTD_c_compressionLevel]: level },
+    });
+    const sink = fs.createWriteStream(temp, { flags: 'wx', mode: 0o600 });
+    const options = input.signal === undefined ? {} : { signal: input.signal };
+    await pipeline(pack, compress, tee.stream, sink, options);
+    await fsyncPath(temp);
+    await renameWithRetry(temp, input.outputPath);
+    return {
+      path: input.outputPath,
+      bytes: tee.bytes(),
+      sha256: tee.digest('sha256'),
+      md5: tee.digest('md5'),
+      compressionLevel: level,
+    };
+  } catch (err) {
+    await fsp.rm(temp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
+async function fsyncPath(file: string): Promise<void> {
+  // Reopened read-write: on Windows, flushing buffers needs write access.
+  const handle = await fsp.open(file, 'r+');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+export type ExtractResult = {
+  entries: string[];
+};
+
+/**
+ * Unpack a bundle into `targetDir`.
+ *
+ * tar's absolute-path and `..` protections stay at their defaults; the pinned
+ * 7.5.x is the reason those defaults can be trusted.
+ */
+export async function extractBundle(args: {
+  bundlePath: string;
+  targetDir: string;
+  signal?: AbortSignal;
+}): Promise<ExtractResult> {
+  await fsp.mkdir(args.targetDir, { recursive: true });
+  const entries: string[] = [];
+  await tar.extract({
+    file: args.bundlePath,
+    cwd: args.targetDir,
+    onReadEntry: (entry) => {
+      entries.push(entry.path);
+    },
+  });
+  return { entries };
+}
+
+/** List what a bundle contains without writing anything. */
+export async function listBundle(bundlePath: string): Promise<{ path: string; size: number }[]> {
+  const entries: { path: string; size: number }[] = [];
+  await tar.list({
+    file: bundlePath,
+    onReadEntry: (entry) => {
+      entries.push({ path: entry.path, size: entry.size });
+    },
+  });
+  return entries;
+}
+
+/**
+ * Walk the files that make up a session and hash each one.
+ *
+ * These hashes go in the manifest, so a bundle can be audited against its own
+ * contents years later without the catalog.
+ */
+export async function describeSessionFiles(args: {
+  cwd: string;
+  entries: string[];
+  signal?: AbortSignal;
+}): Promise<ManifestFile[]> {
+  const described: ManifestFile[] = [];
+  for (const entry of args.entries) {
+    await describeInto(described, args.cwd, entry, args.signal);
+  }
+  described.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return described;
+}
+
+async function describeInto(
+  out: ManifestFile[],
+  cwd: string,
+  relative: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const absolute = path.join(cwd, relative);
+  let stat: fs.Stats;
+  try {
+    stat = await fsp.stat(absolute);
+  } catch {
+    return;
+  }
+  if (stat.isFile()) {
+    out.push({
+      path: toPosix(relative),
+      bytes: stat.size,
+      sha256: await sha256File(absolute, signal),
+    });
+    return;
+  }
+  if (!stat.isDirectory()) return;
+  const children = await fsp.readdir(absolute);
+  for (const child of children) {
+    await describeInto(out, cwd, path.join(relative, child), signal);
+  }
+}
+
+/** tar paths are always `/`-separated, on every platform. */
+export function toPosix(relative: string): string {
+  return relative.split(path.sep).join('/');
+}

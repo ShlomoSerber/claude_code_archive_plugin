@@ -1,0 +1,77 @@
+// Must come first: it silences the node:sqlite warning before SQLite loads.
+import '../core/quiet.ts';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRuntime } from '../composition.ts';
+import { kvGetNumber } from '../adapters/db.ts';
+import { KV } from '../core/state-keys.ts';
+import { spawnWorker } from '../adapters/spawn-worker.ts';
+import { emitSystemMessage, readHookInput } from './hook-input.ts';
+import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
+import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
+import { resolvePaths } from '../core/paths.ts';
+
+/**
+ * The `SessionStart` hook (SPEC §3).
+ *
+ * It exists to wake the sweep. The session that just started is still running,
+ * so it is not a backup candidate; everything else that was missed — a crash, a
+ * fortnight away from the machine — is what the sweep is for.
+ *
+ * The minimum interval keeps a burst of new sessions from starting a burst of
+ * workers, none of which would find anything to do.
+ */
+async function main(): Promise<void> {
+  // Checked before anything opens the database. Claude Code runs hooks with
+  // whatever `node` is on PATH, which is regularly older than the one the user
+  // installed for development.
+  const problem = nodeVersionProblem();
+  if (problem !== null) {
+    // Before giving up, look for a Node that does qualify. Most machines that
+    // land here have one installed under a version manager and simply are not
+    // pointing PATH at it. Re-exec happens before stdin is read, so the child
+    // still receives the hook payload.
+    if (!alreadyReexeced(process.env)) {
+      const better = findCompatibleNode({ cacheFile: resolvePaths(process.env).runtimeCacheFile });
+      if (better !== null) {
+        reexec(better.path);
+        return;
+      }
+    }
+    emitSystemMessage(`Claude Code Archive is not running: ${problem}. ${NODE_REMEDIATION}`);
+    return;
+  }
+  const input = await readHookInput();
+  const runtime = await createRuntime();
+  try {
+    if (!runtime.config.enabled) return;
+
+    const now = runtime.clock.now();
+    const lastSweep = kvGetNumber(runtime.db(), KV.lastSweepAt) ?? 0;
+    if (now - lastSweep < runtime.config.sweepMinIntervalMs) {
+      runtime.logger.debug('hook.session_start.too_soon', { last_sweep_at: lastSweep });
+      return;
+    }
+
+    runtime.logger.info('hook.session_start.sweeping', { source: input?.source ?? null });
+    spawnWorker({
+      workerPath: workerPath(),
+      env: process.env,
+      cwd: runtime.paths.dataDir,
+      logger: runtime.logger,
+    });
+  } finally {
+    runtime.close();
+  }
+}
+
+function workerPath(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), 'worker.mjs');
+}
+
+try {
+  await main();
+} catch {
+  // Never let a hook disturb a session that is just starting.
+}
+process.exit(0);

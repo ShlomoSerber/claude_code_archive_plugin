@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+*.tsbuildinfo
+.DS_Store
+.tmp/
+
+# Local Google OAuth client. Never committed: see README for bring-your-own setup.
+oauth-client.json

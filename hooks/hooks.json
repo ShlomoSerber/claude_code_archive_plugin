@@ -1,0 +1,25 @@
+{
+  "description": "Archive every session to Google Drive when it closes, and sweep for missed work when one starts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/session-start.mjs\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/session-end.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}
