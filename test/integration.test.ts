@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
-import { getSession } from '../src/core/catalog.ts';
+import { getSession, upsertSession } from '../src/core/catalog.ts';
 import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.ts';
 import { RetryableError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
@@ -15,6 +15,8 @@ import { restoreSession } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
+import { kvSetNumber } from '../src/adapters/db.ts';
+import { activeSessionKey } from '../src/core/state-keys.ts';
 import { FakeDrive } from './fakes/fake-drive.ts';
 import { fakeClock, tempDir } from './helpers.ts';
 
@@ -536,5 +538,145 @@ describe('deletion safety', () => {
     const report = await reapLocalCopies(harness.ctx, harness.clock.now());
     assert.equal(report.deleted, 2);
     assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false);
+  });
+});
+
+/**
+ * Second round of audit regressions. These are all one failure class: the
+ * remote copy is not as good as the code believed it to be.
+ */
+describe('deletion safety, second pass', () => {
+  const DAY = DAY_MS;
+
+  it('refuses to delete against a bundle sitting in the Drive wastebasket', async () => {
+    // Drive answers a metadata request for a trashed file with a normal 200
+    // and a valid checksum, then purges it after thirty days.
+    const harness = makeHarness({ retentionDays: 30 }, new FakeDrive({ trashed: true }));
+    await runSweep(harness.ctx);
+    harness.clock.advance(400 * DAY);
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 0);
+    assert.equal(report.unverified, 2);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('does not archive and delete in the same sweep', async () => {
+    // A first install must not delete months-old sessions minutes after its
+    // very first conversation with the Drive API.
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 7 });
+    const old = new Date(harness.clock.now() - 90 * DAY);
+    for (const id of [SESSION_A, SESSION_B]) {
+      fs.utimesSync(harness.transcriptOf(id), old, old);
+    }
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.verified, 2, 'they were archived');
+    assert.equal(report.reap.deleted, 0, 'and not deleted in the same breath');
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('deletes once the archive itself has aged past the grace period', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 7 });
+    const old = new Date(harness.clock.now() - 90 * DAY);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), old, old);
+    await runSweep(harness.ctx);
+
+    harness.clock.advance(8 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 1);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false);
+  });
+
+  it('leaves a session alone while Claude Code still has it open', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+
+    // What the SessionStart hook records while a session is running.
+    kvSetNumber(
+      harness.ctx.db,
+      activeSessionKey(SESSION_A),
+      harness.clock.now(),
+      harness.clock.now(),
+    );
+    harness.clock.advance(31 * DAY);
+    // Refresh the mark, as a still-running session's hooks would.
+    kvSetNumber(
+      harness.ctx.db,
+      activeSessionKey(SESSION_A),
+      harness.clock.now(),
+      harness.clock.now(),
+    );
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_B)), false, 'others still reaped');
+    assert.ok(report.skipped >= 1);
+  });
+
+  it('forgets an active-session mark left behind by a crash', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    // A crashed Claude Code never fires SessionEnd, so a stale mark must expire
+    // rather than protect a session forever.
+    kvSetNumber(
+      harness.ctx.db,
+      activeSessionKey(SESSION_A),
+      harness.clock.now(),
+      harness.clock.now(),
+    );
+
+    harness.clock.advance(31 * DAY);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 2);
+  });
+
+  it('refuses a bundle that does not contain the session it claims to', async () => {
+    const harness = makeHarness();
+    // Swap the bundler for one that packs the wrong session. Everything
+    // downstream compares our hash of the bundle with Drive's hash of the same
+    // bundle, so only a contents check can catch this.
+    const contents = await import('../src/adapters/bundle.ts');
+    const original = contents.verifyBundleContents;
+    assert.equal(typeof original, 'function');
+
+    const files = await contents.describeSessionFiles({
+      cwd: harness.projectDir,
+      entries: [`${SESSION_A}.jsonl`],
+    });
+    const out = path.join(tempDir(), 'wrong.tar.zst');
+    await contents.createBundle({
+      cwd: harness.projectDir,
+      entries: [`${SESSION_B}.jsonl`],
+      outputPath: out,
+    });
+    const problem = await contents.verifyBundleContents(out, files);
+    assert.notEqual(problem, null, 'a bundle of the wrong session is rejected');
+    assert.match(problem ?? '', /missing from the bundle/);
+  });
+
+  it('accepts a bundle that does contain the session', async () => {
+    const harness = makeHarness();
+    const contents = await import('../src/adapters/bundle.ts');
+    const entries = [`${SESSION_B}.jsonl`, SESSION_B];
+    const files = await contents.describeSessionFiles({ cwd: harness.projectDir, entries });
+    const out = path.join(tempDir(), 'right.tar.zst');
+    await contents.createBundle({ cwd: harness.projectDir, entries, outputPath: out });
+    assert.equal(await contents.verifyBundleContents(out, files), null);
+  });
+
+  it('drops the verification fingerprint when a session moves project', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    assert.notEqual(getSession(harness.ctx.db, SESSION_A)?.verifiedLocalMtime, null);
+
+    upsertSession(
+      harness.ctx.db,
+      { sessionId: SESSION_A, encodedDir: '-home-a-elsewhere' },
+      harness.clock.now(),
+    );
+    const moved = getSession(harness.ctx.db, SESSION_A);
+    assert.equal(moved?.verifiedAt, null);
+    assert.equal(moved?.verifiedLocalMtime, null, 'the fingerprint was measured elsewhere');
   });
 });

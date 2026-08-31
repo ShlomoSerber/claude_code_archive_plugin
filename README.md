@@ -128,12 +128,21 @@ Optional `config.json` in the plugin data directory:
 ```json
 {
   "retentionDays": 30,
+  "archiveGraceDays": 7,
   "driveRootFolder": "ClaudeArchive",
   "zstdLevel": 19,
   "keepLocalForever": false,
   "enabled": true
 }
 ```
+
+`archiveGraceDays` is how long a Drive copy must have existed before its local
+copy may be deleted, on top of the idle window. It stops a first install from
+uploading a months-old session and deleting it in the same sweep.
+
+Settings fail closed. A `config.json` the plugin cannot parse disables deletion
+rather than falling back to the defaults, and `retentionDays: 0` means never
+delete rather than delete after a day.
 
 Every key has an environment override: `ARCHIVE_RETENTION_DAYS`,
 `ARCHIVE_DRIVE_FOLDER`, `ARCHIVE_ZSTD_LEVEL`, `ARCHIVE_KEEP_LOCAL_FOREVER`,

@@ -21,7 +21,7 @@ import { REAUTH_REMEDIATION, type AuthProvider } from './google-auth.ts';
 const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const FILE_FIELDS = 'id,name,size,sha256Checksum,md5Checksum';
+const FILE_FIELDS = 'id,name,size,sha256Checksum,md5Checksum,trashed';
 
 /** Drive wants chunks in multiples of 256 KiB; 8 MiB balances retries and calls. */
 export const CHUNK_SIZE = 8 * 1024 * 1024;
@@ -360,6 +360,7 @@ export function toRemoteFile(value: unknown): RemoteFile {
     size: asNumber(record['size']),
     sha256: typeof record['sha256Checksum'] === 'string' ? record['sha256Checksum'] : null,
     md5: typeof record['md5Checksum'] === 'string' ? record['md5Checksum'] : null,
+    trashed: record['trashed'] === true,
   };
 }
 

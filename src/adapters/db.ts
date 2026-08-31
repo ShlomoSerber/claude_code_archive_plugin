@@ -124,6 +124,10 @@ export function kvSet(db: Db, key: string, value: string, now: number): void {
   ).run(key, value, now);
 }
 
+export function kvDelete(db: Db, key: string): void {
+  db.prepare('DELETE FROM kv WHERE key = ?').run(key);
+}
+
 export function kvGetNumber(db: Db, key: string): number | undefined {
   const raw = kvGet(db, key);
   if (raw === undefined) return undefined;

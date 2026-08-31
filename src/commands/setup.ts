@@ -179,9 +179,15 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
       const values = row as unknown as Record<string, string | number | null | undefined>;
       insertSession.run(...columnNames.map((name) => values[name] ?? null));
       // The bytes live on Drive, not here: a recovered session is not local.
-      db.prepare('UPDATE sessions SET local_present = 0 WHERE session_id = ?').run(
-        record.sessionId,
-      );
+      // The verification fingerprint is dropped as well. It was measured on
+      // another machine against files this one has never seen, and it is the
+      // value that authorises deleting local data. Restore still works, since
+      // that needs only the remote id and the bundle hash.
+      db.prepare(
+        `UPDATE sessions
+            SET local_present = 0, verified_local_mtime = NULL, verified_local_bytes = NULL
+          WHERE session_id = ?`,
+      ).run(record.sessionId);
       for (const prompt of selectPrompts.all(record.sessionId) as {
         seq: number;
         ts: number | null;

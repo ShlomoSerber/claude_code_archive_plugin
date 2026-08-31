@@ -103,21 +103,30 @@ describe('matchesLocal', () => {
 
   it('accepts a remote file with the same size and hash', () => {
     assert.equal(
-      matchesLocal({ id: 'x', name: 'n', size: 100, sha256: 'ABC', md5: null }, bundle),
+      matchesLocal(
+        { id: 'x', name: 'n', size: 100, sha256: 'ABC', md5: null, trashed: false },
+        bundle,
+      ),
       true,
     );
   });
 
   it('rejects a different size', () => {
     assert.equal(
-      matchesLocal({ id: 'x', name: 'n', size: 99, sha256: 'abc', md5: null }, bundle),
+      matchesLocal(
+        { id: 'x', name: 'n', size: 99, sha256: 'abc', md5: null, trashed: false },
+        bundle,
+      ),
       false,
     );
   });
 
   it('rejects a remote file whose hash Drive will not tell us', () => {
     assert.equal(
-      matchesLocal({ id: 'x', name: 'n', size: 100, sha256: null, md5: 'x' }, bundle),
+      matchesLocal(
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: 'x', trashed: false },
+        bundle,
+      ),
       false,
     );
   });
@@ -128,35 +137,50 @@ describe('compareChecksums', () => {
 
   it('passes when sha256 agrees', () => {
     assert.equal(
-      compareChecksums({ id: 'x', name: 'n', size: 100, sha256: 'AA', md5: null }, bundle),
+      compareChecksums(
+        { id: 'x', name: 'n', size: 100, sha256: 'AA', md5: null, trashed: false },
+        bundle,
+      ),
       null,
     );
   });
 
   it('falls back to md5 when Drive has no sha256', () => {
     assert.equal(
-      compareChecksums({ id: 'x', name: 'n', size: 100, sha256: null, md5: 'BB' }, bundle),
+      compareChecksums(
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: 'BB', trashed: false },
+        bundle,
+      ),
       null,
     );
   });
 
   it('fails when neither checksum is available', () => {
     assert.equal(
-      compareChecksums({ id: 'x', name: 'n', size: 100, sha256: null, md5: null }, bundle),
+      compareChecksums(
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: null, trashed: false },
+        bundle,
+      ),
       'Drive returned no checksum',
     );
   });
 
   it('fails on a size mismatch before looking at hashes', () => {
     assert.match(
-      compareChecksums({ id: 'x', name: 'n', size: 7, sha256: 'aa', md5: 'bb' }, bundle) ?? '',
+      compareChecksums(
+        { id: 'x', name: 'n', size: 7, sha256: 'aa', md5: 'bb', trashed: false },
+        bundle,
+      ) ?? '',
       /^size /,
     );
   });
 
   it('fails on a hash mismatch', () => {
     assert.equal(
-      compareChecksums({ id: 'x', name: 'n', size: 100, sha256: 'zz', md5: null }, bundle),
+      compareChecksums(
+        { id: 'x', name: 'n', size: 100, sha256: 'zz', md5: null, trashed: false },
+        bundle,
+      ),
       'sha256 mismatch',
     );
   });

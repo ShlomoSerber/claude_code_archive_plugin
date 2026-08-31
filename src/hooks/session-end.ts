@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { createRuntime } from '../composition.ts';
 import { enqueue } from '../core/queue.ts';
 import { encodedDirOfTranscript, sessionIdOfTranscript } from '../core/paths.ts';
+import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
+import { kvDelete } from '../adapters/db.ts';
+import { activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
@@ -52,6 +55,18 @@ async function main(): Promise<void> {
       return;
     }
     const sessionId = input?.session_id ?? sessionIdOfTranscript(transcriptPath);
+    const encodedDir = encodedDirOfTranscript(transcriptPath);
+
+    // These become filesystem paths later. The reaper validates them again as
+    // its last line of defence, but keeping malformed rows out of the catalog
+    // in the first place is better than relying on that.
+    if (!isSafeSessionId(sessionId) || !isSafeEncodedDir(encodedDir)) {
+      runtime.logger.warn('hook.session_end.unsafe_identifiers', { session_id: sessionId });
+      return;
+    }
+
+    // The session is closing, so it stops being off limits to the reaper.
+    kvDelete(runtime.db(), activeSessionKey(sessionId));
 
     const now = runtime.clock.now();
     enqueue(
@@ -59,7 +74,7 @@ async function main(): Promise<void> {
       {
         kind: 'backup',
         sessionId,
-        payload: { encodedDir: encodedDirOfTranscript(transcriptPath) },
+        payload: { encodedDir },
         // The debounce coalesces the burst of fires a resumed session produces
         // into a single backup of its final state.
         notBefore: now + runtime.config.debounceMs,

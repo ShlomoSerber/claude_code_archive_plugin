@@ -14,6 +14,16 @@ export type RemoteFile = {
   size: number | null;
   sha256: string | null;
   md5: string | null;
+  /**
+   * In the remote's wastebasket, awaiting purge.
+   *
+   * Drive answers a metadata request for a trashed file with a normal 200 and
+   * a valid checksum; only a permanent delete gives a 404. So "the request
+   * succeeded" is not the same as "the archive still holds this", and code that
+   * conflates them will delete a local copy against a bundle that has about
+   * thirty days left to live.
+   */
+  trashed: boolean;
 };
 
 export type UploadProgress = {

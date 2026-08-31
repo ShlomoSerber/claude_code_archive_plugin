@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
+import { createHash } from 'node:crypto';
 import * as tar from 'tar';
 import { renameWithRetry, siblingTempPath } from './atomic.ts';
 import { createHashTee, sha256File } from './hashing.ts';
@@ -176,4 +177,57 @@ async function describeInto(
 /** tar paths are always `/`-separated, on every platform. */
 export function toPosix(relative: string): string {
   return relative.split(path.sep).join('/');
+}
+
+/**
+ * Prove a finished bundle actually contains the session.
+ *
+ * The integrity chain up to this point compares a local hash with the remote's
+ * hash, which proves the *transfer* and says nothing about the *contents*. A
+ * bundle that is intact but wrong — the wrong session, a truncated sidecar, an
+ * empty archive — would pass every other check and then authorise deleting the
+ * only real copy.
+ *
+ * Reads the bundle back and hashes each entry, comparing against the manifest.
+ * Returns null when the bundle is what it claims to be, or a reason when not.
+ */
+export async function verifyBundleContents(
+  bundlePath: string,
+  expected: ManifestFile[],
+): Promise<string | null> {
+  const wanted = new Map(expected.map((file) => [file.path, file]));
+  const seen = new Set<string>();
+  const problems: string[] = [];
+
+  await tar.list({
+    file: bundlePath,
+    onReadEntry: (entry) => {
+      const entryPath = toPosix(entry.path).replace(/\/$/, '');
+      const want = wanted.get(entryPath);
+      if (want === undefined) {
+        // Directories carry no bytes and are not in the manifest.
+        entry.resume();
+        return;
+      }
+      seen.add(entryPath);
+      const hash = createHash('sha256');
+      let bytes = 0;
+      entry.on('data', (chunk: Buffer) => {
+        hash.update(chunk);
+        bytes += chunk.length;
+      });
+      entry.on('end', () => {
+        if (bytes !== want.bytes) {
+          problems.push(`${entryPath}: ${String(bytes)} bytes, expected ${String(want.bytes)}`);
+        } else if (hash.digest('hex') !== want.sha256) {
+          problems.push(`${entryPath}: content does not match its hash`);
+        }
+      });
+    },
+  });
+
+  for (const file of expected) {
+    if (!seen.has(file.path)) problems.push(`${file.path}: missing from the bundle`);
+  }
+  return problems.length === 0 ? null : problems.slice(0, 5).join('; ');
 }

@@ -3,8 +3,9 @@ import '../core/quiet.ts';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRuntime } from '../composition.ts';
-import { kvGetNumber } from '../adapters/db.ts';
-import { KV } from '../core/state-keys.ts';
+import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
+import { isSafeSessionId } from '../core/identifiers.ts';
+import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
@@ -47,6 +48,13 @@ async function main(): Promise<void> {
     if (!runtime.config.enabled) return;
 
     const now = runtime.clock.now();
+    // Mark the session open so the reaper leaves it alone. A transcript being
+    // appended to is not idle, however old its last write happens to be.
+    const sessionId = input?.session_id;
+    if (sessionId !== undefined && isSafeSessionId(sessionId)) {
+      kvSetNumber(runtime.db(), activeSessionKey(sessionId), now, now);
+    }
+
     const lastSweep = kvGetNumber(runtime.db(), KV.lastSweepAt) ?? 0;
     if (now - lastSweep < runtime.config.sweepMinIntervalMs) {
       runtime.logger.debug('hook.session_start.too_soon', { last_sweep_at: lastSweep });

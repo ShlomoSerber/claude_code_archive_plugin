@@ -41,6 +41,8 @@ export type FakeDriveOptions = {
   truncateChunksTo?: number;
   /** Report a checksum that does not match, to exercise verification. */
   corruptChecksums?: boolean;
+  /** Report every file as being in the wastebasket, awaiting purge. */
+  trashed?: boolean;
   /** Return no checksum at all, as Drive does for some files. */
   omitSha256?: boolean;
   /** Start failing uploads once this many have succeeded, to model a bad day. */
@@ -246,6 +248,7 @@ export class FakeDrive implements DriveTransport {
             ? 'f'.repeat(64)
             : sha256,
       md5: this.options.omitSha256 === true ? null : md5,
+      trashed: this.options.trashed === true,
     };
   }
 }

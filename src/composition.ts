@@ -10,7 +10,7 @@ import {
   type AuthProvider,
 } from './adapters/google-auth.ts';
 import { createDriveTransport } from './adapters/drive-http.ts';
-import { resolveConfig, type ArchiveConfig } from './core/config.ts';
+import { resolveConfig, unknownConfigKeys, type ArchiveConfig } from './core/config.ts';
 import { resolvePaths, type ArchivePaths, type Environment } from './core/paths.ts';
 import { systemClock, type Clock } from './ports/clock.ts';
 import type { Logger, LogLevel } from './ports/logger.ts';
@@ -54,13 +54,31 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const env = options.env ?? process.env;
   const clock = options.clock ?? systemClock;
   const paths = resolvePaths(env);
-  const config = resolveConfig(await readConfigFile(paths.dataDir), env);
+  const configRead = await readConfigFile(paths.dataDir);
+  let config = resolveConfig(configRead.status === 'ok' ? configRead.source : null, env);
+  if (configRead.status === 'unusable') {
+    // Fail closed: keep archiving, delete nothing, and say why.
+    config = { ...config, keepLocalForever: true };
+  }
 
   const logger = createNdjsonLogger({
     file: paths.logFile,
     level: options.logLevel ?? (env['ARCHIVE_LOG_LEVEL'] as LogLevel | undefined) ?? 'info',
     base: { pid: process.pid, v: ARCHIVER_VERSION },
   });
+
+  if (configRead.status === 'unusable') {
+    logger.error('config.unusable', {
+      reason: configRead.reason,
+      effect: 'local copies will not be deleted until this is fixed',
+    });
+  } else if (configRead.status === 'ok') {
+    const unknown = unknownConfigKeys(configRead.source);
+    if (unknown.length > 0) {
+      // A misspelled `keepLocalForever` is silently no protection at all.
+      logger.warn('config.unknown_keys', { keys: unknown.join(', ') });
+    }
+  }
 
   let database: Db | undefined;
   let httpClient: HttpClient | undefined;
@@ -123,14 +141,37 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   return runtime;
 }
 
-export async function readConfigFile(dataDir: string): Promise<Record<string, unknown> | null> {
+export type ConfigRead =
+  | { status: 'ok'; source: Record<string, unknown> }
+  | { status: 'absent' }
+  | { status: 'unusable'; reason: string };
+
+/**
+ * Read `config.json`, distinguishing "there isn't one" from "there is one and
+ * I cannot read it".
+ *
+ * That distinction is the whole point. This file is where `keepLocalForever`
+ * and `retentionDays` live, so treating an unreadable one as absent silently
+ * resolves a user's attempt to switch deletion *off* into the defaults, which
+ * switch it on. The plugin already refuses to touch the user's settings.json
+ * when it will not parse; its own config deserves the same standard.
+ */
+export async function readConfigFile(dataDir: string): Promise<ConfigRead> {
+  let raw: string;
   try {
-    const raw = await fsp.readFile(path.join(dataDir, 'config.json'), 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
+    raw = await fsp.readFile(path.join(dataDir, 'config.json'), 'utf8');
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return { status: 'absent' };
+    return { status: 'unusable', reason: `config.json could not be read: ${String(err)}` };
+  }
+  if (raw.trim().length === 0) return { status: 'absent' };
+  try {
+    const parsed: unknown = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { status: 'unusable', reason: 'config.json is not a JSON object' };
+    }
+    return { status: 'ok', source: parsed as Record<string, unknown> };
   } catch {
-    return null;
+    return { status: 'unusable', reason: 'config.json is not valid JSON' };
   }
 }

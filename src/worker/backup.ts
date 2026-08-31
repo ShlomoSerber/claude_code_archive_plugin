@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { createBundle, describeSessionFiles } from '../adapters/bundle.ts';
+import { createBundle, describeSessionFiles, verifyBundleContents } from '../adapters/bundle.ts';
 import { bundleEntries, statSession, type LocalSession } from '../adapters/session-scan.ts';
 import { extractFromFile } from '../adapters/transcript-file.ts';
 import { sha256File } from '../adapters/hashing.ts';
@@ -197,6 +197,20 @@ async function publish(
   const folderPath = [ctx.config.driveRootFolder, session.encodedDir, bundle.year];
   const parentId = await ctx.drive.ensureFolder(folderPath, ctx.signal);
 
+  // Hash every file the session is made of, then read the bundle back and
+  // check it holds exactly those bytes. Everything downstream compares our
+  // hash of the bundle with Drive's hash of the bundle, which proves the
+  // transfer and would happily certify a bundle of the wrong session.
+  const files = await describeSessionFiles({
+    cwd: path.dirname(session.transcriptPath),
+    entries: bundleEntries(session),
+    ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+  });
+  const contentProblem = await verifyBundleContents(bundle.path, files);
+  if (contentProblem !== null) {
+    throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
+  }
+
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -210,11 +224,6 @@ async function publish(
 
   await verifyRemote(ctx, session.sessionId, remote, bundle);
 
-  const files = await describeSessionFiles({
-    cwd: path.dirname(session.transcriptPath),
-    entries: bundleEntries(session),
-    ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
-  });
   const manifest = buildManifest({
     archiverVersion: ctx.version,
     sessionId: session.sessionId,

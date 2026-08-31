@@ -48,15 +48,20 @@ export async function restoreSession(
   }
   const targetDir = path.join(ctx.paths.projectsDir, record.encodedDir);
   assertInside(ctx.paths.projectsDir, targetDir, 'restore target');
+  // "Already local" has to mean any part of the session, not only the
+  // transcript. With the transcript gone but the sidecar still here, unpacking
+  // would overwrite tool results that are newer than the archived ones.
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
-  if (existing !== null) {
-    // Already on disk. Restoring over it could only lose the newer copy.
-    markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
+  const sidecarSurvives = await isDirectory(path.join(targetDir, sessionId));
+  if (existing !== null || sidecarSurvives) {
+    if (existing !== null) {
+      markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
+    }
     return {
       sessionId,
       encodedDir: record.encodedDir,
       projectCwd: record.projectCwd,
-      transcriptPath: existing.transcriptPath,
+      transcriptPath: existing?.transcriptPath ?? path.join(targetDir, `${sessionId}.jsonl`),
       entries: [],
       alreadyLocal: true,
       resumeCommand: resumeCommand(sessionId),
@@ -102,6 +107,14 @@ export async function restoreSession(
   }
 }
 
+async function isDirectory(candidate: string): Promise<boolean> {
+  try {
+    return (await fsp.stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function requireRemote(record: SessionRecord): string {
   if (record.remoteFileId === null || record.verifiedAt === null) {
     throw new FatalError(
@@ -142,7 +155,9 @@ export async function verifyArchive(
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      const reason = describeMismatch(record, remote.size, remote.sha256);
+      const reason = remote.trashed
+        ? 'the bundle is in the Drive wastebasket and will be purged'
+        : describeMismatch(record, remote.size, remote.sha256);
       if (reason === null) {
         report.ok++;
       } else {

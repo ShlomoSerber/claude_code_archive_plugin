@@ -1187,7 +1187,7 @@ import { pipeline } from "node:stream/promises";
 var API = "https://www.googleapis.com/drive/v3";
 var UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
-var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum";
+var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed";
 var CHUNK_SIZE = 8 * 1024 * 1024;
 var CHUNK_ALIGNMENT = 256 * 1024;
 function createDriveTransport(deps) {
@@ -1465,7 +1465,8 @@ function toRemoteFile(value) {
     name: typeof record["name"] === "string" ? record["name"] : "",
     size: asNumber(record["size"]),
     sha256: typeof record["sha256Checksum"] === "string" ? record["sha256Checksum"] : null,
-    md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null
+    md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
+    trashed: record["trashed"] === true
   };
 }
 function asNumber(value) {
@@ -1488,10 +1489,26 @@ var DEFAULT_CONFIG = {
   sweepMinIntervalMs: 10 * 6e4,
   workerBudgetMs: 20 * 6e4,
   jobVisibilityMs: 15 * 6e4,
+  archiveGraceDays: 7,
   enabled: true,
   keepLocalForever: false
 };
 var DAY_MS = 864e5;
+var KNOWN_CONFIG_KEYS = [
+  "retentionDays",
+  "driveRootFolder",
+  "zstdLevel",
+  "debounceMs",
+  "sweepMinIntervalMs",
+  "workerBudgetMs",
+  "jobVisibilityMs",
+  "enabled",
+  "keepLocalForever",
+  "archiveGraceDays"
+];
+function unknownConfigKeys(source) {
+  return Object.keys(source).filter((key) => !KNOWN_CONFIG_KEYS.includes(key));
+}
 var CLEANUP_PERIOD_DAYS = 365e3;
 function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
@@ -1514,6 +1531,8 @@ function applySource(config, source) {
   if (budget !== null) config.workerBudgetMs = budget;
   const visibility = asNumber2(source["jobVisibilityMs"]);
   if (visibility !== null) config.jobVisibilityMs = visibility;
+  const grace = asNumber2(source["archiveGraceDays"]);
+  if (grace !== null) config.archiveGraceDays = grace;
   const enabled = asBoolean(source["enabled"]);
   if (enabled !== null) config.enabled = enabled;
   const keepLocal = asBoolean(source["keepLocalForever"]);
@@ -1527,14 +1546,23 @@ function envSource(env) {
     debounceMs: env["ARCHIVE_DEBOUNCE_MS"],
     sweepMinIntervalMs: env["ARCHIVE_SWEEP_INTERVAL_MS"],
     workerBudgetMs: env["ARCHIVE_WORKER_BUDGET_MS"],
+    archiveGraceDays: env["ARCHIVE_ARCHIVE_GRACE_DAYS"],
     enabled: env["ARCHIVE_ENABLED"],
     keepLocalForever: env["ARCHIVE_KEEP_LOCAL_FOREVER"]
   };
 }
 function clamp(config) {
+  const keepLocalForever = config.keepLocalForever || config.retentionDays <= 0;
   return {
     ...config,
+    keepLocalForever,
     retentionDays: clampNumber(config.retentionDays, 1, 36500, DEFAULT_CONFIG.retentionDays),
+    archiveGraceDays: clampNumber(
+      config.archiveGraceDays,
+      0,
+      3650,
+      DEFAULT_CONFIG.archiveGraceDays
+    ),
     zstdLevel: clampNumber(config.zstdLevel, 1, 22, DEFAULT_CONFIG.zstdLevel),
     debounceMs: clampNumber(config.debounceMs, 0, 6e4, DEFAULT_CONFIG.debounceMs),
     sweepMinIntervalMs: clampNumber(
@@ -1572,6 +1600,8 @@ function asString2(value) {
 }
 function asBoolean(value) {
   if (typeof value === "boolean") return value;
+  if (value === 1) return true;
+  if (value === 0) return false;
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
@@ -1629,12 +1659,27 @@ async function createRuntime(options = {}) {
   const env = options.env ?? process.env;
   const clock = options.clock ?? systemClock;
   const paths = resolvePaths(env);
-  const config = resolveConfig(await readConfigFile(paths.dataDir), env);
+  const configRead = await readConfigFile(paths.dataDir);
+  let config = resolveConfig(configRead.status === "ok" ? configRead.source : null, env);
+  if (configRead.status === "unusable") {
+    config = { ...config, keepLocalForever: true };
+  }
   const logger = createNdjsonLogger({
     file: paths.logFile,
     level: options.logLevel ?? env["ARCHIVE_LOG_LEVEL"] ?? "info",
     base: { pid: process.pid, v: ARCHIVER_VERSION }
   });
+  if (configRead.status === "unusable") {
+    logger.error("config.unusable", {
+      reason: configRead.reason,
+      effect: "local copies will not be deleted until this is fixed"
+    });
+  } else if (configRead.status === "ok") {
+    const unknown = unknownConfigKeys(configRead.source);
+    if (unknown.length > 0) {
+      logger.warn("config.unknown_keys", { keys: unknown.join(", ") });
+    }
+  }
   let database;
   let httpClient;
   let authProvider;
@@ -1688,12 +1733,22 @@ async function createRuntime(options = {}) {
   return runtime;
 }
 async function readConfigFile(dataDir) {
+  let raw;
   try {
-    const raw = await fsp5.readFile(path7.join(dataDir, "config.json"), "utf8");
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
+    raw = await fsp5.readFile(path7.join(dataDir, "config.json"), "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { status: "absent" };
+    return { status: "unusable", reason: `config.json could not be read: ${String(err)}` };
+  }
+  if (raw.trim().length === 0) return { status: "absent" };
+  try {
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { status: "unusable", reason: "config.json is not a JSON object" };
+    }
+    return { status: "ok", source: parsed };
   } catch {
-    return null;
+    return { status: "unusable", reason: "config.json is not valid JSON" };
   }
 }
 
@@ -1979,6 +2034,15 @@ function upsertSession(db, session, now) {
        local_present, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT (session_id) DO UPDATE SET
+       -- A row that moves to a different project directory is describing
+       -- different files, so the fingerprint that authorises deleting them
+       -- stops applying the moment the directory changes.
+       verified_at = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                          THEN sessions.verified_at ELSE NULL END,
+       verified_local_mtime = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                   THEN sessions.verified_local_mtime ELSE NULL END,
+       verified_local_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                   THEN sessions.verified_local_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -2303,6 +2367,10 @@ var KV = {
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
+function activeSessionKey(sessionId) {
+  return `active.${sessionId}`;
+}
+var ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
 import fsp9 from "node:fs/promises";
@@ -2314,6 +2382,7 @@ import fs7 from "node:fs";
 import path11 from "node:path";
 import zlib from "node:zlib";
 import { pipeline as pipeline3 } from "node:stream/promises";
+import { createHash as createHash3 } from "node:crypto";
 
 // node_modules/tar/dist/esm/index.min.js
 import Qr from "events";
@@ -5414,6 +5483,40 @@ async function describeInto(out, cwd, relative, signal) {
 function toPosix(relative) {
   return relative.split(path11.sep).join("/");
 }
+async function verifyBundleContents(bundlePath, expected) {
+  const wanted = new Map(expected.map((file) => [file.path, file]));
+  const seen = /* @__PURE__ */ new Set();
+  const problems = [];
+  await Ct({
+    file: bundlePath,
+    onReadEntry: (entry) => {
+      const entryPath = toPosix(entry.path).replace(/\/$/, "");
+      const want = wanted.get(entryPath);
+      if (want === void 0) {
+        entry.resume();
+        return;
+      }
+      seen.add(entryPath);
+      const hash = createHash3("sha256");
+      let bytes = 0;
+      entry.on("data", (chunk) => {
+        hash.update(chunk);
+        bytes += chunk.length;
+      });
+      entry.on("end", () => {
+        if (bytes !== want.bytes) {
+          problems.push(`${entryPath}: ${String(bytes)} bytes, expected ${String(want.bytes)}`);
+        } else if (hash.digest("hex") !== want.sha256) {
+          problems.push(`${entryPath}: content does not match its hash`);
+        }
+      });
+    }
+  });
+  for (const file of expected) {
+    if (!seen.has(file.path)) problems.push(`${file.path}: missing from the bundle`);
+  }
+  return problems.length === 0 ? null : problems.slice(0, 5).join("; ");
+}
 
 // src/adapters/transcript-file.ts
 import { createReadStream as createReadStream2 } from "node:fs";
@@ -5909,6 +6012,15 @@ async function buildBundle(ctx, session, index, now) {
 async function publish(ctx, job, session, bundle, index, now) {
   const folderPath = [ctx.config.driveRootFolder, session.encodedDir, bundle.year];
   const parentId = await ctx.drive.ensureFolder(folderPath, ctx.signal);
+  const files = await describeSessionFiles({
+    cwd: path12.dirname(session.transcriptPath),
+    entries: bundleEntries(session),
+    ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+  });
+  const contentProblem = await verifyBundleContents(bundle.path, files);
+  if (contentProblem !== null) {
+    throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
+  }
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -5920,11 +6032,6 @@ async function publish(ctx, job, session, bundle, index, now) {
     appProperties: { sessionId: session.sessionId, archiver: ctx.version }
   });
   await verifyRemote(ctx, session.sessionId, remote, bundle);
-  const files = await describeSessionFiles({
-    cwd: path12.dirname(session.transcriptPath),
-    entries: bundleEntries(session),
-    ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
-  });
   const manifest = buildManifest({
     archiverVersion: ctx.version,
     sessionId: session.sessionId,
@@ -6032,6 +6139,15 @@ async function reapLocalCopies(ctx, now) {
       report.skipped++;
       continue;
     }
+    if (record.verifiedAt !== null && now - record.verifiedAt < ctx.config.archiveGraceDays * DAY_MS) {
+      report.skipped++;
+      continue;
+    }
+    if (isSessionActive(ctx, record.sessionId, now)) {
+      log.info("reap.session_active");
+      report.skipped++;
+      continue;
+    }
     const remote = await confirmRemote(ctx, record);
     if (remote === "gone") {
       log.warn("reap.remote_no_longer_valid");
@@ -6058,6 +6174,11 @@ async function reapLocalCopies(ctx, now) {
     log.info("reap.deleted", { bytes: onDisk.transcriptBytes + onDisk.sidecarBytes });
   }
   return report;
+}
+function isSessionActive(ctx, sessionId, now) {
+  const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
+  if (seen === void 0) return false;
+  return now - seen < ACTIVE_SESSION_TTL_MS;
 }
 function safeTarget(ctx, record) {
   if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) return null;
@@ -6087,6 +6208,7 @@ async function confirmRemote(ctx, record) {
   if (record.remoteFileId === null) return "gone";
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
+    if (remote.trashed) return "gone";
     if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
       return "gone";
     }
@@ -6864,13 +6986,16 @@ async function restoreSession(ctx, sessionId) {
   const targetDir = path16.join(ctx.paths.projectsDir, record.encodedDir);
   assertInside(ctx.paths.projectsDir, targetDir, "restore target");
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
-  if (existing !== null) {
-    markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
+  const sidecarSurvives = await isDirectory(path16.join(targetDir, sessionId));
+  if (existing !== null || sidecarSurvives) {
+    if (existing !== null) {
+      markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
+    }
     return {
       sessionId,
       encodedDir: record.encodedDir,
       projectCwd: record.projectCwd,
-      transcriptPath: existing.transcriptPath,
+      transcriptPath: existing?.transcriptPath ?? path16.join(targetDir, `${sessionId}.jsonl`),
       entries: [],
       alreadyLocal: true,
       resumeCommand: resumeCommand(sessionId)
@@ -6910,6 +7035,13 @@ async function restoreSession(ctx, sessionId) {
     await fsp13.rm(staged, { force: true }).catch(() => void 0);
   }
 }
+async function isDirectory(candidate) {
+  try {
+    return (await fsp13.stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
 function requireRemote(record) {
   if (record.remoteFileId === null || record.verifiedAt === null) {
     throw new FatalError(
@@ -6933,7 +7065,7 @@ async function verifyArchive(ctx, records) {
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      const reason = describeMismatch(record, remote.size, remote.sha256);
+      const reason = remote.trashed ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
       if (reason === null) {
         report.ok++;
       } else {
@@ -7234,9 +7366,11 @@ function importCatalogFile(runtime, file) {
       }
       const values = row;
       insertSession.run(...columnNames.map((name) => values[name] ?? null));
-      db.prepare("UPDATE sessions SET local_present = 0 WHERE session_id = ?").run(
-        record.sessionId
-      );
+      db.prepare(
+        `UPDATE sessions
+            SET local_present = 0, verified_local_mtime = NULL, verified_local_bytes = NULL
+          WHERE session_id = ?`
+      ).run(record.sessionId);
       for (const prompt of selectPrompts.all(record.sessionId)) {
         insertPrompt.run(record.sessionId, prompt.seq, prompt.ts, prompt.text);
       }

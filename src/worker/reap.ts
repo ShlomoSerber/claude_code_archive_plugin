@@ -7,11 +7,13 @@ import {
   markLocalPresent,
 } from '../core/catalog.ts';
 import type { SessionRecord } from '../core/catalog.ts';
-import { reapCutoff } from '../core/config.ts';
+import { DAY_MS, reapCutoff } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { enqueue } from '../core/queue.ts';
 import { statSession, type LocalSession } from '../adapters/session-scan.ts';
+import { kvGetNumber } from '../adapters/db.ts';
+import { ACTIVE_SESSION_TTL_MS, activeSessionKey } from '../core/state-keys.ts';
 import type { WorkerContext } from './context.ts';
 
 /**
@@ -93,6 +95,26 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
 
+    // The archive itself has to have survived a while. Without this, a first
+    // install uploads a months-old session and deletes it in the same sweep,
+    // before anyone has evidence that restoring from this archive works.
+    if (
+      record.verifiedAt !== null &&
+      now - record.verifiedAt < ctx.config.archiveGraceDays * DAY_MS
+    ) {
+      report.skipped++;
+      continue;
+    }
+
+    // A session Claude Code is using right now is not idle, whatever its mtime
+    // says. Deleting it unlinks the file under a live writer: everything after
+    // the last flush is lost and the session cannot be resumed.
+    if (isSessionActive(ctx, record.sessionId, now)) {
+      log.info('reap.session_active');
+      report.skipped++;
+      continue;
+    }
+
     const remote = await confirmRemote(ctx, record);
     if (remote === 'gone') {
       log.warn('reap.remote_no_longer_valid');
@@ -122,6 +144,14 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
   }
 
   return report;
+}
+
+/** Hooks record a heartbeat while a session is open; this reads it back. */
+function isSessionActive(ctx: WorkerContext, sessionId: string, now: number): boolean {
+  const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
+  if (seen === undefined) return false;
+  // A crashed Claude Code never fires SessionEnd, so the mark has to expire.
+  return now - seen < ACTIVE_SESSION_TTL_MS;
 }
 
 type Target = { transcriptPath: string; sidecarDir: string };
@@ -185,6 +215,11 @@ async function confirmRemote(
   if (record.remoteFileId === null) return 'gone';
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
+    // A file in the wastebasket still answers with its checksum, and Drive
+    // purges the wastebasket after thirty days. Treating that as "stored" is
+    // how the last copy of a conversation quietly becomes the only copy, and
+    // then no copy at all.
+    if (remote.trashed) return 'gone';
     if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
       return 'gone';
     }

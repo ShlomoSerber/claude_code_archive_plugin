@@ -110,6 +110,15 @@ export function upsertSession(db: Db, session: SessionUpsert, now: number): void
        local_present, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT (session_id) DO UPDATE SET
+       -- A row that moves to a different project directory is describing
+       -- different files, so the fingerprint that authorises deleting them
+       -- stops applying the moment the directory changes.
+       verified_at = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                          THEN sessions.verified_at ELSE NULL END,
+       verified_local_mtime = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                   THEN sessions.verified_local_mtime ELSE NULL END,
+       verified_local_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                   THEN sessions.verified_local_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),

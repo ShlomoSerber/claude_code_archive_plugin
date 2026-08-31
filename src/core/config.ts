@@ -21,6 +21,15 @@ export type ArchiveConfig = {
   workerBudgetMs: number;
   /** Visibility timeout on a claimed job. */
   jobVisibilityMs: number;
+  /**
+   * How long a Drive copy must have existed before its local copy may be
+   * deleted, independent of how idle the session is.
+   *
+   * Without this, a first install uploads a months-old session and deletes it
+   * in the same sweep, on the strength of one checksum comparison and before
+   * the user has any evidence the archive works at all.
+   */
+  archiveGraceDays: number;
   /** Set false to stop all archiving without uninstalling. */
   enabled: boolean;
   /** Skip reaping entirely: back everything up, delete nothing. */
@@ -35,11 +44,31 @@ export const DEFAULT_CONFIG: ArchiveConfig = {
   sweepMinIntervalMs: 10 * 60_000,
   workerBudgetMs: 20 * 60_000,
   jobVisibilityMs: 15 * 60_000,
+  archiveGraceDays: 7,
   enabled: true,
   keepLocalForever: false,
 };
 
 export const DAY_MS = 86_400_000;
+
+/** Every key the plugin understands. Anything else is probably a typo. */
+export const KNOWN_CONFIG_KEYS: readonly string[] = [
+  'retentionDays',
+  'driveRootFolder',
+  'zstdLevel',
+  'debounceMs',
+  'sweepMinIntervalMs',
+  'workerBudgetMs',
+  'jobVisibilityMs',
+  'enabled',
+  'keepLocalForever',
+  'archiveGraceDays',
+];
+
+/** Keys in `source` that the plugin does not recognise. */
+export function unknownConfigKeys(source: Readonly<Record<string, unknown>>): string[] {
+  return Object.keys(source).filter((key) => !KNOWN_CONFIG_KEYS.includes(key));
+}
 
 /**
  * Claude Code's own transcript reaper is disabled by setting this (SPEC §2).
@@ -77,6 +106,8 @@ function applySource(config: ArchiveConfig, source: Source): void {
   if (budget !== null) config.workerBudgetMs = budget;
   const visibility = asNumber(source['jobVisibilityMs']);
   if (visibility !== null) config.jobVisibilityMs = visibility;
+  const grace = asNumber(source['archiveGraceDays']);
+  if (grace !== null) config.archiveGraceDays = grace;
   const enabled = asBoolean(source['enabled']);
   if (enabled !== null) config.enabled = enabled;
   const keepLocal = asBoolean(source['keepLocalForever']);
@@ -91,6 +122,7 @@ function envSource(env: Readonly<Record<string, string | undefined>>): Source {
     debounceMs: env['ARCHIVE_DEBOUNCE_MS'],
     sweepMinIntervalMs: env['ARCHIVE_SWEEP_INTERVAL_MS'],
     workerBudgetMs: env['ARCHIVE_WORKER_BUDGET_MS'],
+    archiveGraceDays: env['ARCHIVE_ARCHIVE_GRACE_DAYS'],
     enabled: env['ARCHIVE_ENABLED'],
     keepLocalForever: env['ARCHIVE_KEEP_LOCAL_FOREVER'],
   };
@@ -103,9 +135,20 @@ function envSource(env: Readonly<Record<string, string | undefined>>): Source {
  * which is legal but almost certainly a typo; one day is the floor.
  */
 function clamp(config: ArchiveConfig): ArchiveConfig {
+  // "0 days" and "-1 days" are what someone writes when they mean "never".
+  // Reading them as "delete after one day" resolves a likely typo in the one
+  // direction that loses data.
+  const keepLocalForever = config.keepLocalForever || config.retentionDays <= 0;
   return {
     ...config,
+    keepLocalForever,
     retentionDays: clampNumber(config.retentionDays, 1, 36_500, DEFAULT_CONFIG.retentionDays),
+    archiveGraceDays: clampNumber(
+      config.archiveGraceDays,
+      0,
+      3_650,
+      DEFAULT_CONFIG.archiveGraceDays,
+    ),
     zstdLevel: clampNumber(config.zstdLevel, 1, 22, DEFAULT_CONFIG.zstdLevel),
     debounceMs: clampNumber(config.debounceMs, 0, 60_000, DEFAULT_CONFIG.debounceMs),
     sweepMinIntervalMs: clampNumber(
@@ -147,6 +190,10 @@ function asString(value: unknown): string | null {
 
 function asBoolean(value: unknown): boolean | null {
   if (typeof value === 'boolean') return value;
+  // JSON has a boolean type, but people write 1 and 0, and dropping those on
+  // a switch whose whole job is to prevent deletion is not acceptable.
+  if (value === 1) return true;
+  if (value === 0) return false;
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;

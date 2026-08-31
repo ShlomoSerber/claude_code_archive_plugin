@@ -322,11 +322,20 @@ function kvGet(db, key) {
   const row = db.prepare("SELECT value FROM kv WHERE key = ?").get(key);
   return row?.value;
 }
+function kvSet(db, key, value, now) {
+  db.prepare(
+    `INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(key, value, now);
+}
 function kvGetNumber(db, key) {
   const raw = kvGet(db, key);
   if (raw === void 0) return void 0;
   const value = Number(raw);
   return Number.isFinite(value) ? value : void 0;
+}
+function kvSetNumber(db, key, value, now) {
+  kvSet(db, key, String(value), now);
 }
 
 // src/adapters/ndjson-logger.ts
@@ -868,7 +877,7 @@ import { pipeline } from "node:stream/promises";
 var API = "https://www.googleapis.com/drive/v3";
 var UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
-var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum";
+var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed";
 var CHUNK_SIZE = 8 * 1024 * 1024;
 var CHUNK_ALIGNMENT = 256 * 1024;
 function createDriveTransport(deps) {
@@ -1142,7 +1151,8 @@ function toRemoteFile(value) {
     name: typeof record["name"] === "string" ? record["name"] : "",
     size: asNumber(record["size"]),
     sha256: typeof record["sha256Checksum"] === "string" ? record["sha256Checksum"] : null,
-    md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null
+    md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
+    trashed: record["trashed"] === true
   };
 }
 function asNumber(value) {
@@ -1165,9 +1175,25 @@ var DEFAULT_CONFIG = {
   sweepMinIntervalMs: 10 * 6e4,
   workerBudgetMs: 20 * 6e4,
   jobVisibilityMs: 15 * 6e4,
+  archiveGraceDays: 7,
   enabled: true,
   keepLocalForever: false
 };
+var KNOWN_CONFIG_KEYS = [
+  "retentionDays",
+  "driveRootFolder",
+  "zstdLevel",
+  "debounceMs",
+  "sweepMinIntervalMs",
+  "workerBudgetMs",
+  "jobVisibilityMs",
+  "enabled",
+  "keepLocalForever",
+  "archiveGraceDays"
+];
+function unknownConfigKeys(source) {
+  return Object.keys(source).filter((key) => !KNOWN_CONFIG_KEYS.includes(key));
+}
 function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
   applySource(config, file ?? {});
@@ -1189,6 +1215,8 @@ function applySource(config, source) {
   if (budget !== null) config.workerBudgetMs = budget;
   const visibility = asNumber2(source["jobVisibilityMs"]);
   if (visibility !== null) config.jobVisibilityMs = visibility;
+  const grace = asNumber2(source["archiveGraceDays"]);
+  if (grace !== null) config.archiveGraceDays = grace;
   const enabled = asBoolean(source["enabled"]);
   if (enabled !== null) config.enabled = enabled;
   const keepLocal = asBoolean(source["keepLocalForever"]);
@@ -1202,14 +1230,23 @@ function envSource(env) {
     debounceMs: env["ARCHIVE_DEBOUNCE_MS"],
     sweepMinIntervalMs: env["ARCHIVE_SWEEP_INTERVAL_MS"],
     workerBudgetMs: env["ARCHIVE_WORKER_BUDGET_MS"],
+    archiveGraceDays: env["ARCHIVE_ARCHIVE_GRACE_DAYS"],
     enabled: env["ARCHIVE_ENABLED"],
     keepLocalForever: env["ARCHIVE_KEEP_LOCAL_FOREVER"]
   };
 }
 function clamp(config) {
+  const keepLocalForever = config.keepLocalForever || config.retentionDays <= 0;
   return {
     ...config,
+    keepLocalForever,
     retentionDays: clampNumber(config.retentionDays, 1, 36500, DEFAULT_CONFIG.retentionDays),
+    archiveGraceDays: clampNumber(
+      config.archiveGraceDays,
+      0,
+      3650,
+      DEFAULT_CONFIG.archiveGraceDays
+    ),
     zstdLevel: clampNumber(config.zstdLevel, 1, 22, DEFAULT_CONFIG.zstdLevel),
     debounceMs: clampNumber(config.debounceMs, 0, 6e4, DEFAULT_CONFIG.debounceMs),
     sweepMinIntervalMs: clampNumber(
@@ -1247,6 +1284,8 @@ function asString2(value) {
 }
 function asBoolean(value) {
   if (typeof value === "boolean") return value;
+  if (value === 1) return true;
+  if (value === 0) return false;
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
@@ -1301,12 +1340,27 @@ async function createRuntime(options = {}) {
   const env = options.env ?? process.env;
   const clock = options.clock ?? systemClock;
   const paths = resolvePaths(env);
-  const config = resolveConfig(await readConfigFile(paths.dataDir), env);
+  const configRead = await readConfigFile(paths.dataDir);
+  let config = resolveConfig(configRead.status === "ok" ? configRead.source : null, env);
+  if (configRead.status === "unusable") {
+    config = { ...config, keepLocalForever: true };
+  }
   const logger = createNdjsonLogger({
     file: paths.logFile,
     level: options.logLevel ?? env["ARCHIVE_LOG_LEVEL"] ?? "info",
     base: { pid: process.pid, v: ARCHIVER_VERSION }
   });
+  if (configRead.status === "unusable") {
+    logger.error("config.unusable", {
+      reason: configRead.reason,
+      effect: "local copies will not be deleted until this is fixed"
+    });
+  } else if (configRead.status === "ok") {
+    const unknown = unknownConfigKeys(configRead.source);
+    if (unknown.length > 0) {
+      logger.warn("config.unknown_keys", { keys: unknown.join(", ") });
+    }
+  }
   let database;
   let httpClient;
   let authProvider;
@@ -1360,14 +1414,34 @@ async function createRuntime(options = {}) {
   return runtime;
 }
 async function readConfigFile(dataDir) {
+  let raw;
   try {
-    const raw = await fsp5.readFile(path7.join(dataDir, "config.json"), "utf8");
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
+    raw = await fsp5.readFile(path7.join(dataDir, "config.json"), "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { status: "absent" };
+    return { status: "unusable", reason: `config.json could not be read: ${String(err)}` };
+  }
+  if (raw.trim().length === 0) return { status: "absent" };
+  try {
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { status: "unusable", reason: "config.json is not a JSON object" };
+    }
+    return { status: "ok", source: parsed };
   } catch {
-    return null;
+    return { status: "unusable", reason: "config.json is not valid JSON" };
   }
 }
+
+// src/core/identifiers.ts
+var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,190}$/;
+function isSafePathSegment(value) {
+  if (!SAFE_SEGMENT.test(value)) return false;
+  if (value === "." || value === "..") return false;
+  if (value.includes("/") || value.includes("\\")) return false;
+  return true;
+}
+var isSafeSessionId = isSafePathSegment;
 
 // src/core/state-keys.ts
 var KV = {
@@ -1386,6 +1460,10 @@ var KV = {
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
+function activeSessionKey(sessionId) {
+  return `active.${sessionId}`;
+}
+var ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1e3;
 
 // src/adapters/spawn-worker.ts
 import { spawn } from "node:child_process";
@@ -1651,6 +1729,10 @@ async function main() {
   try {
     if (!runtime.config.enabled) return;
     const now = runtime.clock.now();
+    const sessionId = input?.session_id;
+    if (sessionId !== void 0 && isSafeSessionId(sessionId)) {
+      kvSetNumber(runtime.db(), activeSessionKey(sessionId), now, now);
+    }
     const lastSweep = kvGetNumber(runtime.db(), KV.lastSweepAt) ?? 0;
     if (now - lastSweep < runtime.config.sweepMinIntervalMs) {
       runtime.logger.debug("hook.session_start.too_soon", { last_sweep_at: lastSweep });

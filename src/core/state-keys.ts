@@ -20,3 +20,13 @@ export const KV = {
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: 'backfill.done_at',
 } as const;
+
+/**
+ * Marks a session as open right now. Written by SessionStart, cleared by
+ * SessionEnd, and expired on a timer because a crash never sends SessionEnd.
+ */
+export function activeSessionKey(sessionId: string): string {
+  return `active.${sessionId}`;
+}
+
+export const ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1000;
