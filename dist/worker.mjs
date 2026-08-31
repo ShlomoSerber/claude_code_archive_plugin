@@ -673,7 +673,8 @@ async function writeFileAtomic(finalPath, data, options = {}) {
     throw err;
   }
 }
-async function removePartials(dir) {
+var PARTIAL_GRACE_MS = 5 * 6e4;
+async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
     entries = await fsp.readdir(dir);
@@ -684,6 +685,12 @@ async function removePartials(dir) {
   for (const entry of entries) {
     if (!entry.endsWith(".partial")) continue;
     const full = path4.join(dir, entry);
+    try {
+      const stat = await fsp.stat(full);
+      if (now - stat.mtimeMs < PARTIAL_GRACE_MS) continue;
+    } catch {
+      continue;
+    }
     try {
       await fsp.rm(full, { force: true });
       removed.push(full);
@@ -1428,7 +1435,18 @@ function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
   applySource(config, file ?? {});
   applySource(config, envSource(env));
+  if (file !== null && unreadableSafetyValues(file).length > 0) {
+    config.keepLocalForever = true;
+  }
   return clamp(config);
+}
+function unreadableSafetyValues(source) {
+  const bad = [];
+  for (const key of ["keepLocalForever", "enabled"]) {
+    const value = source[key];
+    if (value !== void 0 && asBoolean(value) === null) bad.push(key);
+  }
+  return bad;
 }
 function applySource(config, source) {
   const retention = asNumber2(source["retentionDays"]);
@@ -1589,6 +1607,13 @@ async function createRuntime(options = {}) {
       effect: "local copies will not be deleted until this is fixed"
     });
   } else if (configRead.status === "ok") {
+    const unreadable = unreadableSafetyValues(configRead.source);
+    if (unreadable.length > 0) {
+      logger.error("config.unreadable_safety_value", {
+        keys: unreadable.join(", "),
+        effect: "local copies will not be deleted until this is fixed"
+      });
+    }
     const unknown = unknownConfigKeys(configRead.source);
     if (unknown.length > 0) {
       logger.warn("config.unknown_keys", { keys: unknown.join(", ") });
@@ -1870,6 +1895,7 @@ async function statSession(paths, encodedDir, sessionId) {
     transcriptPath,
     sidecarDir,
     hasSidecar: sidecar !== null,
+    sidecarUnreadable: sidecar?.unreadable === true,
     transcriptBytes: transcript.size,
     sidecarBytes: sidecar?.bytes ?? 0,
     mtimeMs: Math.max(transcript.mtimeMs, sidecar?.mtimeMs ?? 0)
@@ -1909,8 +1935,9 @@ async function measureDirectory(dir) {
   let entries;
   try {
     entries = await fsp6.readdir(dir);
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    return { bytes: 0, mtimeMs: 0, unreadable: true };
   }
   let bytes = 0;
   let mtimeMs = 0;
@@ -1920,15 +1947,18 @@ async function measureDirectory(dir) {
     if (current === void 0) break;
     let stat;
     try {
-      stat = await fsp6.stat(current);
-    } catch {
-      continue;
+      stat = await fsp6.lstat(current);
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      return { bytes, mtimeMs, unreadable: true };
     }
     mtimeMs = Math.max(mtimeMs, stat.mtimeMs);
     if (stat.isDirectory()) {
       try {
         for (const child of await fsp6.readdir(current)) stack.push(path11.join(current, child));
-      } catch {
+      } catch (err) {
+        if (err.code !== "ENOENT")
+          return { bytes, mtimeMs, unreadable: true };
       }
     } else if (stat.isFile()) {
       bytes += stat.size;
@@ -5383,7 +5413,7 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
   try {
     stat = await fsp7.lstat(absolute);
   } catch (err) {
-    if (optional) return;
+    if (optional && err.code === "ENOENT") return;
     throw err;
   }
   if (stat.isFile()) {
@@ -5869,6 +5899,12 @@ async function backupSession(ctx, job, args) {
     log.info("backup.transcript_missing");
     return { status: "missing" };
   }
+  if (session.sidecarUnreadable) {
+    throw new FatalError(
+      `the sidecar directory for ${args.sessionId} exists but cannot be read`,
+      `Fix the permissions on the session directory beside its transcript, then run /archive:now. Nothing has been archived or deleted for this session.`
+    );
+  }
   const now = ctx.clock.now();
   const previous = getSession(ctx.db, session.sessionId);
   const summary = await indexSession(ctx, session, now);
@@ -5983,7 +6019,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   if (archivedFloor !== null && archivedBytes < archivedFloor) {
     throw new FatalError(
       `session ${session.sessionId} shrank from ${String(archivedFloor)} to ${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
-      "The copy on Drive is larger than what is on disk. Restore it with /archive:resume before archiving again, or delete the local files if the loss was intended."
+      "The copy on Drive is larger than what is on disk, so archiving now would replace the fuller copy with the smaller one. Move the local files aside and run /archive:resume to put the archived copy back, or delete them if the loss was intended."
     );
   }
   const remote = await uploadWithResume(ctx, {
@@ -6114,6 +6150,10 @@ async function reapLocalCopies(ctx, now) {
     const onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
     if (onDisk === null) {
       markLocalDeleted(ctx.db, record.sessionId, now);
+      continue;
+    }
+    if (onDisk.sidecarUnreadable) {
+      report.skipped++;
       continue;
     }
     if (changedSinceVerification(record, onDisk)) {

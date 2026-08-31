@@ -78,6 +78,12 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
 
+    if (onDisk.sidecarUnreadable) {
+      // We cannot tell what is in there, so we cannot know it is archived.
+      report.skipped++;
+      continue;
+    }
+
     if (changedSinceVerification(record, onDisk)) {
       markLocalPresent(ctx.db, record.sessionId, Math.trunc(onDisk.mtimeMs), now);
       enqueue(

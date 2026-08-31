@@ -18,6 +18,13 @@ export type LocalSession = {
   transcriptPath: string;
   sidecarDir: string;
   hasSidecar: boolean;
+  /**
+   * The sidecar exists but could not be read.
+   *
+   * Carried rather than thrown so one unreadable directory fails its own
+   * session loudly instead of aborting the sweep and halting all archiving.
+   */
+  sidecarUnreadable: boolean;
   transcriptBytes: number;
   sidecarBytes: number;
   /** Newest mtime across the transcript and the sidecar: the idle clock. */
@@ -48,6 +55,7 @@ export async function statSession(
     transcriptPath,
     sidecarDir,
     hasSidecar: sidecar !== null,
+    sidecarUnreadable: sidecar?.unreadable === true,
     transcriptBytes: transcript.size,
     sidecarBytes: sidecar?.bytes ?? 0,
     mtimeMs: Math.max(transcript.mtimeMs, sidecar?.mtimeMs ?? 0),
@@ -99,12 +107,30 @@ export async function* scanSessions(
   }
 }
 
-async function measureDirectory(dir: string): Promise<{ bytes: number; mtimeMs: number } | null> {
+/**
+ * Measure a sidecar directory.
+ *
+ * Returns null only when there is no sidecar. Anything else — a permission
+ * denial, an ACL, an ownership mistake after a restore — throws.
+ *
+ * Swallowing those made a session with an unreadable sidecar look like a
+ * session with no sidecar, so the bundle omitted it, the manifest omitted it,
+ * and the cross-check that exists to catch exactly this compared zero with zero
+ * and passed. The session was then reported verified while hundreds of
+ * megabytes of tool results and subagent transcripts were archived nowhere.
+ */
+async function measureDirectory(
+  dir: string,
+): Promise<{ bytes: number; mtimeMs: number; unreadable?: boolean } | null> {
   let entries: string[];
   try {
     entries = await fsp.readdir(dir);
-  } catch {
-    return null;
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return null;
+    // It is there and we cannot look inside it. Reported, never treated as
+    // absence: that is how a session gets archived without its sidecar and
+    // still called verified.
+    return { bytes: 0, mtimeMs: 0, unreadable: true };
   }
   let bytes = 0;
   let mtimeMs = 0;
@@ -114,16 +140,22 @@ async function measureDirectory(dir: string): Promise<{ bytes: number; mtimeMs: 
     if (current === undefined) break;
     let stat: Awaited<ReturnType<typeof fsp.stat>>;
     try {
-      stat = await fsp.stat(current);
-    } catch {
-      continue;
+      stat = await fsp.lstat(current);
+    } catch (err) {
+      // A file that vanished between the listing and the stat is fine; a file
+      // we are not allowed to look at is not.
+      if ((err as { code?: string }).code === 'ENOENT') continue;
+      return { bytes, mtimeMs, unreadable: true };
     }
     mtimeMs = Math.max(mtimeMs, stat.mtimeMs);
     if (stat.isDirectory()) {
+      // Deliberately unguarded: an unreadable subdirectory must fail the
+      // measurement rather than quietly shrink it.
       try {
         for (const child of await fsp.readdir(current)) stack.push(path.join(current, child));
-      } catch {
-        // Unreadable subdirectory; the bundle still gets what it can.
+      } catch (err) {
+        if ((err as { code?: string }).code !== 'ENOENT')
+          return { bytes, mtimeMs, unreadable: true };
       }
     } else if (stat.isFile()) {
       bytes += stat.size;

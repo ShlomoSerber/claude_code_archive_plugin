@@ -10,7 +10,12 @@ import {
   type AuthProvider,
 } from './adapters/google-auth.ts';
 import { createDriveTransport } from './adapters/drive-http.ts';
-import { resolveConfig, unknownConfigKeys, type ArchiveConfig } from './core/config.ts';
+import {
+  resolveConfig,
+  unknownConfigKeys,
+  unreadableSafetyValues,
+  type ArchiveConfig,
+} from './core/config.ts';
 import { resolvePaths, type ArchivePaths, type Environment } from './core/paths.ts';
 import { systemClock, type Clock } from './ports/clock.ts';
 import type { Logger, LogLevel } from './ports/logger.ts';
@@ -73,6 +78,13 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       effect: 'local copies will not be deleted until this is fixed',
     });
   } else if (configRead.status === 'ok') {
+    const unreadable = unreadableSafetyValues(configRead.source);
+    if (unreadable.length > 0) {
+      logger.error('config.unreadable_safety_value', {
+        keys: unreadable.join(', '),
+        effect: 'local copies will not be deleted until this is fixed',
+      });
+    }
     const unknown = unknownConfigKeys(configRead.source);
     if (unknown.length > 0) {
       // A misspelled `keepLocalForever` is silently no protection at all.

@@ -50,6 +50,17 @@ export async function backupSession(
     return { status: 'missing' };
   }
 
+  if (session.sidecarUnreadable) {
+    // Archiving now would store the transcript alone and record the session as
+    // verified, with the tool results and subagent transcripts on Drive nowhere
+    // and nothing anywhere saying so.
+    throw new FatalError(
+      `the sidecar directory for ${args.sessionId} exists but cannot be read`,
+      `Fix the permissions on the session directory beside its transcript, then ` +
+        `run /archive:now. Nothing has been archived or deleted for this session.`,
+    );
+  }
+
   const now = ctx.clock.now();
   // Read before anything clears it: markBundled withdraws verification the
   // moment a new bundle is built, and this is the record of what Drive held.
@@ -246,9 +257,10 @@ async function publish(
     throw new FatalError(
       `session ${session.sessionId} shrank from ${String(archivedFloor)} to ` +
         `${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
-      'The copy on Drive is larger than what is on disk. Restore it with ' +
-        '/archive:resume before archiving again, or delete the local files if the ' +
-        'loss was intended.',
+      'The copy on Drive is larger than what is on disk, so archiving now would ' +
+        'replace the fuller copy with the smaller one. Move the local files aside ' +
+        'and run /archive:resume to put the archived copy back, or delete them if ' +
+        'the loss was intended.',
     );
   }
 

@@ -506,6 +506,7 @@ async function writeFileAtomic(finalPath, data, options = {}) {
     throw err;
   }
 }
+var PARTIAL_GRACE_MS = 5 * 6e4;
 
 // src/ports/logger.ts
 var nullLogger = {
@@ -1256,7 +1257,18 @@ function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
   applySource(config, file ?? {});
   applySource(config, envSource(env));
+  if (file !== null && unreadableSafetyValues(file).length > 0) {
+    config.keepLocalForever = true;
+  }
   return clamp(config);
+}
+function unreadableSafetyValues(source) {
+  const bad = [];
+  for (const key of ["keepLocalForever", "enabled"]) {
+    const value = source[key];
+    if (value !== void 0 && asBoolean(value) === null) bad.push(key);
+  }
+  return bad;
 }
 function applySource(config, source) {
   const retention = asNumber2(source["retentionDays"]);
@@ -1414,6 +1426,13 @@ async function createRuntime(options = {}) {
       effect: "local copies will not be deleted until this is fixed"
     });
   } else if (configRead.status === "ok") {
+    const unreadable = unreadableSafetyValues(configRead.source);
+    if (unreadable.length > 0) {
+      logger.error("config.unreadable_safety_value", {
+        keys: unreadable.join(", "),
+        effect: "local copies will not be deleted until this is fixed"
+      });
+    }
     const unknown = unknownConfigKeys(configRead.source);
     if (unknown.length > 0) {
       logger.warn("config.unknown_keys", { keys: unknown.join(", ") });

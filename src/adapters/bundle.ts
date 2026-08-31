@@ -194,7 +194,10 @@ async function describeInto(
     // Silently dropping an unreadable file would produce a manifest that omits
     // it, and the manifest is what the bundle is checked against — so the
     // bundle would then verify as complete while missing data.
-    if (optional) return;
+    //
+    // `optional` means "this entry need not exist", not "any failure is fine":
+    // a session with no sidecar is ordinary, a sidecar we cannot read is not.
+    if (optional && (err as { code?: string }).code === 'ENOENT') return;
     throw err;
   }
   if (stat.isFile()) {

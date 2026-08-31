@@ -6,7 +6,7 @@ import { statSession } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, type SessionRecord } from '../core/catalog.ts';
 import { FatalError, RetryableError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
-import { clearVerification } from '../core/catalog.ts';
+import { clearVerification, markVerified } from '../core/catalog.ts';
 import type { WorkerContext } from './context.ts';
 
 /**
@@ -48,24 +48,28 @@ export async function restoreSession(
   }
   const targetDir = path.join(ctx.paths.projectsDir, record.encodedDir);
   assertInside(ctx.paths.projectsDir, targetDir, 'restore target');
-  // "Already local" has to mean any part of the session, not only the
-  // transcript. With the transcript gone but the sidecar still here, unpacking
-  // would overwrite tool results that are newer than the archived ones.
+  // "Already local" means the transcript is here. A surviving sidecar with no
+  // transcript is a half-present session — what a crash between the reaper's two
+  // deletes leaves behind — and calling that "already on this machine" was the
+  // one state the plugin could not get itself out of. The stale sidecar is moved
+  // aside first so unpacking cannot overwrite it.
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
-  const sidecarSurvives = await isDirectory(path.join(targetDir, sessionId));
-  if (existing !== null || sidecarSurvives) {
-    if (existing !== null) {
-      markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
-    }
+  if (existing !== null) {
+    markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
     return {
       sessionId,
       encodedDir: record.encodedDir,
       projectCwd: record.projectCwd,
-      transcriptPath: existing?.transcriptPath ?? path.join(targetDir, `${sessionId}.jsonl`),
+      transcriptPath: existing.transcriptPath,
       entries: [],
       alreadyLocal: true,
       resumeCommand: resumeCommand(sessionId),
     };
+  }
+  if (await isDirectory(path.join(targetDir, sessionId))) {
+    const aside = path.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
+    await fsp.rename(path.join(targetDir, sessionId), aside).catch(() => undefined);
+    ctx.logger.warn('restore.sidecar_moved_aside', { session_id: sessionId, path: aside });
   }
 
   const remoteFileId = requireRemote(record);
@@ -115,7 +119,26 @@ export async function restoreSession(
 
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
     const now = ctx.clock.now();
-    if (restored !== null) markLocalPresent(ctx.db, sessionId, Math.trunc(restored.mtimeMs), now);
+    if (restored !== null) {
+      markLocalPresent(ctx.db, sessionId, Math.trunc(restored.mtimeMs), now);
+      // The unpacked files just matched the archive byte for byte, so this is
+      // the archived state. Without re-recording it, tar's second-granularity
+      // mtimes make every restore look like a change and force a full re-bundle
+      // and re-upload of a session nobody touched.
+      markVerified(
+        ctx.db,
+        sessionId,
+        {
+          fileId: remoteFileId,
+          path: record.remotePath ?? '',
+          localMtime: Math.trunc(restored.mtimeMs),
+          localBytes: restored.transcriptBytes + restored.sidecarBytes,
+          bundleSha256: record.verifiedBundleSha256,
+          transcriptSha256: record.verifiedTranscriptSha256,
+        },
+        now,
+      );
+    }
 
     ctx.logger.info('restore.done', { session_id: sessionId, entries: entries.length });
     return {

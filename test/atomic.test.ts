@@ -110,12 +110,25 @@ describe('removePartials', () => {
     const dir = tempDir();
     await fsp.writeFile(path.join(dir, 'a.tar.zst'), 'keep');
     await fsp.writeFile(path.join(dir, 'b.tar.zst.abc123.partial'), 'discard');
-    const removed = await removePartials(dir);
+    // Freshly written partials belong to an operation that may still be
+    // running, so the sweep leaves them; pass a later clock to age them out.
+    const removed = await removePartials(dir, Date.now() + 10 * 60_000);
     assert.equal(removed.length, 1);
     assert.deepEqual(await fsp.readdir(dir), ['a.tar.zst']);
   });
 
   it('returns nothing for a directory that does not exist yet', async () => {
     assert.deepEqual(await removePartials(path.join(tempDir(), 'absent')), []);
+  });
+});
+
+describe('removePartials grace period', () => {
+  it('leaves a partial that a running operation may still be writing', async () => {
+    // A restore downloads through a temp file with this suffix; a sweep running
+    // alongside used to delete it mid-download and fail the restore.
+    const dir = tempDir();
+    await fsp.writeFile(path.join(dir, 'restore.tar.zst.abc.partial'), 'in flight');
+    assert.deepEqual(await removePartials(dir), []);
+    assert.equal(fs.existsSync(path.join(dir, 'restore.tar.zst.abc.partial')), true);
   });
 });

@@ -6,7 +6,13 @@ import { describe, it } from 'node:test';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import { clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
-import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.ts';
+import {
+  DEFAULT_CONFIG,
+  resolveConfig,
+  unreadableSafetyValues,
+  type ArchiveConfig,
+  DAY_MS,
+} from '../src/core/config.ts';
 import { RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import { claim, enqueue, getJob, listJobs, setUploadUri } from '../src/core/queue.ts';
@@ -1183,5 +1189,116 @@ describe('fresh-machine recovery', () => {
     const names = found.map((file) => file.name).sort();
     assert.ok(names.includes('catalog-deadbeef.sqlite'), 'the other machine is visible');
     assert.ok(names.includes(catalogFileName()));
+  });
+});
+
+/**
+ * Seventh round. The red team could not delete a transcript this time. What it
+ * found was the plugin saying "verified" about bytes that were nowhere.
+ */
+describe('archive completeness', () => {
+  it('fails the backup when a sidecar cannot be read, rather than archiving without it', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permissions do not apply on Windows');
+      return;
+    }
+    const harness = makeHarness();
+    const sidecar = path.join(harness.projectDir, SESSION_B);
+    fs.chmodSync(sidecar, 0o000);
+    try {
+      const report = await runSweep(harness.ctx);
+      // Both the measurer and the manifest builder used to fail the same way,
+      // so the cross-check compared zero with zero and passed.
+      assert.equal(report.blocked, 1, 'the session is not silently archived without its sidecar');
+      assert.equal(getSession(harness.ctx.db, SESSION_B)?.verifiedAt, null);
+      assert.equal(report.verified, 1, 'and the other session is archived normally');
+    } finally {
+      fs.chmodSync(sidecar, 0o755);
+    }
+  });
+
+  it('still treats a session with no sidecar at all as ordinary', async () => {
+    const harness = makeHarness();
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.verified, 2);
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, 'no sidecar is not an error');
+  });
+
+  it('repairs a session whose transcript was reaped but whose sidecar survived', async () => {
+    // What a crash between the reaper's two deletes leaves behind. This used to
+    // report "already on this machine" and restore nothing, with the backup
+    // blocked forever and no supported way out.
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    fs.rmSync(harness.transcriptOf(SESSION_B));
+
+    const restored = await restoreSession(harness.ctx, SESSION_B);
+    assert.equal(restored.alreadyLocal, false, 'a half-present session is not "already local"');
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_B)), true);
+    assert.equal(
+      fs.existsSync(path.join(harness.projectDir, SESSION_B, 'tool-result.json')),
+      true,
+      'the sidecar is restored too',
+    );
+  });
+
+  it('does not re-upload a session merely because it was restored', async () => {
+    // tar restores mtimes at second granularity, so a restored session used to
+    // look changed and be bundled and uploaded again from scratch.
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.clock.advance(31 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    await restoreSession(harness.ctx, SESSION_A);
+
+    harness.clock.advance(60_000);
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.enqueued, 0, 'a restored session is already archived');
+  });
+
+  it('treats an unreadable value on a safety switch as an attempt to use it', () => {
+    // `keepLocalForever: 'yes please'` used to be discarded in silence, leaving
+    // the default, which deletes.
+    assert.equal(resolveConfig({ keepLocalForever: 'yes please' }, {}).keepLocalForever, true);
+    assert.equal(resolveConfig({ enabled: 'sometimes' }, {}).keepLocalForever, true);
+    assert.deepEqual(unreadableSafetyValues({ keepLocalForever: 'maybe' }), ['keepLocalForever']);
+    assert.deepEqual(unreadableSafetyValues({ keepLocalForever: true }), []);
+  });
+});
+
+describe('an unreadable sidecar', () => {
+  it('does not stop the sweep archiving everything else', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permissions do not apply on Windows');
+      return;
+    }
+    const harness = makeHarness();
+    const sidecar = path.join(harness.projectDir, SESSION_B);
+    fs.chmodSync(sidecar, 0o000);
+    try {
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.discovered, 2, 'the scan does not abort');
+      assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, 'its neighbour still archives');
+    } finally {
+      fs.chmodSync(sidecar, 0o755);
+    }
+  });
+
+  it('is never reaped, since we cannot know it is archived', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permissions do not apply on Windows');
+      return;
+    }
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const sidecar = path.join(harness.projectDir, SESSION_B);
+    fs.chmodSync(sidecar, 0o000);
+    try {
+      harness.clock.advance(31 * DAY_MS);
+      await reapLocalCopies(harness.ctx, harness.clock.now());
+      assert.equal(fs.existsSync(harness.transcriptOf(SESSION_B)), true);
+    } finally {
+      fs.chmodSync(sidecar, 0o755);
+    }
   });
 });

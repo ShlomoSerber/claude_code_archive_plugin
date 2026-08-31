@@ -141,7 +141,10 @@ export function writeFileAtomicSync(
  * Delete leftover `*.partial` files in a directory. Run at worker startup:
  * an interrupted bundle is cheap to rebuild and impossible to resume.
  */
-export async function removePartials(dir: string): Promise<string[]> {
+/** Younger than this and it may still belong to a running operation. */
+const PARTIAL_GRACE_MS = 5 * 60_000;
+
+export async function removePartials(dir: string, now = Date.now()): Promise<string[]> {
   let entries: string[];
   try {
     entries = await fsp.readdir(dir);
@@ -152,6 +155,14 @@ export async function removePartials(dir: string): Promise<string[]> {
   for (const entry of entries) {
     if (!entry.endsWith('.partial')) continue;
     const full = path.join(dir, entry);
+    try {
+      // A restore downloads through a temp file with the same suffix, and a
+      // sweep running beside it would otherwise delete the file mid-download.
+      const stat = await fsp.stat(full);
+      if (now - stat.mtimeMs < PARTIAL_GRACE_MS) continue;
+    } catch {
+      continue;
+    }
     try {
       await fsp.rm(full, { force: true });
       removed.push(full);

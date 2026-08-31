@@ -88,7 +88,26 @@ export function resolveConfig(
   const config = { ...DEFAULT_CONFIG };
   applySource(config, file ?? {});
   applySource(config, envSource(env));
+  // An unreadable value on a switch whose only job is to prevent deletion is
+  // treated as an attempt to prevent deletion.
+  if (file !== null && unreadableSafetyValues(file).length > 0) {
+    config.keepLocalForever = true;
+  }
   return clamp(config);
+}
+
+/**
+ * Values on the two switches that stop deletion, which are present but not
+ * understood. `keepLocalForever: 'yes please'` used to be discarded in silence,
+ * turning an attempt to disable deletion into the default, which enables it.
+ */
+export function unreadableSafetyValues(source: Readonly<Record<string, unknown>>): string[] {
+  const bad: string[] = [];
+  for (const key of ['keepLocalForever', 'enabled'] as const) {
+    const value = source[key];
+    if (value !== undefined && asBoolean(value) === null) bad.push(key);
+  }
+  return bad;
 }
 
 function applySource(config: ArchiveConfig, source: Source): void {
