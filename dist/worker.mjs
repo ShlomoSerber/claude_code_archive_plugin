@@ -245,7 +245,7 @@ function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUS.has(status) || status >= 500 && status < 600;
 }
 function isRetryableNetworkError(err) {
-  if (err instanceof RetryableError) return true;
+  if (err instanceof RetryableError) return err.status !== void 0;
   const code = errorCode(err);
   if (code !== void 0 && RETRYABLE_SYSCALL_CODES.has(code)) return true;
   if (err instanceof Error && err.name === "TimeoutError") return true;
@@ -1142,6 +1142,21 @@ function createDriveTransport(deps) {
       }
       return parentId;
     },
+    async listFiles(args, signal) {
+      const url = new URL(`${API}/files`);
+      url.searchParams.set(
+        "q",
+        `name contains '${escapeQuery(args.namePrefix)}' and '${escapeQuery(args.parentId)}' in parents and trashed = false`
+      );
+      url.searchParams.set("fields", `files(${FILE_FIELDS})`);
+      url.searchParams.set("pageSize", "100");
+      url.searchParams.set("spaces", "drive");
+      const response = await authorized(url.toString(), signal === void 0 ? {} : { signal });
+      const body = await failIfNotOk(response, "listing Drive files");
+      const files = body?.files;
+      if (!Array.isArray(files)) return [];
+      return files.map(toRemoteFile).filter((file) => file.name.startsWith(args.namePrefix));
+    },
     findFile(args, signal) {
       return listOne(
         `name = '${escapeQuery(args.name)}' and '${escapeQuery(args.parentId)}' in parents and trashed = false`,
@@ -1240,6 +1255,22 @@ function createDriveTransport(deps) {
         return;
       }
       await failIfNotOk(response, "deleting a Drive file");
+    },
+    async trashFile(fileId, signal) {
+      const url = new URL(`${API}/files/${encodeURIComponent(fileId)}`);
+      url.searchParams.set("fields", "id,trashed");
+      const response = await authorized(url.toString(), {
+        method: "PATCH",
+        headers: { "content-type": "application/json; charset=UTF-8" },
+        body: JSON.stringify({ trashed: true }),
+        expect: [404],
+        ...signal === void 0 ? {} : { signal }
+      });
+      if (response.status === 404) {
+        await response.body?.cancel().catch(() => void 0);
+        return;
+      }
+      await failIfNotOk(response, "moving a Drive file to the wastebasket");
     },
     async downloadToFile(args, signal) {
       const url = new URL(`${API}/files/${encodeURIComponent(args.fileId)}`);
@@ -2026,12 +2057,10 @@ function markVerified(db, sessionId, remote, now) {
   );
 }
 function clearVerification(db, sessionId, now) {
-  db.prepare(
-    `UPDATE sessions
-        SET verified_at = NULL,
-            verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
-      WHERE session_id = ?`
-  ).run(now, sessionId);
+  db.prepare(`UPDATE sessions SET verified_at = NULL, updated_at = ? WHERE session_id = ?`).run(
+    now,
+    sessionId
+  );
 }
 function markLocalDeleted(db, sessionId, now) {
   db.prepare(
@@ -2148,6 +2177,10 @@ function enqueue(db, args, now) {
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = 0,
          claim_token = NULL,
+         -- New work means a new bundle. A URI opened for the previous one would
+         -- otherwise be resumed against different bytes, and the "already
+         -- complete" answer would hand back the wrong file.
+         upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
   ).get(key, args.kind, sessionId, payload, notBefore, now, now);
@@ -5348,7 +5381,7 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
   const absolute = path12.join(cwd, relative);
   let stat;
   try {
-    stat = await fsp7.stat(absolute);
+    stat = await fsp7.lstat(absolute);
   } catch (err) {
     if (optional) return;
     throw err;
@@ -5713,7 +5746,12 @@ import fsp8 from "node:fs/promises";
 async function uploadWithResume(ctx, args) {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? "", name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
-  let uploadUri = args.job.uploadUri;
+  const stored = parseUploadUri(args.job.uploadUri);
+  let uploadUri = stored !== null && stored.sha256 === args.sha256 ? stored.uri : null;
+  if (stored !== null && uploadUri === null) {
+    log.info("upload.uri_belongs_to_another_bundle");
+    setUploadUri(ctx.db, args.job, null, ctx.clock.now());
+  }
   let confirmed = 0;
   if (uploadUri !== null) {
     const progress = await ctx.drive.probeUpload(
@@ -5725,8 +5763,14 @@ async function uploadWithResume(ctx, args) {
       uploadUri = null;
       setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else if (progress.done && progress.file !== null) {
-      log.info("upload.already_complete");
-      return progress.file;
+      if (matchesLocal(progress.file, args)) {
+        log.info("upload.already_complete");
+        setUploadUri(ctx.db, args.job, null, ctx.clock.now());
+        return progress.file;
+      }
+      log.warn("upload.complete_but_mismatched", { file_id: progress.file.id });
+      uploadUri = null;
+      setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else {
       confirmed = progress.confirmedBytes;
       log.info("upload.resuming", { confirmed_bytes: confirmed });
@@ -5757,7 +5801,7 @@ async function uploadWithResume(ctx, args) {
       },
       ctx.signal
     );
-    setUploadUri(ctx.db, args.job, uploadUri, ctx.clock.now());
+    setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
     confirmed = 0;
   }
   const handle = await fsp8.open(args.filePath, "r");
@@ -5801,6 +5845,15 @@ async function uploadWithResume(ctx, args) {
     await handle.close();
   }
   throw new RetryableError("the upload finished without Drive returning the file");
+}
+function tagUploadUri(uri, sha256) {
+  return `${sha256}|${uri}`;
+}
+function parseUploadUri(stored) {
+  if (stored === null) return null;
+  const separator = stored.indexOf("|");
+  if (separator <= 0) return null;
+  return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
 }
 function matchesLocal(remote, args) {
   if (remote.size !== null && remote.size !== args.totalBytes) return false;
@@ -5926,9 +5979,10 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError("the session changed while it was being archived");
   }
-  if (previous?.verifiedLocalBytes != null && archivedBytes < previous.verifiedLocalBytes) {
+  const archivedFloor = previousArchivedBytes(previous);
+  if (archivedFloor !== null && archivedBytes < archivedFloor) {
     throw new FatalError(
-      `session ${session.sessionId} shrank from ${String(previous.verifiedLocalBytes)} to ${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
+      `session ${session.sessionId} shrank from ${String(archivedFloor)} to ${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
       "The copy on Drive is larger than what is on disk. Restore it with /archive:resume before archiving again, or delete the local files if the loss was intended."
     );
   }
@@ -5993,7 +6047,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   const sameProject = previous?.encodedDir === session.encodedDir;
   if (supersededId !== null && supersededId !== remote.id && sameProject) {
     try {
-      await ctx.drive.deleteFile(supersededId, ctx.signal);
+      await ctx.drive.trashFile(supersededId, ctx.signal);
     } catch (err) {
       ctx.logger.warn("backup.superseded_cleanup_failed", { file_id: supersededId }, err);
     }
@@ -6014,6 +6068,12 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   clearVerification(ctx.db, sessionId, ctx.clock.now());
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
+}
+function previousArchivedBytes(previous) {
+  if (previous?.remoteFileId == null) return null;
+  if (previous.verifiedLocalBytes !== null) return previous.verifiedLocalBytes;
+  const parts2 = (previous.transcriptBytes ?? 0) + (previous.sidecarBytes ?? 0);
+  return parts2 > 0 ? parts2 : null;
 }
 function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
@@ -6144,7 +6204,7 @@ async function confirmRemote(ctx, record) {
     if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
       return "gone";
     }
-    if (remote.sha256 === null) return "gone";
+    if (remote.sha256 === null) return "unavailable";
     return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase() ? "ok" : "gone";
   } catch (err) {
     if (err instanceof FatalError) return "gone";
@@ -6520,12 +6580,14 @@ function unavailableDrive(reason) {
   return {
     ensureFolder: fail,
     findFile: fail,
+    listFiles: fail,
     startResumableUpload: fail,
     uploadChunk: fail,
     probeUpload: fail,
     uploadSmallFile: fail,
     getFile: fail,
     deleteFile: fail,
+    trashFile: fail,
     downloadToFile: fail,
     storageQuota: fail
   };

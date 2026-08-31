@@ -78,7 +78,11 @@ export function isRetryableHttpStatus(status: number): boolean {
 
 /** True for the network-level failures worth another attempt. */
 export function isRetryableNetworkError(err: unknown): boolean {
-  if (err instanceof RetryableError) return true;
+  // A RetryableError only counts as a *network* failure when it carries an HTTP
+  // status. Without this, one session that cannot be bundled locally — an
+  // unreadable file, a symlink tar refuses — drove the shared circuit breaker
+  // and throttled archiving for every other session for hours.
+  if (err instanceof RetryableError) return err.status !== undefined;
   const code = errorCode(err);
   if (code !== undefined && RETRYABLE_SYSCALL_CODES.has(code)) return true;
   if (err instanceof Error && err.name === 'TimeoutError') return true;

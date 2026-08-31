@@ -226,7 +226,10 @@ async function confirmRemote(
     }
     // Deletion is irreversible, so the strong hash is required here even though
     // the upload path is willing to fall back to md5.
-    if (remote.sha256 === null) return 'gone';
+    // No checksum means Drive could not answer the question, not that the
+    // answer was bad. Skip this session for now rather than withdrawing a good
+    // verification and scheduling a re-archive that could overwrite the archive.
+    if (remote.sha256 === null) return 'unavailable';
     // Compared against the hash verification actually passed on, not against
     // bundle_sha256, which a later failed rebuild overwrites with bytes Drive
     // never received.

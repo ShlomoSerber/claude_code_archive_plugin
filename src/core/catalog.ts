@@ -262,20 +262,22 @@ export function markVerified(
 /**
  * Withdraw the authority to delete this session's local copy.
  *
- * It deliberately keeps `remote_file_id` and `bundle_sha256`. For a session
- * whose local copy has already been reaped, that id is the only pointer to
- * bytes that exist nowhere else, and nothing rebuilds it: discovery only
- * enqueues sessions found on disk. Clearing it turns "this needs re-checking"
- * into "this is gone forever". Restore verifies the downloaded bytes against
- * the stored hash, so keeping the pointer costs no safety.
+ * It clears exactly one thing: `verified_at`. Everything else on the row
+ * describes the copy Drive holds, and this function is called for *transient*
+ * reasons — a checksum that arrived late, one failed verification, a bulk
+ * `/archive:verify` run. Erasing the description each time blinded the guard
+ * that refuses to archive a session smaller than its archive, which is the
+ * check standing between a locally damaged session and a destroyed archive.
+ *
+ * `remote_file_id` stays for the same reason. For a session already reaped, it
+ * is the only pointer to bytes that exist nowhere else, and nothing rebuilds
+ * it: discovery only enqueues sessions found on disk.
  */
 export function clearVerification(db: Db, sessionId: string, now: number): void {
-  db.prepare(
-    `UPDATE sessions
-        SET verified_at = NULL,
-            verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
-      WHERE session_id = ?`,
-  ).run(now, sessionId);
+  db.prepare(`UPDATE sessions SET verified_at = NULL, updated_at = ? WHERE session_id = ?`).run(
+    now,
+    sessionId,
+  );
 }
 
 export function markLocalDeleted(db: Db, sessionId: string, now: number): void {

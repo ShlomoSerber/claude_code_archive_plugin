@@ -92,7 +92,7 @@ function isRetryableHttpStatus(status) {
   return RETRYABLE_HTTP_STATUS.has(status) || status >= 500 && status < 600;
 }
 function isRetryableNetworkError(err) {
-  if (err instanceof RetryableError) return true;
+  if (err instanceof RetryableError) return err.status !== void 0;
   const code = errorCode(err);
   if (code !== void 0 && RETRYABLE_SYSCALL_CODES.has(code)) return true;
   if (err instanceof Error && err.name === "TimeoutError") return true;
@@ -959,6 +959,21 @@ function createDriveTransport(deps) {
       }
       return parentId;
     },
+    async listFiles(args, signal) {
+      const url = new URL(`${API}/files`);
+      url.searchParams.set(
+        "q",
+        `name contains '${escapeQuery(args.namePrefix)}' and '${escapeQuery(args.parentId)}' in parents and trashed = false`
+      );
+      url.searchParams.set("fields", `files(${FILE_FIELDS})`);
+      url.searchParams.set("pageSize", "100");
+      url.searchParams.set("spaces", "drive");
+      const response = await authorized(url.toString(), signal === void 0 ? {} : { signal });
+      const body = await failIfNotOk(response, "listing Drive files");
+      const files = body?.files;
+      if (!Array.isArray(files)) return [];
+      return files.map(toRemoteFile).filter((file) => file.name.startsWith(args.namePrefix));
+    },
     findFile(args, signal) {
       return listOne(
         `name = '${escapeQuery(args.name)}' and '${escapeQuery(args.parentId)}' in parents and trashed = false`,
@@ -1057,6 +1072,22 @@ function createDriveTransport(deps) {
         return;
       }
       await failIfNotOk(response, "deleting a Drive file");
+    },
+    async trashFile(fileId, signal) {
+      const url = new URL(`${API}/files/${encodeURIComponent(fileId)}`);
+      url.searchParams.set("fields", "id,trashed");
+      const response = await authorized(url.toString(), {
+        method: "PATCH",
+        headers: { "content-type": "application/json; charset=UTF-8" },
+        body: JSON.stringify({ trashed: true }),
+        expect: [404],
+        ...signal === void 0 ? {} : { signal }
+      });
+      if (response.status === 404) {
+        await response.body?.cancel().catch(() => void 0);
+        return;
+      }
+      await failIfNotOk(response, "moving a Drive file to the wastebasket");
     },
     async downloadToFile(args, signal) {
       const url = new URL(`${API}/files/${encodeURIComponent(args.fileId)}`);
@@ -1468,6 +1499,10 @@ function enqueue(db, args, now) {
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = 0,
          claim_token = NULL,
+         -- New work means a new bundle. A URI opened for the previous one would
+         -- otherwise be resumed against different bytes, and the "already
+         -- complete" answer would hand back the wrong file.
+         upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
   ).get(key, args.kind, sessionId, payload, notBefore, now, now);

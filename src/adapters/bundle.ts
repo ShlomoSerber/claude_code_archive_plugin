@@ -186,7 +186,10 @@ async function describeInto(
   const absolute = path.join(cwd, relative);
   let stat: fs.Stats;
   try {
-    stat = await fsp.stat(absolute);
+    // lstat, not stat: tar is configured not to follow links, so following one
+    // here would put a file in the manifest that the bundle does not contain,
+    // and the content check would then disagree with itself forever.
+    stat = await fsp.lstat(absolute);
   } catch (err) {
     // Silently dropping an unreadable file would produce a manifest that omits
     // it, and the manifest is what the bundle is checked against — so the

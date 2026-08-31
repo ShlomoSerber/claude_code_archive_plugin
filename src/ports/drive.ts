@@ -42,6 +42,12 @@ export interface DriveTransport {
   /** Create the folder chain if needed and return the deepest folder's id. */
   ensureFolder(pathSegments: string[], signal?: AbortSignal): Promise<string>;
 
+  /** Files in a folder whose name starts with `prefix`. */
+  listFiles(
+    args: { parentId: string; namePrefix: string },
+    signal?: AbortSignal,
+  ): Promise<RemoteFile[]>;
+
   /** Find a file by exact name inside a folder, or null. */
   findFile(
     args: { name: string; parentId: string },
@@ -96,7 +102,17 @@ export interface DriveTransport {
   /** Metadata including checksums, which must be requested explicitly. */
   getFile(fileId: string, signal?: AbortSignal): Promise<RemoteFile>;
 
+  /** Permanent. Only for a file this run created and then rejected. */
   deleteFile(fileId: string, signal?: AbortSignal): Promise<void>;
+
+  /**
+   * Move to the remote's wastebasket, where it can still be recovered.
+   *
+   * Anything that retires a bundle believed to be good goes through here. A
+   * permanent delete makes one wrong decision anywhere upstream unrecoverable;
+   * the wastebasket buys thirty days to notice.
+   */
+  trashFile(fileId: string, signal?: AbortSignal): Promise<void>;
 
   /** Stream a file's bytes to a local path. */
   downloadToFile(

@@ -30,7 +30,14 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? '', name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
 
-  let uploadUri = args.job.uploadUri;
+  // The URI is stored tagged with the hash of the bundle it was opened for.
+  // Resuming one against different bytes produces a file that is neither.
+  const stored = parseUploadUri(args.job.uploadUri);
+  let uploadUri = stored !== null && stored.sha256 === args.sha256 ? stored.uri : null;
+  if (stored !== null && uploadUri === null) {
+    log.info('upload.uri_belongs_to_another_bundle');
+    setUploadUri(ctx.db, args.job, null, ctx.clock.now());
+  }
   let confirmed = 0;
 
   if (uploadUri !== null) {
@@ -44,8 +51,15 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       uploadUri = null;
       setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else if (progress.done && progress.file !== null) {
-      log.info('upload.already_complete');
-      return progress.file;
+      // "Complete" only counts if what landed is what we are uploading.
+      if (matchesLocal(progress.file, args)) {
+        log.info('upload.already_complete');
+        setUploadUri(ctx.db, args.job, null, ctx.clock.now());
+        return progress.file;
+      }
+      log.warn('upload.complete_but_mismatched', { file_id: progress.file.id });
+      uploadUri = null;
+      setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else {
       confirmed = progress.confirmedBytes;
       log.info('upload.resuming', { confirmed_bytes: confirmed });
@@ -87,7 +101,7 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       ctx.signal,
     );
     // Persisted before a single byte is sent: this URI is the idempotency key.
-    setUploadUri(ctx.db, args.job, uploadUri, ctx.clock.now());
+    setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
     confirmed = 0;
   }
 
@@ -145,6 +159,19 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
  * a checksum must agree. When Drive gives us neither checksum, we treat the
  * remote as unknown and replace it.
  */
+/** `<bundle sha256>|<uri>`, so a stored URI can never outlive its bundle. */
+export function tagUploadUri(uri: string, sha256: string): string {
+  return `${sha256}|${uri}`;
+}
+
+export function parseUploadUri(stored: string | null): { sha256: string; uri: string } | null {
+  if (stored === null) return null;
+  const separator = stored.indexOf('|');
+  // An untagged value predates this format and cannot be trusted to a bundle.
+  if (separator <= 0) return null;
+  return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
+}
+
 export function matchesLocal(
   remote: RemoteFile,
   args: { totalBytes: number; sha256: string },

@@ -128,6 +128,24 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
       return parentId;
     },
 
+    async listFiles(args, signal): Promise<RemoteFile[]> {
+      const url = new URL(`${API}/files`);
+      url.searchParams.set(
+        'q',
+        `name contains '${escapeQuery(args.namePrefix)}' and '${escapeQuery(args.parentId)}' ` +
+          `in parents and trashed = false`,
+      );
+      url.searchParams.set('fields', `files(${FILE_FIELDS})`);
+      url.searchParams.set('pageSize', '100');
+      url.searchParams.set('spaces', 'drive');
+      const response = await authorized(url.toString(), signal === undefined ? {} : { signal });
+      const body = await failIfNotOk(response, 'listing Drive files');
+      const files = (body as { files?: unknown } | null)?.files;
+      if (!Array.isArray(files)) return [];
+      // `name contains` is a prefix-ish match on Drive, so filter exactly.
+      return files.map(toRemoteFile).filter((file) => file.name.startsWith(args.namePrefix));
+    },
+
     findFile(args, signal) {
       return listOne(
         `name = '${escapeQuery(args.name)}' and '${escapeQuery(args.parentId)}' in parents ` +
@@ -238,6 +256,23 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
         return;
       }
       await failIfNotOk(response, 'deleting a Drive file');
+    },
+
+    async trashFile(fileId, signal): Promise<void> {
+      const url = new URL(`${API}/files/${encodeURIComponent(fileId)}`);
+      url.searchParams.set('fields', 'id,trashed');
+      const response = await authorized(url.toString(), {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json; charset=UTF-8' },
+        body: JSON.stringify({ trashed: true }),
+        expect: [404],
+        ...(signal === undefined ? {} : { signal }),
+      });
+      if (response.status === 404) {
+        await response.body?.cancel().catch(() => undefined);
+        return;
+      }
+      await failIfNotOk(response, 'moving a Drive file to the wastebasket');
     },
 
     async downloadToFile(args, signal): Promise<void> {

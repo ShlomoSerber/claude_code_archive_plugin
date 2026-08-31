@@ -16,7 +16,6 @@ import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
 import type { Runtime } from '../composition.ts';
 import { commandContext } from './context.ts';
 import { runNow } from './now.ts';
-import { catalogFileName } from '../worker/sweep.ts';
 import { formatBytes, print, printJson, warn } from './output.ts';
 
 /**
@@ -138,13 +137,16 @@ export async function importCatalogIfEmpty(runtime: Runtime): Promise<number> {
   try {
     const ctx = commandContext(runtime);
     const parentId = await ctx.drive.ensureFolder([runtime.config.driveRootFolder], ctx.signal);
-    // This machine's own copy first, then the legacy shared name. Both are
-    // plain files in the archive root, and importing the union is what makes a
-    // replacement machine see the whole history rather than one machine's share.
+    // Every machine's copy, not only this one's. A replacement laptop has a
+    // different hostname and so a different catalog name, and searching for its
+    // own would find nothing at all — which is precisely the case the whole
+    // disaster-recovery promise is about.
+    const remotes = await ctx.drive.listFiles({ parentId, namePrefix: 'catalog' }, ctx.signal);
+    const wanted = remotes.filter(
+      (file) => file.name === 'catalog.sqlite' || /^catalog-[0-9a-f]{8}\.sqlite$/.test(file.name),
+    );
     let imported = 0;
-    for (const name of [catalogFileName(), 'catalog.sqlite']) {
-      const remote = await ctx.drive.findFile({ name, parentId }, ctx.signal);
-      if (remote === null) continue;
+    for (const remote of wanted) {
       await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
       imported += importCatalogFile(runtime, staged);
       await fsp.rm(staged, { force: true }).catch(() => undefined);
@@ -200,13 +202,17 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
       const values = row as unknown as Record<string, string | number | null | undefined>;
       insertSession.run(...columnNames.map((name) => values[name] ?? null));
       // The bytes live on Drive, not here: a recovered session is not local.
+      // Only the mtime fingerprint is dropped — it was measured against another
+      // machine's files, and it is what authorises deletion. The recorded size
+      // is a fact about the archive itself, and the guard that refuses to
+      // overwrite a larger archive with a smaller session needs it.
       // The verification fingerprint is dropped as well. It was measured on
       // another machine against files this one has never seen, and it is the
       // value that authorises deleting local data. Restore still works, since
       // that needs only the remote id and the bundle hash.
       db.prepare(
         `UPDATE sessions
-            SET local_present = 0, verified_local_mtime = NULL, verified_local_bytes = NULL
+            SET local_present = 0, verified_local_mtime = NULL
           WHERE session_id = ?`,
       ).run(record.sessionId);
       for (const prompt of selectPrompts.all(record.sessionId) as {

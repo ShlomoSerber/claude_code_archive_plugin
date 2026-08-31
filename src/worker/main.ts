@@ -108,12 +108,14 @@ function unavailableDrive(reason: string): WorkerContext['drive'] {
   return {
     ensureFolder: fail,
     findFile: fail,
+    listFiles: fail,
     startResumableUpload: fail,
     uploadChunk: fail,
     probeUpload: fail,
     uploadSmallFile: fail,
     getFile: fail,
     deleteFile: fail,
+    trashFile: fail,
     downloadToFile: fail,
     storageQuota: fail,
   };

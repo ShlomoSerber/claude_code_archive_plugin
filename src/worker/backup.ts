@@ -237,9 +237,14 @@ async function publish(
   // damage, not of normal use: a half-finished delete, a truncated restore, a
   // filesystem error. Archiving over the good copy is precisely how that
   // damage would become permanent, so stop and make a person look.
-  if (previous?.verifiedLocalBytes != null && archivedBytes < previous.verifiedLocalBytes) {
+  // Falls back to the plain byte counts the row has always carried. A column
+  // added by a migration is NULL for every existing session, and an imported
+  // catalog deliberately drops the fingerprint — in both cases the guard would
+  // otherwise be off for exactly the first re-archive, across the whole archive.
+  const archivedFloor = previousArchivedBytes(previous);
+  if (archivedFloor !== null && archivedBytes < archivedFloor) {
     throw new FatalError(
-      `session ${session.sessionId} shrank from ${String(previous.verifiedLocalBytes)} to ` +
+      `session ${session.sessionId} shrank from ${String(archivedFloor)} to ` +
         `${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
       'The copy on Drive is larger than what is on disk. Restore it with ' +
         '/archive:resume before archiving again, or delete the local files if the ' +
@@ -318,7 +323,10 @@ async function publish(
   const sameProject = previous?.encodedDir === session.encodedDir;
   if (supersededId !== null && supersededId !== remote.id && sameProject) {
     try {
-      await ctx.drive.deleteFile(supersededId, ctx.signal);
+      // Trashed, not deleted. This bundle was a good archive a moment ago, and
+      // every chain that has destroyed data in this codebase ended with a
+      // permanent delete of something that turned out to be the only copy.
+      await ctx.drive.trashFile(supersededId, ctx.signal);
     } catch (err) {
       ctx.logger.warn('backup.superseded_cleanup_failed', { file_id: supersededId }, err);
     }
@@ -355,11 +363,24 @@ export async function verifyRemote(
 
   ctx.logger.error('backup.verification_failed', { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
+  // This one is safe to remove outright: it is the file this run just uploaded
+  // and just proved wrong, and nothing else points at it.
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => undefined);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
 }
 
 /** Returns null when the remote copy is provably ours, or a reason when not. */
+/**
+ * How large the archived copy of this session is known to be, or null when the
+ * row says nothing about an archive at all.
+ */
+export function previousArchivedBytes(previous: SessionRecord | null): number | null {
+  if (previous?.remoteFileId == null) return null;
+  if (previous.verifiedLocalBytes !== null) return previous.verifiedLocalBytes;
+  const parts = (previous.transcriptBytes ?? 0) + (previous.sidecarBytes ?? 0);
+  return parts > 0 ? parts : null;
+}
+
 export function compareChecksums(
   remote: RemoteFile,
   bundle: { bytes: number; sha256: string; md5: string },

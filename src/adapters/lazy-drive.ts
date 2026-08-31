@@ -22,6 +22,9 @@ export function createLazyDrive(factory: () => Promise<DriveTransport>): DriveTr
     async ensureFolder(...args) {
       return (await resolve()).ensureFolder(...args);
     },
+    async listFiles(...args) {
+      return (await resolve()).listFiles(...args);
+    },
     async findFile(...args) {
       return (await resolve()).findFile(...args);
     },
@@ -39,6 +42,9 @@ export function createLazyDrive(factory: () => Promise<DriveTransport>): DriveTr
     },
     async getFile(...args) {
       return (await resolve()).getFile(...args);
+    },
+    async trashFile(...args) {
+      return (await resolve()).trashFile(...args);
     },
     async deleteFile(...args) {
       return (await resolve()).deleteFile(...args);

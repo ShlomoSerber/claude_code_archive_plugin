@@ -7,9 +7,9 @@ import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import { clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
 import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.ts';
-import { RetryableError } from '../src/core/errors.ts';
+import { RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
-import { listJobs } from '../src/core/queue.ts';
+import { claim, enqueue, getJob, listJobs, setUploadUri } from '../src/core/queue.ts';
 import { catalogFileName, runSweep } from '../src/worker/sweep.ts';
 import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
@@ -866,7 +866,10 @@ describe('deletion safety, fourth pass', () => {
     const replacement = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
     assert.notEqual(replacement, original);
     assert.equal(harness.drive.files.has(replacement), true, 'the new bundle is there');
-    assert.equal(harness.drive.files.has(original), false, 'the old one was retired after');
+    // Trashed rather than deleted: a bundle that was good a moment ago stays
+    // recoverable for the thirty days Drive keeps its wastebasket.
+    assert.equal(harness.drive.trashedIds.has(original), true, 'the old one was retired after');
+    assert.equal(harness.drive.files.has(original), true, 'and is still recoverable');
   });
 
   it('refuses to archive over a good copy when the session has shrunk', async () => {
@@ -1052,5 +1055,133 @@ describe('deletion safety, fifth pass', () => {
       null,
       'a rate limit must not withdraw a good verification',
     );
+  });
+});
+
+/**
+ * Sixth round. The reaper still held under every hostile remote, but the
+ * *archive* was not safe, and deletion follows the archive.
+ */
+describe('deletion safety, sixth pass', () => {
+  async function archivedThenDamaged() {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    fs.writeFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    return { harness, original };
+  }
+
+  it('keeps refusing a shrunken session after verification is withdrawn', async () => {
+    // clearVerification used to null the byte count the shrink guard reads, and
+    // it is called for transient reasons from three places — one of which
+    // requeues the destructive re-archive itself.
+    const { harness, original } = await archivedThenDamaged();
+    clearVerification(harness.ctx.db, SESSION_A, harness.clock.now());
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.verified, 0);
+    assert.equal(harness.drive.files.has(original), true, 'the fuller archive survives');
+  });
+
+  it('keeps refusing after a bulk verify run', async () => {
+    const { harness, original } = await archivedThenDamaged();
+    const records = [
+      getSession(harness.ctx.db, SESSION_A)!,
+      getSession(harness.ctx.db, SESSION_B)!,
+    ];
+    await verifyArchive(harness.ctx, records);
+
+    await runSweep(harness.ctx);
+    assert.equal(harness.drive.files.has(original), true);
+  });
+
+  it('refuses a shrunken session even with no fingerprint recorded at all', async () => {
+    // The state after a schema migration, and after importing a catalog: the
+    // column is NULL for every existing row, so the guard has to fall back to
+    // the byte counts the row has always carried.
+    const { harness, original } = await archivedThenDamaged();
+    harness.ctx.db
+      .prepare('UPDATE sessions SET verified_local_bytes = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+
+    await runSweep(harness.ctx);
+    assert.equal(harness.drive.files.has(original), true);
+  });
+
+  it('treats a missing remote checksum as unchecked, not as a mismatch', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.drive.options = { ...harness.drive.options, omitSha256: true };
+
+    const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
+    assert.equal(report.mismatched.length, 0);
+    assert.equal(report.unchecked.length, 1);
+    assert.notEqual(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null);
+
+    // And the reaper waits rather than deleting or withdrawing trust.
+    harness.clock.advance(31 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('never resumes an upload URI opened for a different bundle', async () => {
+    const contents = await import('../src/worker/upload.ts');
+    const tagged = contents.tagUploadUri('https://upload.test/1', 'aaaa');
+    assert.deepEqual(contents.parseUploadUri(tagged), {
+      sha256: 'aaaa',
+      uri: 'https://upload.test/1',
+    });
+    // An untagged value predates the format and must not be trusted to a bundle.
+    assert.equal(contents.parseUploadUri('https://upload.test/1'), null);
+    assert.equal(contents.parseUploadUri(null), null);
+  });
+
+  it('drops a stored upload URI when new work arrives for the session', () => {
+    const db = harnessDb();
+    const id = enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
+    const job = claim(db, 1000, 60_000)!;
+    setUploadUri(db, job, 'abc|https://upload.test/1', 1000);
+    assert.notEqual(getJob(db, id)?.uploadUri, null);
+
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, 2000);
+    assert.equal(getJob(db, id)?.uploadUri, null, 'a new bundle cannot resume the old URI');
+  });
+
+  it('does not let one unbundleable session throttle every other', () => {
+    // A local failure carries no HTTP status, and only network failures should
+    // drive the shared circuit breaker.
+    assert.equal(isRetryableNetworkError(new RetryableError('tar could not read a file')), false);
+    assert.equal(isRetryableNetworkError(new RetryableError('HTTP 503', { status: 503 })), true);
+  });
+});
+
+/** A bare catalog database, for queue-level assertions. */
+function harnessDb() {
+  return openDatabase(path.join(tempDir(), 'queue.sqlite'));
+}
+
+describe('fresh-machine recovery', () => {
+  it('imports every machine catalog, not only the one named after this host', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const parentId = await harness.drive.ensureFolder([harness.ctx.config.driveRootFolder]);
+
+    // What a different laptop's sweep would have left behind.
+    const own = harness.drive.fileByName(catalogFileName());
+    assert.ok(own, 'this machine wrote its own copy');
+    await harness.drive.uploadSmallFile({
+      name: 'catalog-deadbeef.sqlite',
+      parentId,
+      mimeType: 'application/vnd.sqlite3',
+      body: own.content,
+    });
+
+    const found = await harness.drive.listFiles({ parentId, namePrefix: 'catalog' });
+    const names = found.map((file) => file.name).sort();
+    assert.ok(names.includes('catalog-deadbeef.sqlite'), 'the other machine is visible');
+    assert.ok(names.includes(catalogFileName()));
   });
 });

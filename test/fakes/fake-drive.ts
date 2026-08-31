@@ -53,6 +53,8 @@ export class FakeDrive implements DriveTransport {
   readonly files = new Map<string, StoredFile>();
   readonly folders = new Map<string, { id: string; name: string; parentId: string }>();
   readonly calls: string[] = [];
+  /** Ids in the wastebasket: still present, but no longer stored. */
+  readonly trashedIds = new Set<string>();
   options: FakeDriveOptions;
 
   private sessions = new Map<string, Session>();
@@ -88,6 +90,15 @@ export class FakeDrive implements DriveTransport {
       parentId = id;
     }
     return Promise.resolve(parentId);
+  }
+
+  listFiles(args: { parentId: string; namePrefix: string }): Promise<RemoteFile[]> {
+    this.calls.push(`listFiles:${args.namePrefix}`);
+    return Promise.resolve(
+      [...this.files.values()]
+        .filter((file) => file.parentId === args.parentId && file.name.startsWith(args.namePrefix))
+        .map((file) => this.describe(file)),
+    );
   }
 
   findFile(args: { name: string; parentId: string }): Promise<RemoteFile | null> {
@@ -199,6 +210,12 @@ export class FakeDrive implements DriveTransport {
     return Promise.resolve(this.describe(file));
   }
 
+  trashFile(fileId: string): Promise<void> {
+    this.calls.push(`trashFile:${fileId}`);
+    if (this.files.has(fileId)) this.trashedIds.add(fileId);
+    return Promise.resolve();
+  }
+
   deleteFile(fileId: string): Promise<void> {
     this.calls.push(`deleteFile:${fileId}`);
     this.files.delete(fileId);
@@ -248,7 +265,7 @@ export class FakeDrive implements DriveTransport {
             ? 'f'.repeat(64)
             : sha256,
       md5: this.options.omitSha256 === true ? null : md5,
-      trashed: this.options.trashed === true,
+      trashed: this.options.trashed === true || this.trashedIds.has(file.id),
     };
   }
 }

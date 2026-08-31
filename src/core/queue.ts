@@ -87,6 +87,10 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = 0,
          claim_token = NULL,
+         -- New work means a new bundle. A URI opened for the previous one would
+         -- otherwise be resumed against different bytes, and the "already
+         -- complete" answer would hand back the wrong file.
+         upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`,
     )
