@@ -1412,3 +1412,89 @@ describe('the plugin says when it cannot archive something', () => {
     }
   });
 });
+
+/**
+ * Ninth round. Objective 1 held under 22 adversarial conditions attacked from
+ * scratch. What broke was the other destructive act: replacing a good archive.
+ */
+describe('the archive is not replaced by a smaller one', () => {
+  async function archivedWithSidecar() {
+    const harness = makeHarness();
+    for (const name of ['tool-a.json', 'tool-b.json']) {
+      fs.writeFileSync(
+        path.join(harness.projectDir, SESSION_B, name),
+        JSON.stringify({ output: 'x'.repeat(2000) }),
+      );
+    }
+    await runSweep(harness.ctx);
+    return { harness, original: getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '' };
+  }
+
+  function touch(harness: Harness, id: string) {
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(id), later, later);
+    harness.clock.advance(60_000);
+  }
+
+  it('refuses when the sidecar shrank even though the session grew overall', async () => {
+    // Sidecar files vanish while the conversation continues. The total is
+    // larger, so a total-only guard waved this through and trashed the archive
+    // holding the only copy of the lost subagent transcripts.
+    const { harness, original } = await archivedWithSidecar();
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'tool-a.json'));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), `${'{"type":"user"}\n'.repeat(500)}`);
+    touch(harness, SESSION_B);
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.blocked, 1);
+    assert.equal(harness.drive.files.has(original), true, 'the fuller archive survives');
+    assert.equal(harness.drive.trashedIds.has(original), false);
+  });
+
+  it('keeps refusing on every later sweep, not just the first', async () => {
+    // The guard used to read transcript_bytes, which indexSession rewrites at
+    // the start of the very attempt the guard rejects — so sweep two passed.
+    const { harness, original } = await archivedWithSidecar();
+    fs.writeFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    touch(harness, SESSION_B);
+
+    for (const pass of [1, 2, 3]) {
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.verified, 0, `sweep ${String(pass)}`);
+      assert.equal(harness.drive.files.has(original), true, `sweep ${String(pass)}`);
+      harness.clock.advance(60_000);
+    }
+  });
+
+  it('recovers an incomplete session beside itself rather than leaving it stuck', async () => {
+    const { harness } = await archivedWithSidecar();
+    fs.rmSync(path.join(harness.projectDir, SESSION_B), { recursive: true, force: true });
+
+    const result = await restoreSession(harness.ctx, SESSION_B);
+    assert.ok(result.recoveredTo, 'the archived copy is put somewhere the user can reach');
+    assert.equal(
+      fs.existsSync(path.join(result.recoveredTo ?? '', SESSION_B, 'tool-a.json')),
+      true,
+    );
+    assert.equal(
+      fs.existsSync(harness.transcriptOf(SESSION_B)),
+      true,
+      'the live file is untouched',
+    );
+  });
+
+  it('compares the remote size against what verification recorded', async () => {
+    // bundle_bytes describes the last bundle built, which a failed re-upload
+    // leaves pointing at bytes Drive never received — so comparing it called a
+    // perfectly good archive corrupt and forced a re-archive.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    harness.ctx.db
+      .prepare('UPDATE sessions SET bundle_bytes = 999999 WHERE session_id = ?')
+      .run(SESSION_A);
+
+    const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
+    assert.equal(report.mismatched.length, 0, 'the archive is intact and is reported so');
+    assert.equal(report.ok, 1);
+  });
+});

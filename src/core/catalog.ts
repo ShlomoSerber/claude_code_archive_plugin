@@ -43,6 +43,12 @@ export type SessionRecord = {
   verifiedBundleSha256: string | null;
   /** Transcript hash belonging to the archived copy, not to whatever is on disk. */
   verifiedTranscriptSha256: string | null;
+  /** Transcript size of the archived copy. Written only by markVerified. */
+  verifiedTranscriptBytes: number | null;
+  /** Sidecar size of the archived copy. Written only by markVerified. */
+  verifiedSidecarBytes: number | null;
+  /** Bundle size Drive was confirmed to hold. Written only by markVerified. */
+  verifiedBundleBytes: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -75,6 +81,9 @@ type SessionRow = {
   verified_local_bytes: number | null;
   verified_bundle_sha256: string | null;
   verified_transcript_sha256: string | null;
+  verified_transcript_bytes: number | null;
+  verified_sidecar_bytes: number | null;
+  verified_bundle_bytes: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -84,7 +93,8 @@ const SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, g
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
-  verified_transcript_sha256, created_at, updated_at`;
+  verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
+  verified_bundle_bytes, created_at, updated_at`;
 
 /** The fields extraction knows about. Backup and verification fill the rest. */
 export type SessionUpsert = {
@@ -130,6 +140,12 @@ export function upsertSession(db: Db, session: SessionUpsert, now: number): void
                                      THEN sessions.verified_bundle_sha256 ELSE NULL END,
        verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                          THEN sessions.verified_transcript_sha256 ELSE NULL END,
+       verified_transcript_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                        THEN sessions.verified_transcript_bytes ELSE NULL END,
+       verified_sidecar_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                     THEN sessions.verified_sidecar_bytes ELSE NULL END,
+       verified_bundle_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                    THEN sessions.verified_bundle_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -236,6 +252,10 @@ export function markVerified(
     bundleSha256: string;
     /** Hash of the transcript *inside* that bundle. */
     transcriptSha256: string | null;
+    /** Sizes of the archived copy, component by component. */
+    transcriptBytes: number | null;
+    sidecarBytes: number | null;
+    bundleBytes: number | null;
   },
   now: number,
 ): void {
@@ -243,7 +263,8 @@ export function markVerified(
     `UPDATE sessions
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
-            verified_transcript_sha256 = ?, updated_at = ?
+            verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
+            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, updated_at = ?
       WHERE session_id = ?`,
   ).run(
     remote.fileId,
@@ -254,6 +275,9 @@ export function markVerified(
     remote.localBytes,
     remote.bundleSha256,
     remote.transcriptSha256,
+    remote.transcriptBytes,
+    remote.sidecarBytes,
+    remote.bundleBytes,
     now,
     sessionId,
   );
@@ -423,6 +447,9 @@ export function toRecord(row: SessionRow): SessionRecord {
     verifiedLocalBytes: row.verified_local_bytes,
     verifiedBundleSha256: row.verified_bundle_sha256,
     verifiedTranscriptSha256: row.verified_transcript_sha256,
+    verifiedTranscriptBytes: row.verified_transcript_bytes,
+    verifiedSidecarBytes: row.verified_sidecar_bytes,
+    verifiedBundleBytes: row.verified_bundle_bytes,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

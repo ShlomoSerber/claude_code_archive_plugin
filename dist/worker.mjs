@@ -436,6 +436,18 @@ var MIGRATIONS = [
   // every restore attempt failed the check and deleted what it had unpacked.
   `
   ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
+  `,
+  // 5 — the remaining measurements of the archived copy.
+  //
+  // Every safety guard must read a column that only markVerified writes. Three
+  // separate defects have now come from a guard consulting a column some
+  // earlier step of the same attempt rewrites: the guard fires once, erases its
+  // own evidence, and waves the retry through. transcript_bytes, sidecar_bytes
+  // and bundle_bytes all describe the last attempt, not the archived copy.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_bytes INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_sidecar_bytes INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_bundle_bytes INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1987,7 +1999,8 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
-  verified_transcript_sha256, created_at, updated_at`;
+  verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
+  verified_bundle_bytes, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -2009,6 +2022,12 @@ function upsertSession(db, session, now) {
                                      THEN sessions.verified_bundle_sha256 ELSE NULL END,
        verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                          THEN sessions.verified_transcript_sha256 ELSE NULL END,
+       verified_transcript_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                        THEN sessions.verified_transcript_bytes ELSE NULL END,
+       verified_sidecar_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                     THEN sessions.verified_sidecar_bytes ELSE NULL END,
+       verified_bundle_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                    THEN sessions.verified_bundle_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -2080,7 +2099,8 @@ function markVerified(db, sessionId, remote, now) {
     `UPDATE sessions
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
-            verified_transcript_sha256 = ?, updated_at = ?
+            verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
+            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, updated_at = ?
       WHERE session_id = ?`
   ).run(
     remote.fileId,
@@ -2091,6 +2111,9 @@ function markVerified(db, sessionId, remote, now) {
     remote.localBytes,
     remote.bundleSha256,
     remote.transcriptSha256,
+    remote.transcriptBytes,
+    remote.sidecarBytes,
+    remote.bundleBytes,
     now,
     sessionId
   );
@@ -2190,6 +2213,9 @@ function toRecord(row) {
     verifiedLocalBytes: row.verified_local_bytes,
     verifiedBundleSha256: row.verified_bundle_sha256,
     verifiedTranscriptSha256: row.verified_transcript_sha256,
+    verifiedTranscriptBytes: row.verified_transcript_bytes,
+    verifiedSidecarBytes: row.verified_sidecar_bytes,
+    verifiedBundleBytes: row.verified_bundle_bytes,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -6028,20 +6054,20 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError("the session changed while it was being archived");
   }
-  const transcriptFloor = previous?.remoteFileId == null ? null : previous.transcriptBytes;
   const archivedTranscript = files.find((file) => file.path === `${session.sessionId}.jsonl`)?.bytes ?? 0;
-  if (transcriptFloor !== null && archivedTranscript < transcriptFloor) {
+  const archivedSidecar = archivedBytes - archivedTranscript;
+  const shrank = describeShrink(previous, {
+    transcript: archivedTranscript,
+    sidecar: archivedSidecar,
+    total: archivedBytes
+  });
+  if (shrank !== null) {
     throw new FatalError(
-      `the transcript of ${session.sessionId} shrank from ${String(transcriptFloor)} to ${String(archivedTranscript)} bytes since it was archived`,
-      "The copy on Drive is fuller than what is on disk. Move the local files aside and run /archive:resume to put the archived copy back, or delete them if the loss was intended."
+      `${session.sessionId} has less on disk than the copy on Drive: ${shrank}`,
+      "Archiving now would replace the fuller copy with the smaller one. Run /archive:resume to recover the archived copy beside the local files, then remove whichever you do not want. Nothing has been changed."
     );
   }
-  const archivedFloor = previousArchivedBytes(previous);
-  if (archivedFloor !== null && archivedBytes < archivedFloor) {
-    throw new FatalError(
-      `session ${session.sessionId} shrank from ${String(archivedFloor)} to ${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
-      "The copy on Drive is larger than what is on disk, so archiving now would replace the fuller copy with the smaller one. Move the local files aside and run /archive:resume to put the archived copy back, or delete them if the loss was intended."
-    );
+  {
   }
   const remote = await uploadWithResume(ctx, {
     job,
@@ -6092,6 +6118,9 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       path: `${folderPath.join("/")}/${bundle.name}`,
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
+      transcriptBytes: archivedTranscript,
+      sidecarBytes: archivedSidecar,
+      bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
@@ -6102,7 +6131,12 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  if (supersededId !== null && supersededId !== remote.id && sameProject) {
+  const grewEverywhere = describeShrink(previous, {
+    transcript: archivedTranscript,
+    sidecar: archivedSidecar,
+    total: archivedBytes
+  }) === null;
+  if (supersededId !== null && supersededId !== remote.id && sameProject && grewEverywhere) {
     try {
       await ctx.drive.trashFile(supersededId, ctx.signal);
     } catch (err) {
@@ -6126,11 +6160,18 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
 }
-function previousArchivedBytes(previous) {
+function describeShrink(previous, now) {
   if (previous?.remoteFileId == null) return null;
-  if (previous.verifiedLocalBytes !== null) return previous.verifiedLocalBytes;
-  const parts2 = (previous.transcriptBytes ?? 0) + (previous.sidecarBytes ?? 0);
-  return parts2 > 0 ? parts2 : null;
+  const complaints = [];
+  const check = (label, floor, current) => {
+    if (floor !== null && current < floor) {
+      complaints.push(`${label} ${String(current)} bytes, archived ${String(floor)}`);
+    }
+  };
+  check("transcript", previous.verifiedTranscriptBytes, now.transcript);
+  check("sidecar", previous.verifiedSidecarBytes, now.sidecar);
+  check("total", previous.verifiedLocalBytes, now.total);
+  return complaints.length === 0 ? null : complaints.join("; ");
 }
 function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
@@ -6269,7 +6310,8 @@ async function confirmRemote(ctx, record) {
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
     if (remote.trashed) return "gone";
-    if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
+    const expectedBytes = record.verifiedBundleBytes;
+    if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return "gone";
     }
     if (remote.sha256 === null) return "unavailable";
@@ -6290,13 +6332,20 @@ async function removeLocalCopy(ctx, onDisk, target) {
       return false;
     }
   }
-  try {
-    await fsp10.rm(target.transcriptPath, { force: true });
-    return true;
-  } catch (err) {
-    log.warn("reap.delete_failed", {}, err);
-    return false;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await fsp10.rm(target.transcriptPath, { force: true });
+      return true;
+    } catch (err) {
+      const code = err.code;
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES" || attempt === 3) {
+        log.warn("reap.delete_failed", {}, err);
+        return false;
+      }
+      await ctx.clock.sleep(renameRetryDelay(attempt));
+    }
   }
+  return false;
 }
 
 // src/worker/sweep.ts

@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { extractBundle } from '../adapters/bundle.ts';
 import { sha256File } from '../adapters/hashing.ts';
-import { statSession } from '../adapters/session-scan.ts';
+import { statSession, type LocalSession } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, type SessionRecord } from '../core/catalog.ts';
 import { FatalError, RetryableError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
@@ -18,6 +18,16 @@ import type { WorkerContext } from './context.ts';
  * themselves.
  */
 
+/** True when what is on disk is smaller than what the archive holds. */
+function isIncomplete(record: SessionRecord, onDisk: LocalSession): boolean {
+  const smaller = (floor: number | null, current: number): boolean =>
+    floor !== null && current < floor;
+  return (
+    smaller(record.verifiedTranscriptBytes, onDisk.transcriptBytes) ||
+    smaller(record.verifiedSidecarBytes, onDisk.sidecarBytes)
+  );
+}
+
 export type RestoreResult = {
   sessionId: string;
   encodedDir: string;
@@ -25,6 +35,8 @@ export type RestoreResult = {
   transcriptPath: string;
   entries: string[];
   alreadyLocal: boolean;
+  /** Where an archived copy was unpacked beside an incomplete local one. */
+  recoveredTo?: string;
   resumeCommand: string;
 };
 
@@ -54,6 +66,35 @@ export async function restoreSession(
   // one state the plugin could not get itself out of. The stale sidecar is moved
   // aside first so unpacking cannot overwrite it.
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
+  if (existing !== null && isIncomplete(record, existing)) {
+    // Present but smaller than the archive: a half-finished reap, a deleted
+    // sidecar, a truncated write. Unpacking over it would destroy whatever the
+    // live session has added since, so the archived copy goes beside it and the
+    // user decides. Without this the session was simply stuck.
+    const recovery = path.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
+    await fsp.mkdir(recovery, { recursive: true });
+    const staged = path.join(ctx.paths.stagingDir, `${sessionId}.recover.tar.zst`);
+    try {
+      await ctx.drive.downloadToFile(
+        { fileId: requireRemote(record), destination: staged },
+        ctx.signal,
+      );
+      await extractBundle({ bundlePath: staged, targetDir: recovery, onlySession: sessionId });
+    } finally {
+      await fsp.rm(staged, { force: true }).catch(() => undefined);
+    }
+    ctx.logger.warn('restore.recovered_beside', { session_id: sessionId, path: recovery });
+    return {
+      sessionId,
+      encodedDir: record.encodedDir,
+      projectCwd: record.projectCwd,
+      transcriptPath: existing.transcriptPath,
+      entries: [],
+      alreadyLocal: true,
+      recoveredTo: recovery,
+      resumeCommand: resumeCommand(sessionId),
+    };
+  }
   if (existing !== null) {
     markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
     return {
@@ -133,6 +174,9 @@ export async function restoreSession(
           path: record.remotePath ?? '',
           localMtime: Math.trunc(restored.mtimeMs),
           localBytes: restored.transcriptBytes + restored.sidecarBytes,
+          transcriptBytes: restored.transcriptBytes,
+          sidecarBytes: restored.sidecarBytes,
+          bundleBytes: record.verifiedBundleBytes,
           bundleSha256: record.verifiedBundleSha256,
           transcriptSha256: record.verifiedTranscriptSha256,
         },
@@ -313,8 +357,9 @@ function describeMismatch(
   remoteSize: number | null,
   remoteSha256: string | null,
 ): string | null {
-  if (record.bundleBytes !== null && remoteSize !== null && remoteSize !== record.bundleBytes) {
-    return `size ${String(remoteSize)} != ${String(record.bundleBytes)}`;
+  const expectedBytes = record.verifiedBundleBytes;
+  if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
+    return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
   }
   if (record.verifiedBundleSha256 === null) {
     return 'the catalog has no verified hash for this bundle';

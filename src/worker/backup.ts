@@ -252,32 +252,29 @@ async function publish(
   // added by a migration is NULL for every existing session, and an imported
   // catalog deliberately drops the fingerprint — in both cases the guard would
   // otherwise be off for exactly the first re-archive, across the whole archive.
-  // Per component. A total hides the case that matters: a transcript
-  // truncated by a crashed write, while a resumed session added sidecar bytes,
-  // sums to more than before and sails through.
-  const transcriptFloor = previous?.remoteFileId == null ? null : previous.transcriptBytes;
+  // Component by component, and only ever against columns markVerified
+  // writes. A total hides the case that matters — a transcript truncated by a
+  // crashed write while a resumed session adds sidecar bytes sums to more than
+  // before — and a column that this same attempt has already rewritten turns
+  // the guard into a one-shot that waves the retry through.
   const archivedTranscript =
     files.find((file) => file.path === `${session.sessionId}.jsonl`)?.bytes ?? 0;
-  if (transcriptFloor !== null && archivedTranscript < transcriptFloor) {
+  const archivedSidecar = archivedBytes - archivedTranscript;
+  const shrank = describeShrink(previous, {
+    transcript: archivedTranscript,
+    sidecar: archivedSidecar,
+    total: archivedBytes,
+  });
+  if (shrank !== null) {
     throw new FatalError(
-      `the transcript of ${session.sessionId} shrank from ${String(transcriptFloor)} to ` +
-        `${String(archivedTranscript)} bytes since it was archived`,
-      'The copy on Drive is fuller than what is on disk. Move the local files ' +
-        'aside and run /archive:resume to put the archived copy back, or delete ' +
-        'them if the loss was intended.',
+      `${session.sessionId} has less on disk than the copy on Drive: ${shrank}`,
+      'Archiving now would replace the fuller copy with the smaller one. Run ' +
+        '/archive:resume to recover the archived copy beside the local files, ' +
+        'then remove whichever you do not want. Nothing has been changed.',
     );
   }
 
-  const archivedFloor = previousArchivedBytes(previous);
-  if (archivedFloor !== null && archivedBytes < archivedFloor) {
-    throw new FatalError(
-      `session ${session.sessionId} shrank from ${String(archivedFloor)} to ` +
-        `${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
-      'The copy on Drive is larger than what is on disk, so archiving now would ' +
-        'replace the fuller copy with the smaller one. Move the local files aside ' +
-        'and run /archive:resume to put the archived copy back, or delete them if ' +
-        'the loss was intended.',
-    );
+  {
   }
 
   const remote = await uploadWithResume(ctx, {
@@ -335,6 +332,9 @@ async function publish(
       path: `${folderPath.join('/')}/${bundle.name}`,
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
+      transcriptBytes: archivedTranscript,
+      sidecarBytes: archivedSidecar,
+      bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
@@ -349,7 +349,16 @@ async function publish(
   // Only now, with the replacement verified and recorded, is the previous
   // bundle safe to retire. Failing to remove it wastes space and loses nothing.
   const sameProject = previous?.encodedDir === session.encodedDir;
-  if (supersededId !== null && supersededId !== remote.id && sameProject) {
+  // The shrink guard should already have stopped anything smaller reaching
+  // here. This is the second lock on the door: retiring the previous archive is
+  // the one remaining act in this codebase that can make data unrecoverable.
+  const grewEverywhere =
+    describeShrink(previous, {
+      transcript: archivedTranscript,
+      sidecar: archivedSidecar,
+      total: archivedBytes,
+    }) === null;
+  if (supersededId !== null && supersededId !== remote.id && sameProject && grewEverywhere) {
     try {
       // Trashed, not deleted. This bundle was a good archive a moment ago, and
       // every chain that has destroyed data in this codebase ended with a
@@ -399,14 +408,28 @@ export async function verifyRemote(
 
 /** Returns null when the remote copy is provably ours, or a reason when not. */
 /**
- * How large the archived copy of this session is known to be, or null when the
- * row says nothing about an archive at all.
+ * Would archiving these sizes replace the copy on Drive with a smaller one?
+ *
+ * Returns a description of what shrank, or null when nothing did. Every
+ * comparison is against a column written only by markVerified, so the answer
+ * does not change just because an earlier step of this attempt rewrote the
+ * row — which is how the two previous versions of this guard became one-shots.
  */
-export function previousArchivedBytes(previous: SessionRecord | null): number | null {
+export function describeShrink(
+  previous: SessionRecord | null,
+  now: { transcript: number; sidecar: number; total: number },
+): string | null {
   if (previous?.remoteFileId == null) return null;
-  if (previous.verifiedLocalBytes !== null) return previous.verifiedLocalBytes;
-  const parts = (previous.transcriptBytes ?? 0) + (previous.sidecarBytes ?? 0);
-  return parts > 0 ? parts : null;
+  const complaints: string[] = [];
+  const check = (label: string, floor: number | null, current: number): void => {
+    if (floor !== null && current < floor) {
+      complaints.push(`${label} ${String(current)} bytes, archived ${String(floor)}`);
+    }
+  };
+  check('transcript', previous.verifiedTranscriptBytes, now.transcript);
+  check('sidecar', previous.verifiedSidecarBytes, now.sidecar);
+  check('total', previous.verifiedLocalBytes, now.total);
+  return complaints.length === 0 ? null : complaints.join('; ');
 }
 
 export function compareChecksums(

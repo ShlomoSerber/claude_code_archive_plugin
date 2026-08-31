@@ -283,6 +283,18 @@ var MIGRATIONS = [
   // every restore attempt failed the check and deleted what it had unpacked.
   `
   ALTER TABLE sessions ADD COLUMN verified_transcript_sha256 TEXT;
+  `,
+  // 5 — the remaining measurements of the archived copy.
+  //
+  // Every safety guard must read a column that only markVerified writes. Three
+  // separate defects have now come from a guard consulting a column some
+  // earlier step of the same attempt rewrites: the guard fires once, erases its
+  // own evidence, and waves the retry through. transcript_bytes, sidecar_bytes
+  // and bundle_bytes all describe the last attempt, not the archived copy.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_transcript_bytes INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_sidecar_bytes INTEGER;
+  ALTER TABLE sessions ADD COLUMN verified_bundle_bytes INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;

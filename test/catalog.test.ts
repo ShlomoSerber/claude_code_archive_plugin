@@ -131,6 +131,9 @@ describe('the backup lifecycle', () => {
         localBytes: 600,
         bundleSha256: 'abc',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       3000,
     );
@@ -157,6 +160,9 @@ describe('the backup lifecycle', () => {
         localBytes: 600,
         bundleSha256: 'abc',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       3000,
     );
@@ -210,6 +216,9 @@ describe('listReapable', () => {
         localBytes: 600,
         bundleSha256: 'h',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       1,
     );
@@ -236,6 +245,9 @@ describe('listReapable', () => {
         localBytes: 600,
         bundleSha256: 'h',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       1,
     );
@@ -290,6 +302,9 @@ describe('listUnverified', () => {
         localBytes: 600,
         bundleSha256: 'h',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       1,
     );
@@ -333,6 +348,9 @@ describe('catalogStats', () => {
         localBytes: 600,
         bundleSha256: 'h',
         transcriptSha256: 't1',
+        transcriptBytes: 500,
+        sidecarBytes: 100,
+        bundleBytes: 120,
       },
       1,
     );

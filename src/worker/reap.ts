@@ -12,6 +12,7 @@ import { FatalError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { enqueue } from '../core/queue.ts';
 import { statSession, type LocalSession } from '../adapters/session-scan.ts';
+import { renameRetryDelay } from '../adapters/atomic.ts';
 import { kvGetNumber } from '../adapters/db.ts';
 import { ACTIVE_SESSION_TTL_MS, activeSessionKey } from '../core/state-keys.ts';
 import type { WorkerContext } from './context.ts';
@@ -236,7 +237,12 @@ async function confirmRemote(
     // how the last copy of a conversation quietly becomes the only copy, and
     // then no copy at all.
     if (remote.trashed) return 'gone';
-    if (remote.size !== null && record.bundleBytes !== null && remote.size !== record.bundleBytes) {
+    // Against the size verification recorded, not bundle_bytes, which
+    // describes the last bundle *built* — a failed re-upload leaves that
+    // pointing at bytes Drive never received while the pointer still names the
+    // good copy, and comparing it calls a healthy archive corrupt.
+    const expectedBytes = record.verifiedBundleBytes;
+    if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return 'gone';
     }
     // Deletion is irreversible, so the strong hash is required here even though
@@ -281,11 +287,22 @@ async function removeLocalCopy(
       return false;
     }
   }
-  try {
-    await fsp.rm(target.transcriptPath, { force: true });
-    return true;
-  } catch (err) {
-    log.warn('reap.delete_failed', {}, err);
-    return false;
+  // Retried the way renames are: on Windows an antivirus or indexer handle
+  // gives a transient EPERM, and giving up here leaves the sidecar deleted and
+  // the transcript in place — the half-reaped state that later let a growing
+  // session overwrite the archive of what was already lost.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await fsp.rm(target.transcriptPath, { force: true });
+      return true;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if ((code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') || attempt === 3) {
+        log.warn('reap.delete_failed', {}, err);
+        return false;
+      }
+      await ctx.clock.sleep(renameRetryDelay(attempt));
+    }
   }
+  return false;
 }
