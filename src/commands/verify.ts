@@ -29,6 +29,13 @@ export async function runVerify(
   }
 
   print(`Checked ${String(report.checked)} archived sessions: ${String(report.ok)} verified.`);
+  if (report.unchecked.length > 0) {
+    // Not a verdict: Drive could not be asked. Saying so plainly keeps a rate
+    // limit from reading as an archive failure.
+    print(
+      `${String(report.unchecked.length)} could not be checked right now (network or rate limit).`,
+    );
+  }
   if (report.missing.length > 0) {
     print(`${String(report.missing.length)} have no remote copy recorded.`);
   }

@@ -90,6 +90,8 @@ async function fsyncPath(file: string): Promise<void> {
 
 export type ExtractResult = {
   entries: string[];
+  /** Entries refused by `onlySession`, for the caller to log. */
+  rejected: string[];
 };
 
 /**
@@ -101,18 +103,44 @@ export type ExtractResult = {
 export async function extractBundle(args: {
   bundlePath: string;
   targetDir: string;
+  /**
+   * Unpack only this session's own files.
+   *
+   * The target is a project directory shared with every other session of that
+   * project, so without a filter a bundle carrying a neighbour's transcript
+   * overwrites it. tar's traversal defences stop a path leaving the
+   * directory; nothing stops it landing on the wrong file inside it.
+   */
+  onlySession?: string;
   signal?: AbortSignal;
 }): Promise<ExtractResult> {
   await fsp.mkdir(args.targetDir, { recursive: true });
   const entries: string[] = [];
+  const rejected: string[] = [];
   await tar.extract({
     file: args.bundlePath,
     cwd: args.targetDir,
+    filter: (entryPath) => {
+      if (args.onlySession === undefined) return true;
+      if (belongsToSession(entryPath, args.onlySession)) return true;
+      rejected.push(entryPath);
+      return false;
+    },
     onReadEntry: (entry) => {
       entries.push(entry.path);
     },
   });
-  return { entries };
+  return { entries, rejected };
+}
+
+/** `<id>.jsonl`, `<id>` or anything beneath `<id>/`, and nothing else. */
+export function belongsToSession(entryPath: string, sessionId: string): boolean {
+  const normalized = toPosix(entryPath).replace(/^\.\//, '').replace(/\/$/, '');
+  return (
+    normalized === `${sessionId}.jsonl` ||
+    normalized === sessionId ||
+    normalized.startsWith(`${sessionId}/`)
+  );
 }
 
 /** List what a bundle contains without writing anything. */
@@ -140,7 +168,8 @@ export async function describeSessionFiles(args: {
 }): Promise<ManifestFile[]> {
   const described: ManifestFile[] = [];
   for (const entry of args.entries) {
-    await describeInto(described, args.cwd, entry, args.signal);
+    // Top level only: a session with no sidecar directory is normal.
+    await describeInto(described, args.cwd, entry, args.signal, true);
   }
   described.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return described;
@@ -151,13 +180,18 @@ async function describeInto(
   cwd: string,
   relative: string,
   signal: AbortSignal | undefined,
+  optional = false,
 ): Promise<void> {
   const absolute = path.join(cwd, relative);
   let stat: fs.Stats;
   try {
     stat = await fsp.stat(absolute);
-  } catch {
-    return;
+  } catch (err) {
+    // Silently dropping an unreadable file would produce a manifest that omits
+    // it, and the manifest is what the bundle is checked against — so the
+    // bundle would then verify as complete while missing data.
+    if (optional) return;
+    throw err;
   }
   if (stat.isFile()) {
     out.push({

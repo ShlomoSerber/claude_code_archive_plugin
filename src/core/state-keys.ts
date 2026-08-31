@@ -29,4 +29,12 @@ export function activeSessionKey(sessionId: string): string {
   return `active.${sessionId}`;
 }
 
-export const ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1000;
+/**
+ * How long an open-session mark is honoured without being refreshed.
+ *
+ * Deliberately generous. The mark is only written at SessionStart, so a session
+ * left open for days still holds one; and the two failure directions are not
+ * symmetric. A mark that lingers too long delays a deletion, which costs disk.
+ * A mark that expires too early unlinks a file under a live writer.
+ */
+export const ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;

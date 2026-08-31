@@ -211,6 +211,15 @@ async function publish(
     throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
   }
 
+  // Take the fingerprint here, not from the stat at the start of the backup.
+  // Indexing and compression both take time, and a fingerprint measured before
+  // them would describe a state the bundle does not contain.
+  const archivedBytes = files.reduce((total, file) => total + file.bytes, 0);
+  const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+  if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
+    throw new RetryableError('the session changed while it was being archived');
+  }
+
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -253,17 +262,17 @@ async function publish(
     ctx.signal,
   );
 
-  // The state recorded here is what the reaper will later compare the disk
-  // against. It must describe the files this bundle was actually made from, so
-  // it is taken from the same stat the bundling used, not from a fresh one.
+  // The state recorded here is what later authorises deleting the local copy.
+  // It comes from the stat taken immediately after the bundle was proved to
+  // match the disk, so it describes exactly what Drive now holds.
   markVerified(
     ctx.db,
     session.sessionId,
     {
       fileId: remote.id,
       path: `${folderPath.join('/')}/${bundle.name}`,
-      localMtime: Math.trunc(session.mtimeMs),
-      localBytes: session.transcriptBytes + session.sidecarBytes,
+      localMtime: Math.trunc(confirmed.mtimeMs),
+      localBytes: archivedBytes,
     },
     ctx.clock.now(),
   );

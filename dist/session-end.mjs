@@ -1462,7 +1462,7 @@ var isSafeEncodedDir = isSafePathSegment;
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/adapters/spawn-worker.ts
 import { spawn } from "node:child_process";

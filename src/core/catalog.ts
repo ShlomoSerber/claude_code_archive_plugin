@@ -225,11 +225,20 @@ export function markVerified(
   ).run(remote.fileId, remote.path, now, now, remote.localMtime, remote.localBytes, now, sessionId);
 }
 
-/** Verification failed or the remote copy is gone: the session must not be reaped. */
+/**
+ * Withdraw the authority to delete this session's local copy.
+ *
+ * It deliberately keeps `remote_file_id` and `bundle_sha256`. For a session
+ * whose local copy has already been reaped, that id is the only pointer to
+ * bytes that exist nowhere else, and nothing rebuilds it: discovery only
+ * enqueues sessions found on disk. Clearing it turns "this needs re-checking"
+ * into "this is gone forever". Restore verifies the downloaded bytes against
+ * the stored hash, so keeping the pointer costs no safety.
+ */
 export function clearVerification(db: Db, sessionId: string, now: number): void {
   db.prepare(
     `UPDATE sessions
-        SET verified_at = NULL, remote_file_id = NULL,
+        SET verified_at = NULL,
             verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
       WHERE session_id = ?`,
   ).run(now, sessionId);

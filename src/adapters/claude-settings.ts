@@ -1,4 +1,5 @@
 import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { writeFileAtomic } from './atomic.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
@@ -71,6 +72,28 @@ export async function setCleanupPeriodDays(
     mode: await currentMode(target, 0o600),
   });
   return { changed: true, previous, current: days };
+}
+
+/**
+ * Every settings file that can set `cleanupPeriodDays`, most specific last.
+ *
+ * The plugin writes only the user file. Claude Code also reads a local
+ * override, and a value there outranks the one we wrote — so "we own deletion"
+ * is a claim that has to be checked against all of them, not asserted from the
+ * one we control.
+ */
+export async function competingCleanupSettings(
+  claudeDir: string,
+): Promise<{ file: string; value: number }[]> {
+  const found: { file: string; value: number }[] = [];
+  for (const name of ['settings.local.json', 'managed-settings.json']) {
+    const file = path.join(claudeDir, name);
+    const read = await readSettings(file);
+    if (read.status !== 'ok') continue;
+    const value = read.settings['cleanupPeriodDays'];
+    if (typeof value === 'number') found.push({ file, value });
+  }
+  return found;
 }
 
 export async function readSettings(file: string): Promise<SettingsRead> {

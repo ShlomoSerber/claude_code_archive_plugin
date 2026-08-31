@@ -5,13 +5,13 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
-import { getSession, upsertSession } from '../src/core/catalog.ts';
+import { clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
 import { DEFAULT_CONFIG, type ArchiveConfig, DAY_MS } from '../src/core/config.ts';
 import { RetryableError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import { listJobs } from '../src/core/queue.ts';
 import { runSweep } from '../src/worker/sweep.ts';
-import { restoreSession } from '../src/worker/restore.ts';
+import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
@@ -357,7 +357,7 @@ describe('restore', () => {
     // Simulate the local copy being lost some other way: the reaper itself
     // would never have removed an unverified session.
     fs.rmSync(harness.transcriptOf(SESSION_A));
-    await assert.rejects(restoreSession(harness.ctx, SESSION_A), /no verified copy/);
+    await assert.rejects(restoreSession(harness.ctx, SESSION_A), /no copy on Drive/);
   });
 });
 
@@ -678,5 +678,126 @@ describe('deletion safety, second pass', () => {
     const moved = getSession(harness.ctx.db, SESSION_A);
     assert.equal(moved?.verifiedAt, null);
     assert.equal(moved?.verifiedLocalMtime, null, 'the fingerprint was measured elsewhere');
+  });
+});
+
+/**
+ * Third round: a red team could not break the reaper, but found that the
+ * integrity checker could orphan an archive, that restore could overwrite a
+ * neighbouring session, and that "verified" could mean "compared nothing".
+ */
+describe('deletion safety, third pass', () => {
+  const DAY = DAY_MS;
+
+  it('does not orphan an archive when Drive cannot be reached', async () => {
+    // The bug this replaces: /archive:verify --all walks hundreds of files,
+    // earns a rate limit, and a catch-all treated every transport error as a
+    // verification failure — clearing the only pointer to bundles whose local
+    // copies had already been deleted.
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.clock.advance(31 * DAY);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false, 'reaped, as intended');
+
+    harness.drive.getFile = () => Promise.reject(new RetryableError('rateLimitExceeded'));
+    const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
+
+    assert.equal(report.unchecked.length, 1, 'reported as unchecked, not as failed');
+    assert.equal(report.mismatched.length, 0);
+    assert.notEqual(
+      getSession(harness.ctx.db, SESSION_A)?.remoteFileId,
+      null,
+      'the pointer to bytes that exist nowhere else survives',
+    );
+  });
+
+  it('can still restore a session whose verification was withdrawn', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.clock.advance(31 * DAY);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    // Withdraw deletion authority, as a failed check would.
+    clearVerification(harness.ctx.db, SESSION_A, harness.clock.now());
+    const restored = await restoreSession(harness.ctx, SESSION_A);
+    assert.equal(restored.alreadyLocal, false);
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('withdraws verification when Drive actually answers with a bad file', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    const stored = harness.drive.files.get(record?.remoteFileId ?? '');
+    if (stored !== undefined) stored.content = Buffer.from('not the bundle');
+
+    const report = await verifyArchive(harness.ctx, [record!]);
+    assert.equal(report.mismatched.length, 1);
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null);
+  });
+
+  it('never reports a session verified when it compared nothing', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    harness.ctx.db
+      .prepare('UPDATE sessions SET bundle_sha256 = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+
+    const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
+    assert.equal(report.ok, 0);
+    assert.match(report.mismatched[0]?.reason ?? '', /no hash/);
+  });
+
+  it('refuses to restore bytes it has no hash to check', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    fs.rmSync(harness.transcriptOf(SESSION_A));
+    harness.ctx.db
+      .prepare('UPDATE sessions SET bundle_sha256 = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+
+    await assert.rejects(restoreSession(harness.ctx, SESSION_A), /no stored hash/);
+  });
+
+  it('unpacks only the session being restored', async () => {
+    const contents = await import('../src/adapters/bundle.ts');
+    assert.equal(contents.belongsToSession(`${SESSION_A}.jsonl`, SESSION_A), true);
+    assert.equal(contents.belongsToSession(`${SESSION_A}/tool.json`, SESSION_A), true);
+    assert.equal(contents.belongsToSession(`${SESSION_A}/`, SESSION_A), true);
+    // The project directory is shared, so a neighbour's transcript must not be
+    // written even though it is not a traversal.
+    assert.equal(contents.belongsToSession(`${SESSION_B}.jsonl`, SESSION_A), false);
+    assert.equal(contents.belongsToSession('other.jsonl', SESSION_A), false);
+    assert.equal(contents.belongsToSession(`${SESSION_A}-extra.jsonl`, SESSION_A), false);
+  });
+
+  it('does not write a neighbouring session when restoring from a bad bundle', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+
+    // A bundle that carries someone else's transcript, as a hostile or corrupt
+    // catalog on Drive could produce.
+    const contents = await import('../src/adapters/bundle.ts');
+    const out = path.join(tempDir(), 'mixed.tar.zst');
+    await contents.createBundle({
+      cwd: harness.projectDir,
+      entries: [`${SESSION_A}.jsonl`, `${SESSION_B}.jsonl`],
+      outputPath: out,
+    });
+    const victim = harness.transcriptOf(SESSION_B);
+    const before = fs.readFileSync(victim, 'utf8');
+    fs.rmSync(harness.transcriptOf(SESSION_A));
+
+    const target = harness.projectDir;
+    const result = await contents.extractBundle({
+      bundlePath: out,
+      targetDir: target,
+      onlySession: SESSION_A,
+    });
+
+    assert.equal(fs.readFileSync(victim, 'utf8'), before, 'the neighbour is untouched');
+    assert.ok(result.rejected.some((entry) => entry.includes(SESSION_B)));
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
   });
 });

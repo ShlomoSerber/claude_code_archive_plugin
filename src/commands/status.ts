@@ -2,7 +2,7 @@ import { catalogStats } from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
-import { readCleanupPeriodDays } from '../adapters/claude-settings.ts';
+import { competingCleanupSettings, readCleanupPeriodDays } from '../adapters/claude-settings.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { readStatusFile } from '../worker/status.ts';
 import type { Runtime } from '../composition.ts';
@@ -26,6 +26,7 @@ export async function runStatus(
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
+  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const signedIn = await runtime.tokenStore
     .read()
     .then((tokens) => tokens !== null)
@@ -49,6 +50,7 @@ export async function runStatus(
       signedIn,
       config: runtime.config,
       cleanupPeriodDays,
+      competingCleanupSettings: competing,
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -93,6 +95,10 @@ export async function runStatus(
   print(`  Data directory:     ${runtime.paths.dataDir}`);
   print(`  Log:                ${runtime.paths.logFile}`);
 
+  for (const other of competing) {
+    print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
+    print(`                      That file outranks the one this plugin wrote.`);
+  }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);
   }

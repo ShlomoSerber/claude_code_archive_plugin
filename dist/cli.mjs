@@ -2121,7 +2121,7 @@ function markVerified(db, sessionId, remote, now) {
 function clearVerification(db, sessionId, now) {
   db.prepare(
     `UPDATE sessions
-        SET verified_at = NULL, remote_file_id = NULL,
+        SET verified_at = NULL,
             verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
       WHERE session_id = ?`
   ).run(now, sessionId);
@@ -2370,7 +2370,7 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
 import fsp9 from "node:fs/promises";
@@ -5441,30 +5441,42 @@ async function fsyncPath(file) {
 async function extractBundle(args) {
   await fsp7.mkdir(args.targetDir, { recursive: true });
   const entries = [];
+  const rejected = [];
   await So({
     file: args.bundlePath,
     cwd: args.targetDir,
+    filter: (entryPath) => {
+      if (args.onlySession === void 0) return true;
+      if (belongsToSession(entryPath, args.onlySession)) return true;
+      rejected.push(entryPath);
+      return false;
+    },
     onReadEntry: (entry) => {
       entries.push(entry.path);
     }
   });
-  return { entries };
+  return { entries, rejected };
+}
+function belongsToSession(entryPath, sessionId) {
+  const normalized = toPosix(entryPath).replace(/^\.\//, "").replace(/\/$/, "");
+  return normalized === `${sessionId}.jsonl` || normalized === sessionId || normalized.startsWith(`${sessionId}/`);
 }
 async function describeSessionFiles(args) {
   const described = [];
   for (const entry of args.entries) {
-    await describeInto(described, args.cwd, entry, args.signal);
+    await describeInto(described, args.cwd, entry, args.signal, true);
   }
   described.sort((a, b2) => a.path < b2.path ? -1 : a.path > b2.path ? 1 : 0);
   return described;
 }
-async function describeInto(out, cwd, relative, signal) {
+async function describeInto(out, cwd, relative, signal, optional = false) {
   const absolute = path11.join(cwd, relative);
   let stat;
   try {
     stat = await fsp7.stat(absolute);
-  } catch {
-    return;
+  } catch (err) {
+    if (optional) return;
+    throw err;
   }
   if (stat.isFile()) {
     out.push({
@@ -6021,6 +6033,11 @@ async function publish(ctx, job, session, bundle, index, now) {
   if (contentProblem !== null) {
     throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
   }
+  const archivedBytes = files.reduce((total, file) => total + file.bytes, 0);
+  const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+  if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
+    throw new RetryableError("the session changed while it was being archived");
+  }
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -6067,8 +6084,8 @@ async function publish(ctx, job, session, bundle, index, now) {
     {
       fileId: remote.id,
       path: `${folderPath.join("/")}/${bundle.name}`,
-      localMtime: Math.trunc(session.mtimeMs),
-      localBytes: session.transcriptBytes + session.sidecarBytes
+      localMtime: Math.trunc(confirmed.mtimeMs),
+      localBytes: archivedBytes
     },
     ctx.clock.now()
   );
@@ -7005,19 +7022,37 @@ async function restoreSession(ctx, sessionId) {
   const staged = path16.join(ctx.paths.stagingDir, `${sessionId}.restore.tar.zst`);
   try {
     await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
-    if (record.bundleSha256 !== null) {
-      const actual = await sha256File(staged, ctx.signal);
-      if (actual !== record.bundleSha256) {
-        throw new RetryableError(
-          `the downloaded bundle does not match the catalog hash for ${sessionId}`
-        );
-      }
+    const actual = await sha256File(staged, ctx.signal);
+    if (actual !== record.bundleSha256) {
+      throw new RetryableError(
+        `the downloaded bundle does not match the catalog hash for ${sessionId}`
+      );
     }
-    const { entries } = await extractBundle({
+    const { entries, rejected } = await extractBundle({
       bundlePath: staged,
       targetDir,
+      // The project directory is shared with every other session of that
+      // project. Without this, a bundle containing another session's
+      // transcript would overwrite it — and that bundle can arrive from a
+      // catalog downloaded off Drive.
+      onlySession: sessionId,
       ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
     });
+    if (rejected.length > 0) {
+      ctx.logger.warn("restore.rejected_entries", {
+        session_id: sessionId,
+        count: rejected.length,
+        first: rejected[0] ?? ""
+      });
+    }
+    if (record.transcriptSha256 !== null) {
+      const restoredHash = await sha256File(path16.join(targetDir, `${sessionId}.jsonl`)).catch(
+        () => null
+      );
+      if (restoredHash !== null && restoredHash !== record.transcriptSha256) {
+        ctx.logger.error("restore.transcript_hash_mismatch", { session_id: sessionId });
+      }
+    }
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
     const now = ctx.clock.now();
     if (restored !== null) markLocalPresent(ctx.db, sessionId, Math.trunc(restored.mtimeMs), now);
@@ -7043,10 +7078,16 @@ async function isDirectory(candidate) {
   }
 }
 function requireRemote(record) {
-  if (record.remoteFileId === null || record.verifiedAt === null) {
+  if (record.remoteFileId === null) {
     throw new FatalError(
-      `session ${record.sessionId} has no verified copy on Drive`,
+      `session ${record.sessionId} has no copy on Drive`,
       "Run /archive:now to finish backing it up, then try again."
+    );
+  }
+  if (record.bundleSha256 === null) {
+    throw new FatalError(
+      `session ${record.sessionId} has no stored hash, so a download cannot be checked`,
+      "Run /archive:now to archive it again, which records the hash."
     );
   }
   return record.remoteFileId;
@@ -7055,7 +7096,7 @@ function resumeCommand(sessionId) {
   return `claude --resume ${sessionId}`;
 }
 async function verifyArchive(ctx, records) {
-  const report = { checked: 0, ok: 0, mismatched: [], missing: [] };
+  const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
   for (const record of records) {
     ctx.signal?.throwIfAborted();
     if (record.remoteFileId === null) {
@@ -7073,8 +7114,8 @@ async function verifyArchive(ctx, records) {
         report.mismatched.push({ sessionId: record.sessionId, reason });
       }
     } catch (err) {
-      clearVerification(ctx.db, record.sessionId, ctx.clock.now());
-      report.mismatched.push({
+      report.checked--;
+      report.unchecked.push({
         sessionId: record.sessionId,
         reason: err instanceof Error ? err.message : "unreadable"
       });
@@ -7086,10 +7127,9 @@ function describeMismatch(record, remoteSize, remoteSha256) {
   if (record.bundleBytes !== null && remoteSize !== null && remoteSize !== record.bundleBytes) {
     return `size ${String(remoteSize)} != ${String(record.bundleBytes)}`;
   }
-  if (record.bundleSha256 !== null && remoteSha256 !== null) {
-    return remoteSha256.toLowerCase() === record.bundleSha256.toLowerCase() ? null : "sha256 mismatch";
-  }
-  return remoteSha256 === null ? "Drive returned no checksum" : null;
+  if (record.bundleSha256 === null) return "the catalog has no hash for this bundle";
+  if (remoteSha256 === null) return "Drive returned no checksum";
+  return remoteSha256.toLowerCase() === record.bundleSha256.toLowerCase() ? null : "sha256 mismatch";
 }
 
 // src/commands/search.ts
@@ -7185,10 +7225,11 @@ function resolveSessionId(runtime, query) {
 
 // src/commands/setup.ts
 import fsp15 from "node:fs/promises";
-import path17 from "node:path";
+import path18 from "node:path";
 
 // src/adapters/claude-settings.ts
 import fsp14 from "node:fs/promises";
+import path17 from "node:path";
 async function readCleanupPeriodDays(file) {
   const read = await readSettings(file);
   if (read.status !== "ok") return null;
@@ -7216,6 +7257,17 @@ async function setCleanupPeriodDays(file, days = CLEANUP_PERIOD_DAYS) {
     mode: await currentMode(target, 384)
   });
   return { changed: true, previous, current: days };
+}
+async function competingCleanupSettings(claudeDir) {
+  const found = [];
+  for (const name of ["settings.local.json", "managed-settings.json"]) {
+    const file = path17.join(claudeDir, name);
+    const read = await readSettings(file);
+    if (read.status !== "ok") continue;
+    const value = read.settings["cleanupPeriodDays"];
+    if (typeof value === "number") found.push({ file, value });
+  }
+  return found;
 }
 async function readSettings(file) {
   let raw;
@@ -7322,7 +7374,7 @@ async function importCatalogIfEmpty(runtime) {
   const db = runtime.db();
   if (catalogStats(db).sessions > 0) return 0;
   if ((kvGetNumber(db, KV.catalogUploadedAt) ?? 0) > 0) return 0;
-  const staged = path17.join(runtime.paths.stagingDir, "catalog-recovered.sqlite");
+  const staged = path18.join(runtime.paths.stagingDir, "catalog-recovered.sqlite");
   try {
     const ctx = commandContext(runtime);
     const parentId = await ctx.drive.ensureFolder([runtime.config.driveRootFolder], ctx.signal);
@@ -7400,6 +7452,7 @@ async function runStatus(runtime, options) {
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
+  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
   let quota = null;
@@ -7417,6 +7470,7 @@ async function runStatus(runtime, options) {
       signedIn,
       config: runtime.config,
       cleanupPeriodDays,
+      competingCleanupSettings: competing,
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -7456,6 +7510,10 @@ async function runStatus(runtime, options) {
   print();
   print(`  Data directory:     ${runtime.paths.dataDir}`);
   print(`  Log:                ${runtime.paths.logFile}`);
+  for (const other of competing) {
+    print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
+    print(`                      That file outranks the one this plugin wrote.`);
+  }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);
   }
@@ -7488,6 +7546,11 @@ async function runVerify(runtime, options = {}) {
     return report.mismatched.length > 0 ? 1 : 0;
   }
   print(`Checked ${String(report.checked)} archived sessions: ${String(report.ok)} verified.`);
+  if (report.unchecked.length > 0) {
+    print(
+      `${String(report.unchecked.length)} could not be checked right now (network or rate limit).`
+    );
+  }
   if (report.missing.length > 0) {
     print(`${String(report.missing.length)} have no remote copy recorded.`);
   }

@@ -73,20 +73,43 @@ export async function restoreSession(
   try {
     await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
 
-    if (record.bundleSha256 !== null) {
-      const actual = await sha256File(staged, ctx.signal);
-      if (actual !== record.bundleSha256) {
-        throw new RetryableError(
-          `the downloaded bundle does not match the catalog hash for ${sessionId}`,
-        );
-      }
+    // Unconditional: requireRemote has already refused a row without a hash,
+    // so there is no path here that unpacks unverified bytes.
+    const actual = await sha256File(staged, ctx.signal);
+    if (actual !== record.bundleSha256) {
+      throw new RetryableError(
+        `the downloaded bundle does not match the catalog hash for ${sessionId}`,
+      );
     }
 
-    const { entries } = await extractBundle({
+    const { entries, rejected } = await extractBundle({
       bundlePath: staged,
       targetDir,
+      // The project directory is shared with every other session of that
+      // project. Without this, a bundle containing another session's
+      // transcript would overwrite it — and that bundle can arrive from a
+      // catalog downloaded off Drive.
+      onlySession: sessionId,
       ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
     });
+    if (rejected.length > 0) {
+      ctx.logger.warn('restore.rejected_entries', {
+        session_id: sessionId,
+        count: rejected.length,
+        first: rejected[0] ?? '',
+      });
+    }
+
+    // The transcript hash was recorded at backup time and never read until
+    // now. Comparing it here is what turns it from decoration into a check.
+    if (record.transcriptSha256 !== null) {
+      const restoredHash = await sha256File(path.join(targetDir, `${sessionId}.jsonl`)).catch(
+        () => null,
+      );
+      if (restoredHash !== null && restoredHash !== record.transcriptSha256) {
+        ctx.logger.error('restore.transcript_hash_mismatch', { session_id: sessionId });
+      }
+    }
 
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
     const now = ctx.clock.now();
@@ -115,11 +138,25 @@ async function isDirectory(candidate: string): Promise<boolean> {
   }
 }
 
+/**
+ * What restore needs is a pointer and a hash, not `verified_at`.
+ *
+ * `verified_at` records the authority to *delete* a local copy. Requiring it
+ * here would make a session unrecoverable the moment a network blip withdrew
+ * that authority, which is exactly backwards: the bytes are still on Drive and
+ * the download is checked against the hash either way.
+ */
 function requireRemote(record: SessionRecord): string {
-  if (record.remoteFileId === null || record.verifiedAt === null) {
+  if (record.remoteFileId === null) {
     throw new FatalError(
-      `session ${record.sessionId} has no verified copy on Drive`,
+      `session ${record.sessionId} has no copy on Drive`,
       'Run /archive:now to finish backing it up, then try again.',
+    );
+  }
+  if (record.bundleSha256 === null) {
+    throw new FatalError(
+      `session ${record.sessionId} has no stored hash, so a download cannot be checked`,
+      'Run /archive:now to archive it again, which records the hash.',
     );
   }
   return record.remoteFileId;
@@ -139,13 +176,15 @@ export type VerifyReport = {
   ok: number;
   mismatched: { sessionId: string; reason: string }[];
   missing: string[];
+  /** Rows Drive could not be asked about. Not a verdict, and not a failure. */
+  unchecked: { sessionId: string; reason: string }[];
 };
 
 export async function verifyArchive(
   ctx: WorkerContext,
   records: SessionRecord[],
 ): Promise<VerifyReport> {
-  const report: VerifyReport = { checked: 0, ok: 0, mismatched: [], missing: [] };
+  const report: VerifyReport = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
   for (const record of records) {
     ctx.signal?.throwIfAborted();
     if (record.remoteFileId === null) {
@@ -161,15 +200,19 @@ export async function verifyArchive(
       if (reason === null) {
         report.ok++;
       } else {
-        // A check that only reports is decoration. Withdrawing verification is
-        // what stops the reaper deleting the local copy of a bundle that Drive
+        // Drive answered, and its answer was bad. Withdrawing verification is
+        // what stops the reaper deleting a local copy against a bundle Drive
         // no longer holds intact.
         clearVerification(ctx.db, record.sessionId, ctx.clock.now());
         report.mismatched.push({ sessionId: record.sessionId, reason });
       }
     } catch (err) {
-      clearVerification(ctx.db, record.sessionId, ctx.clock.now());
-      report.mismatched.push({
+      // Drive did not answer. That is a statement about the network, not about
+      // the archive. `/archive:verify --all` walks hundreds of files fast
+      // enough to earn a rate limit, and treating those as verification
+      // failures would withdraw trust from a healthy archive wholesale.
+      report.checked--;
+      report.unchecked.push({
         sessionId: record.sessionId,
         reason: err instanceof Error ? err.message : 'unreadable',
       });
@@ -186,11 +229,9 @@ function describeMismatch(
   if (record.bundleBytes !== null && remoteSize !== null && remoteSize !== record.bundleBytes) {
     return `size ${String(remoteSize)} != ${String(record.bundleBytes)}`;
   }
-  if (record.bundleSha256 !== null && remoteSha256 !== null) {
-    return remoteSha256.toLowerCase() === record.bundleSha256.toLowerCase()
-      ? null
-      : 'sha256 mismatch';
-  }
-  // Nothing to compare is not the same as a match, and must not read as one.
-  return remoteSha256 === null ? 'Drive returned no checksum' : null;
+  if (record.bundleSha256 === null) return 'the catalog has no hash for this bundle';
+  if (remoteSha256 === null) return 'Drive returned no checksum';
+  return remoteSha256.toLowerCase() === record.bundleSha256.toLowerCase()
+    ? null
+    : 'sha256 mismatch';
 }

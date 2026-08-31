@@ -1977,7 +1977,7 @@ function markVerified(db, sessionId, remote, now) {
 function clearVerification(db, sessionId, now) {
   db.prepare(
     `UPDATE sessions
-        SET verified_at = NULL, remote_file_id = NULL,
+        SET verified_at = NULL,
             verified_local_mtime = NULL, verified_local_bytes = NULL, updated_at = ?
       WHERE session_id = ?`
   ).run(now, sessionId);
@@ -2213,7 +2213,7 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 36 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
 import fsp9 from "node:fs/promises";
@@ -5284,18 +5284,19 @@ async function fsyncPath(file) {
 async function describeSessionFiles(args) {
   const described = [];
   for (const entry of args.entries) {
-    await describeInto(described, args.cwd, entry, args.signal);
+    await describeInto(described, args.cwd, entry, args.signal, true);
   }
   described.sort((a, b2) => a.path < b2.path ? -1 : a.path > b2.path ? 1 : 0);
   return described;
 }
-async function describeInto(out, cwd, relative, signal) {
+async function describeInto(out, cwd, relative, signal, optional = false) {
   const absolute = path12.join(cwd, relative);
   let stat;
   try {
     stat = await fsp7.stat(absolute);
-  } catch {
-    return;
+  } catch (err) {
+    if (optional) return;
+    throw err;
   }
   if (stat.isFile()) {
     out.push({
@@ -5852,6 +5853,11 @@ async function publish(ctx, job, session, bundle, index, now) {
   if (contentProblem !== null) {
     throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
   }
+  const archivedBytes = files.reduce((total, file) => total + file.bytes, 0);
+  const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+  if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
+    throw new RetryableError("the session changed while it was being archived");
+  }
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -5898,8 +5904,8 @@ async function publish(ctx, job, session, bundle, index, now) {
     {
       fileId: remote.id,
       path: `${folderPath.join("/")}/${bundle.name}`,
-      localMtime: Math.trunc(session.mtimeMs),
-      localBytes: session.transcriptBytes + session.sidecarBytes
+      localMtime: Math.trunc(confirmed.mtimeMs),
+      localBytes: archivedBytes
     },
     ctx.clock.now()
   );
