@@ -20,6 +20,18 @@ import type { ManifestFile } from '../core/manifest.ts';
 
 export const DEFAULT_ZSTD_LEVEL = 19;
 
+/**
+ * node-tar refuses to read an archive that expands more than 1000:1, as a
+ * defence against archives from strangers. Every archive read here is one this
+ * plugin created moments earlier from the user's own files.
+ *
+ * Leaving the default on meant a highly compressible session — a short parent
+ * transcript with a large sidecar of repeated build output — bundled fine and
+ * was then unreadable by the code that has to read it back, so the session
+ * could never be archived and nothing said so.
+ */
+const TAR_READ_OPTIONS = { maxDecompressionRatio: Infinity } as const;
+
 export type BundleInput = {
   /** Directory the tar paths are relative to: the encoded project directory. */
   cwd: string;
@@ -118,6 +130,7 @@ export async function extractBundle(args: {
   const entries: string[] = [];
   const rejected: string[] = [];
   await tar.extract({
+    ...TAR_READ_OPTIONS,
     file: args.bundlePath,
     cwd: args.targetDir,
     ...(args.signal === undefined ? {} : { signal: args.signal }),
@@ -148,6 +161,7 @@ export function belongsToSession(entryPath: string, sessionId: string): boolean 
 export async function listBundle(bundlePath: string): Promise<{ path: string; size: number }[]> {
   const entries: { path: string; size: number }[] = [];
   await tar.list({
+    ...TAR_READ_OPTIONS,
     file: bundlePath,
     onReadEntry: (entry) => {
       entries.push({ path: entry.path, size: entry.size });
@@ -241,6 +255,7 @@ export async function verifyBundleContents(
   const problems: string[] = [];
 
   await tar.list({
+    ...TAR_READ_OPTIONS,
     file: bundlePath,
     onReadEntry: (entry) => {
       const entryPath = toPosix(entry.path).replace(/\/$/, '');

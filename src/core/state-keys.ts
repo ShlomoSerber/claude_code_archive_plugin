@@ -19,6 +19,8 @@ export const KV = {
   lastScanAt: 'scan.last_at',
   /** Sessions or projects the last scan could not archive, for /archive:status. */
   skippedCount: 'scan.skipped_count',
+  /** How many of those were unreadable rather than badly named. */
+  unreadableCount: 'scan.unreadable_count',
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: 'backfill.done_at',
 } as const;

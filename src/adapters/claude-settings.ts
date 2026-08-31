@@ -105,7 +105,14 @@ export async function competingCleanupSettings(
 ): Promise<{ file: string; value: number }[]> {
   const found: { file: string; value: number }[] = [];
   for (const file of competingSettingsPaths(claudeDir)) {
-    const read = await readSettings(file);
+    let read: SettingsRead;
+    try {
+      read = await readSettings(file);
+    } catch {
+      // Unreadable is not the same as absent, but this runs inside a status
+      // report: crashing the diagnostic helps nobody.
+      continue;
+    }
     if (read.status !== 'ok') continue;
     const value = read.settings['cleanupPeriodDays'];
     if (typeof value === 'number') found.push({ file, value });

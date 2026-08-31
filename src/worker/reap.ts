@@ -72,7 +72,16 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
 
-    const onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    let onDisk;
+    try {
+      onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    } catch (err) {
+      // "I could not look" is not "it is not there". Recording the latter made
+      // /archive:status report space reclaimed from files still on disk.
+      log.warn('reap.stat_failed', {}, err);
+      report.skipped++;
+      continue;
+    }
     if (onDisk === null) {
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;

@@ -1302,3 +1302,113 @@ describe('an unreadable sidecar', () => {
     }
   });
 });
+
+/**
+ * Eighth round. Objective 1 held again; every finding was "never archived, and
+ * nothing said so" — the safe failure direction taken silently, which becomes
+ * an unsafe one the day the disk dies.
+ */
+describe('the plugin says when it cannot archive something', () => {
+  it('archives a session that compresses far better than a thousand to one', async () => {
+    // node-tar refuses to read an archive expanding more than 1000:1, as a
+    // defence against archives from strangers. Every archive read here is one
+    // this plugin just made from the user's own files, so a short transcript
+    // with a large repetitive sidecar could be bundled and never read back.
+    const harness = makeHarness();
+    const id = 'ffffffff-1111-2222-3333-444444444444';
+    fs.writeFileSync(
+      path.join(harness.projectDir, `${id}.jsonl`),
+      '{"type":"user","message":{"role":"user","content":"why does the build fail"}}\n',
+    );
+    fs.mkdirSync(path.join(harness.projectDir, id), { recursive: true });
+    fs.writeFileSync(
+      path.join(harness.projectDir, id, 'build-output.txt'),
+      'ERROR: could not resolve module\n'.repeat(200_000),
+    );
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.failed, 0, 'no unreadable-archive failure');
+    assert.ok(getSession(harness.ctx.db, id)?.verifiedAt, 'the session is archived');
+  });
+
+  it('parks a session that keeps failing locally instead of retrying it in silence', async () => {
+    const harness = makeHarness();
+    // A local fault that will never fix itself.
+    harness.ctx.drive.ensureFolder = () => Promise.reject(new RetryableError('local fault'));
+
+    let blocked = 0;
+    for (let sweep = 0; sweep < 8; sweep++) {
+      const report = await runSweep(harness.ctx);
+      blocked = Math.max(blocked, report.blocked);
+      harness.clock.advance(6 * 60 * 60_000);
+    }
+    assert.ok(blocked > 0, 'it reaches /archive:status rather than retrying for ever');
+  });
+
+  it('reports a project directory it cannot read', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permissions do not apply on Windows');
+      return;
+    }
+    const harness = makeHarness();
+    const hidden = path.join(harness.ctx.paths.projectsDir, '-home-a-secret');
+    fs.mkdirSync(hidden, { recursive: true });
+    fs.writeFileSync(path.join(hidden, '99999999-1111-2222-3333-444444444444.jsonl'), '{}\n');
+    fs.chmodSync(hidden, 0o000);
+    try {
+      await runSweep(harness.ctx);
+      assert.equal(kvGetNumber(harness.ctx.db, KV.unreadableCount), 1);
+      assert.ok((kvGetNumber(harness.ctx.db, KV.skippedCount) ?? 0) >= 1);
+    } finally {
+      fs.chmodSync(hidden, 0o755);
+    }
+  });
+
+  it('refuses a truncated transcript even when the sidecar grew by more', async () => {
+    // Comparing only the total let this through: the sum was larger, so the
+    // damaged copy replaced the good archive.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '';
+
+    fs.writeFileSync(harness.transcriptOf(SESSION_B), '{"t":1}\n');
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'more-output.json'),
+      JSON.stringify({ padding: 'x'.repeat(4000) }),
+    );
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), touched, touched);
+    harness.clock.advance(60_000);
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.blocked, 1);
+    assert.equal(harness.drive.files.has(original), true, 'the fuller archive survives');
+  });
+
+  it('does not let local faults stop every other session archiving', async () => {
+    const harness = makeHarness();
+    // Five sessions that cannot be bundled locally.
+    for (let index = 0; index < 5; index++) {
+      const id = `1000000${String(index)}-1111-2222-3333-444444444444`;
+      fs.writeFileSync(path.join(harness.projectDir, `${id}.jsonl`), '{}\n');
+      const sidecar = path.join(harness.projectDir, id);
+      fs.mkdirSync(sidecar, { recursive: true });
+      fs.chmodSync(sidecar, 0o000);
+    }
+    try {
+      for (let sweep = 0; sweep < 3; sweep++) {
+        await runSweep(harness.ctx);
+        harness.clock.advance(60_000);
+      }
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.cooledDown, false, 'the shared circuit breaker stays closed');
+    } finally {
+      for (let index = 0; index < 5; index++) {
+        fs.chmodSync(
+          path.join(harness.projectDir, `1000000${String(index)}-1111-2222-3333-444444444444`),
+          0o755,
+        );
+      }
+    }
+  });
+});

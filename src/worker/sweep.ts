@@ -189,13 +189,17 @@ async function discover(
 
   kvSetNumber(ctx.db, KV.lastScanAt, now, now);
   if (skipped.length > 0) {
+    const unreadable = skipped.filter((entry) => entry.reason === 'unreadable');
     ctx.logger.error('sweep.skipped_unarchivable', {
       count: skipped.length,
+      unreadable: unreadable.length,
       first: skipped[0]?.name ?? '',
     });
     kvSetNumber(ctx.db, KV.skippedCount, skipped.length, now);
+    kvSetNumber(ctx.db, KV.unreadableCount, unreadable.length, now);
   } else {
     kvSetNumber(ctx.db, KV.skippedCount, 0, now);
+    kvSetNumber(ctx.db, KV.unreadableCount, 0, now);
   }
   return { discovered, enqueued };
 }
@@ -265,7 +269,27 @@ function handleJobFailure(ctx: WorkerContext, job: Job, err: unknown, report: Sw
     );
     block(ctx.db, job, { error: `${message} — ${err.remediation}`, now });
     report.blocked++;
-    noteFailure(ctx);
+    // Deliberately conditional: an unreadable sidecar or a shrunken session is
+    // a local fault, and letting a handful of those open the shared circuit
+    // breaker stops every healthy session archiving for hours.
+    if (isRetryableNetworkError(err)) noteFailure(ctx);
+    return;
+  }
+
+  // A local fault does not fix itself. Retrying it a thousand times a day in
+  // silence is how a session stays unarchived for months with nothing reported:
+  // no blocked job, no error, no warning in /archive:status.
+  if (!isRetryableNetworkError(err) && job.attempts >= LOCAL_FAILURE_LIMIT) {
+    ctx.logger.error(
+      'sweep.job_blocked_after_local_failures',
+      { session_id: job.sessionId, attempts: job.attempts },
+      err,
+    );
+    block(ctx.db, job, {
+      error: `${message} (gave up after ${String(job.attempts)} local attempts)`,
+      now,
+    });
+    report.blocked++;
     return;
   }
 
@@ -322,6 +346,9 @@ function clockLooksSane(ctx: WorkerContext, now: number): boolean {
   }
   return true;
 }
+
+/** Consecutive local failures before a job is parked where a person sees it. */
+const LOCAL_FAILURE_LIMIT = 5;
 
 const CATALOG_REFRESH_MS = 24 * 3_600_000;
 

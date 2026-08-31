@@ -252,6 +252,22 @@ async function publish(
   // added by a migration is NULL for every existing session, and an imported
   // catalog deliberately drops the fingerprint — in both cases the guard would
   // otherwise be off for exactly the first re-archive, across the whole archive.
+  // Per component. A total hides the case that matters: a transcript
+  // truncated by a crashed write, while a resumed session added sidecar bytes,
+  // sums to more than before and sails through.
+  const transcriptFloor = previous?.remoteFileId == null ? null : previous.transcriptBytes;
+  const archivedTranscript =
+    files.find((file) => file.path === `${session.sessionId}.jsonl`)?.bytes ?? 0;
+  if (transcriptFloor !== null && archivedTranscript < transcriptFloor) {
+    throw new FatalError(
+      `the transcript of ${session.sessionId} shrank from ${String(transcriptFloor)} to ` +
+        `${String(archivedTranscript)} bytes since it was archived`,
+      'The copy on Drive is fuller than what is on disk. Move the local files ' +
+        'aside and run /archive:resume to put the archived copy back, or delete ' +
+        'them if the loss was intended.',
+    );
+  }
+
   const archivedFloor = previousArchivedBytes(previous);
   if (archivedFloor !== null && archivedBytes < archivedFloor) {
     throw new FatalError(

@@ -10,7 +10,12 @@ import type { ArchivePaths } from '../core/paths.ts';
  * directory of the same name holding tool results and subagent transcripts.
  */
 
-export type ScanSkip = { kind: 'project' | 'session'; name: string };
+export type ScanSkip = {
+  kind: 'project' | 'session';
+  name: string;
+  /** 'name' when the name is unusable, 'unreadable' when access failed. */
+  reason: 'name' | 'unreadable';
+};
 
 export type LocalSession = {
   sessionId: string;
@@ -83,13 +88,19 @@ export async function* scanSessions(
     // Recorded rather than dropped: a silent skip means a whole project is
     // absent from the archive with nothing anywhere saying so.
     if (!isSafeEncodedDir(encodedDir)) {
-      skipped?.push({ kind: 'project', name: encodedDir });
+      skipped?.push({ kind: 'project', name: encodedDir, reason: 'name' });
       continue;
     }
     let entries: string[];
     try {
       entries = await fsp.readdir(path.join(paths.projectsDir, encodedDir));
-    } catch {
+    } catch (err) {
+      // A project we cannot list is a project whose sessions are absent from
+      // the archive. The same reasoning already applies one level down, to an
+      // unreadable sidecar; it was never applied here.
+      if ((err as { code?: string }).code !== 'ENOENT') {
+        skipped?.push({ kind: 'project', name: encodedDir, reason: 'unreadable' });
+      }
       continue;
     }
     for (const entry of entries) {
@@ -98,10 +109,16 @@ export async function* scanSessions(
       // `...jsonl` yields `..`, and `.jsonl` yields the empty string. Both
       // join into the parent directory, which the reaper would then delete.
       if (!isSafeSessionId(sessionId)) {
-        skipped?.push({ kind: 'session', name: entry });
+        skipped?.push({ kind: 'session', name: entry, reason: 'name' });
         continue;
       }
-      const session = await statSession(paths, encodedDir, sessionId);
+      let session: LocalSession | null;
+      try {
+        session = await statSession(paths, encodedDir, sessionId);
+      } catch {
+        skipped?.push({ kind: 'session', name: entry, reason: 'unreadable' });
+        continue;
+      }
       if (session !== null) yield session;
     }
   }

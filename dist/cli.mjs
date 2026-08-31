@@ -2054,23 +2054,32 @@ async function* scanSessions(paths, skipped) {
   }
   for (const encodedDir of projectDirs) {
     if (!isSafeEncodedDir(encodedDir)) {
-      skipped?.push({ kind: "project", name: encodedDir });
+      skipped?.push({ kind: "project", name: encodedDir, reason: "name" });
       continue;
     }
     let entries;
     try {
       entries = await fsp6.readdir(path10.join(paths.projectsDir, encodedDir));
-    } catch {
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        skipped?.push({ kind: "project", name: encodedDir, reason: "unreadable" });
+      }
       continue;
     }
     for (const entry of entries) {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionId = entry.slice(0, -".jsonl".length);
       if (!isSafeSessionId(sessionId)) {
-        skipped?.push({ kind: "session", name: entry });
+        skipped?.push({ kind: "session", name: entry, reason: "name" });
         continue;
       }
-      const session = await statSession(paths, encodedDir, sessionId);
+      let session;
+      try {
+        session = await statSession(paths, encodedDir, sessionId);
+      } catch {
+        skipped?.push({ kind: "session", name: entry, reason: "unreadable" });
+        continue;
+      }
       if (session !== null) yield session;
     }
   }
@@ -2482,6 +2491,8 @@ var KV = {
   lastScanAt: "scan.last_at",
   /** Sessions or projects the last scan could not archive, for /archive:status. */
   skippedCount: "scan.skipped_count",
+  /** How many of those were unreadable rather than badly named. */
+  unreadableCount: "scan.unreadable_count",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
@@ -5511,6 +5522,7 @@ function createHashTee(algorithms = ["sha256", "md5"]) {
 
 // src/adapters/bundle.ts
 var DEFAULT_ZSTD_LEVEL = 19;
+var TAR_READ_OPTIONS = { maxDecompressionRatio: Infinity };
 async function createBundle(input) {
   const level = input.compressionLevel ?? DEFAULT_ZSTD_LEVEL;
   await fsp7.mkdir(path11.dirname(input.outputPath), { recursive: true });
@@ -5561,6 +5573,7 @@ async function extractBundle(args) {
   const entries = [];
   const rejected = [];
   await So({
+    ...TAR_READ_OPTIONS,
     file: args.bundlePath,
     cwd: args.targetDir,
     ...args.signal === void 0 ? {} : { signal: args.signal },
@@ -5619,6 +5632,7 @@ async function verifyBundleContents(bundlePath, expected) {
   const seen = /* @__PURE__ */ new Set();
   const problems = [];
   await Ct({
+    ...TAR_READ_OPTIONS,
     file: bundlePath,
     onReadEntry: (entry) => {
       const entryPath = toPosix(entry.path).replace(/\/$/, "");
@@ -6196,6 +6210,14 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError("the session changed while it was being archived");
   }
+  const transcriptFloor = previous?.remoteFileId == null ? null : previous.transcriptBytes;
+  const archivedTranscript = files.find((file) => file.path === `${session.sessionId}.jsonl`)?.bytes ?? 0;
+  if (transcriptFloor !== null && archivedTranscript < transcriptFloor) {
+    throw new FatalError(
+      `the transcript of ${session.sessionId} shrank from ${String(transcriptFloor)} to ${String(archivedTranscript)} bytes since it was archived`,
+      "The copy on Drive is fuller than what is on disk. Move the local files aside and run /archive:resume to put the archived copy back, or delete them if the loss was intended."
+    );
+  }
   const archivedFloor = previousArchivedBytes(previous);
   if (archivedFloor !== null && archivedBytes < archivedFloor) {
     throw new FatalError(
@@ -6328,7 +6350,14 @@ async function reapLocalCopies(ctx, now) {
       report.skipped++;
       continue;
     }
-    const onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    let onDisk;
+    try {
+      onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    } catch (err) {
+      log.warn("reap.stat_failed", {}, err);
+      report.skipped++;
+      continue;
+    }
     if (onDisk === null) {
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;
@@ -6549,13 +6578,17 @@ async function discover(ctx, now) {
   }
   kvSetNumber(ctx.db, KV.lastScanAt, now, now);
   if (skipped.length > 0) {
+    const unreadable = skipped.filter((entry) => entry.reason === "unreadable");
     ctx.logger.error("sweep.skipped_unarchivable", {
       count: skipped.length,
+      unreadable: unreadable.length,
       first: skipped[0]?.name ?? ""
     });
     kvSetNumber(ctx.db, KV.skippedCount, skipped.length, now);
+    kvSetNumber(ctx.db, KV.unreadableCount, unreadable.length, now);
   } else {
     kvSetNumber(ctx.db, KV.skippedCount, 0, now);
+    kvSetNumber(ctx.db, KV.unreadableCount, 0, now);
   }
   return { discovered, enqueued };
 }
@@ -6606,7 +6639,20 @@ function handleJobFailure(ctx, job, err, report) {
     );
     block(ctx.db, job, { error: `${message} \u2014 ${err.remediation}`, now });
     report.blocked++;
-    noteFailure(ctx);
+    if (isRetryableNetworkError(err)) noteFailure(ctx);
+    return;
+  }
+  if (!isRetryableNetworkError(err) && job.attempts >= LOCAL_FAILURE_LIMIT) {
+    ctx.logger.error(
+      "sweep.job_blocked_after_local_failures",
+      { session_id: job.sessionId, attempts: job.attempts },
+      err
+    );
+    block(ctx.db, job, {
+      error: `${message} (gave up after ${String(job.attempts)} local attempts)`,
+      now
+    });
+    report.blocked++;
     return;
   }
   const at2 = nextAttemptAt({
@@ -6646,6 +6692,7 @@ function clockLooksSane(ctx, now) {
   }
   return true;
 }
+var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
 function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
@@ -7547,7 +7594,12 @@ function competingSettingsPaths(claudeDir) {
 async function competingCleanupSettings(claudeDir) {
   const found = [];
   for (const file of competingSettingsPaths(claudeDir)) {
-    const read = await readSettings(file);
+    let read;
+    try {
+      read = await readSettings(file);
+    } catch {
+      continue;
+    }
     if (read.status !== "ok") continue;
     const value = read.settings["cleanupPeriodDays"];
     if (typeof value === "number") found.push({ file, value });
@@ -7754,6 +7806,7 @@ async function runStatus(runtime, options) {
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
+  const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
   let quota = null;
@@ -7773,6 +7826,7 @@ async function runStatus(runtime, options) {
       cleanupPeriodDays,
       competingCleanupSettings: competing,
       unarchivable: skipped,
+      unreadable,
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -7814,7 +7868,9 @@ async function runStatus(runtime, options) {
   print(`  Log:                ${runtime.paths.logFile}`);
   if (skipped > 0) {
     print(`  WARNING:            ${String(skipped)} project(s) or session(s) cannot be archived`);
-    print(`                      Their names are unusable as paths; see the log.`);
+    print(
+      `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`
+    );
   }
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
