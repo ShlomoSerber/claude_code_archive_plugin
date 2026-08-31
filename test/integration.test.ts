@@ -15,6 +15,8 @@ import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
+import { competingCleanupSettings } from '../src/adapters/claude-settings.ts';
+import { createExtractor } from '../src/core/transcript.ts';
 import { kvSetNumber } from '../src/adapters/db.ts';
 import { activeSessionKey } from '../src/core/state-keys.ts';
 import { FakeDrive } from './fakes/fake-drive.ts';
@@ -129,8 +131,13 @@ describe('a full sweep', () => {
     assert.ok(record.remoteFileId);
     assert.equal(record.title, 'Auth redirect fix');
     // 2026-08-20 is when the transcript says the session ended; the sweep ran
-    // on 2026-08-31. The name must follow the session, not the sweep.
-    assert.equal(record.bundleName, '2026-08-20_auth-redirect-fix_aaaaaaaa.tar.zst');
+    // on 2026-08-31. The name follows the session, not the sweep — and carries
+    // eight hex of the bundle hash, so a changed session gets a different name
+    // rather than needing the existing archive destroyed to make room.
+    assert.match(
+      record.bundleName ?? '',
+      /^2026-08-20_auth-redirect-fix_aaaaaaaa_[0-9a-f]{8}.tar.zst$/,
+    );
   });
 
   it('files bundles by project and year, with a manifest beside each', async () => {
@@ -741,12 +748,12 @@ describe('deletion safety, third pass', () => {
     const harness = makeHarness();
     await runSweep(harness.ctx);
     harness.ctx.db
-      .prepare('UPDATE sessions SET bundle_sha256 = NULL WHERE session_id = ?')
+      .prepare('UPDATE sessions SET verified_bundle_sha256 = NULL WHERE session_id = ?')
       .run(SESSION_A);
 
     const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
     assert.equal(report.ok, 0);
-    assert.match(report.mismatched[0]?.reason ?? '', /no hash/);
+    assert.match(report.mismatched[0]?.reason ?? '', /no verified hash/);
   });
 
   it('refuses to restore bytes it has no hash to check', async () => {
@@ -754,10 +761,10 @@ describe('deletion safety, third pass', () => {
     await runSweep(harness.ctx);
     fs.rmSync(harness.transcriptOf(SESSION_A));
     harness.ctx.db
-      .prepare('UPDATE sessions SET bundle_sha256 = NULL WHERE session_id = ?')
+      .prepare('UPDATE sessions SET verified_bundle_sha256 = NULL WHERE session_id = ?')
       .run(SESSION_A);
 
-    await assert.rejects(restoreSession(harness.ctx, SESSION_A), /no stored hash/);
+    await assert.rejects(restoreSession(harness.ctx, SESSION_A), /no verified hash/);
   });
 
   it('unpacks only the session being restored', async () => {
@@ -799,5 +806,123 @@ describe('deletion safety, third pass', () => {
     assert.equal(fs.readFileSync(victim, 'utf8'), before, 'the neighbour is untouched');
     assert.ok(result.rejected.some((entry) => entry.includes(SESSION_B)));
     assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+});
+
+/**
+ * Fourth round. A red team found the hole on the *upload* path: bundle names
+ * came from the title, so re-archiving changed content collided with the
+ * existing archive, and the code deleted the archive to make room. Drive's
+ * DELETE is permanent, so an interrupted upload then left nothing at all.
+ */
+describe('deletion safety, fourth pass', () => {
+  const DAY = DAY_MS;
+
+  it('gives a changed session a different remote name instead of a collision', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const first = getSession(harness.ctx.db, SESSION_A)?.bundleName;
+
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user","content":"more"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const second = getSession(harness.ctx.db, SESSION_A)?.bundleName;
+    assert.notEqual(first, second, 'the name follows the content, not the title');
+  });
+
+  it('never deletes an archived bundle before its replacement is verified', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    assert.ok(harness.drive.files.has(original));
+
+    // Make every upload from here on fail, as a dropped connection would.
+    harness.drive.options = { ...harness.drive.options, failUploadsAfter: 0 };
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+
+    const report = await runSweep(harness.ctx);
+    assert.ok(report.failed > 0, 'the re-upload failed');
+    assert.equal(harness.drive.files.has(original), true, 'the archived bundle survives');
+  });
+
+  it('retires the superseded bundle only after the new one is verified', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const replacement = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    assert.notEqual(replacement, original);
+    assert.equal(harness.drive.files.has(replacement), true, 'the new bundle is there');
+    assert.equal(harness.drive.files.has(original), false, 'the old one was retired after');
+  });
+
+  it('refuses to archive over a good copy when the session has shrunk', async () => {
+    // The signature of a half-finished delete or a truncated restore. Archiving
+    // over the good copy is how that damage would become permanent.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+
+    fs.writeFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.blocked, 1, 'the job is parked for a person to look at');
+    assert.equal(harness.drive.files.has(original), true, 'the fuller archive is untouched');
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('does not reap after the clock jumps forward by half a year', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+
+    harness.clock.advance(400 * DAY);
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.reap.deleted, 0, 'a clock jump is not evidence of idleness');
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+
+    // The next sweep, with the gap recorded, reaps normally.
+    harness.clock.advance(DAY);
+    const after = await runSweep(harness.ctx);
+    assert.equal(after.reap.deleted, 2);
+  });
+
+  it('refuses setup when another settings file outranks the one it writes', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.ctx.paths.claudeDir, 'settings.local.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+    const competing = await competingCleanupSettings(harness.ctx.paths.claudeDir);
+    assert.equal(competing.length, 1);
+    assert.equal(competing[0]?.value, 30);
+  });
+
+  it('keeps a fractional timestamp out of a STRICT integer column', () => {
+    const extractor = createExtractor();
+    extractor.pushLine(
+      JSON.stringify({
+        type: 'user',
+        sessionId: 's',
+        timestamp: 1_700_000_000_000.5,
+        message: { role: 'user', content: 'hello' },
+      }),
+    );
+    const summary = extractor.finish();
+    assert.ok(Number.isInteger(summary.startedAt));
   });
 });

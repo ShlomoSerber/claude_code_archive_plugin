@@ -124,7 +124,13 @@ describe('the backup lifecycle', () => {
     markVerified(
       db,
       's1',
-      { fileId: 'drive-1', path: 'ClaudeArchive/x/b.tar.zst', localMtime: 2000, localBytes: 600 },
+      {
+        fileId: 'drive-1',
+        path: 'ClaudeArchive/x/b.tar.zst',
+        localMtime: 2000,
+        localBytes: 600,
+        bundleSha256: 'abc',
+      },
       3000,
     );
     const verified = getSession(db, 's1');
@@ -143,7 +149,7 @@ describe('the backup lifecycle', () => {
     markVerified(
       db,
       's1',
-      { fileId: 'drive-1', path: 'p', localMtime: 2000, localBytes: 600 },
+      { fileId: 'drive-1', path: 'p', localMtime: 2000, localBytes: 600, bundleSha256: 'abc' },
       3000,
     );
     markBundled(
@@ -183,7 +189,7 @@ describe('listReapable', () => {
     markVerified(
       db,
       'verified-old',
-      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600 },
+      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
       1,
     );
 
@@ -202,7 +208,7 @@ describe('listReapable', () => {
     markVerified(
       db,
       'verified-recent',
-      { fileId: 'f', path: 'p', localMtime: 90_000, localBytes: 600 },
+      { fileId: 'f', path: 'p', localMtime: 90_000, localBytes: 600, bundleSha256: 'h' },
       1,
     );
 
@@ -246,7 +252,12 @@ describe('listUnverified', () => {
     upsertSession(db, { ...BASE, sessionId: 'older', endedAt: 1000 }, 1);
     upsertSession(db, { ...BASE, sessionId: 'newer', endedAt: 9000 }, 1);
     upsertSession(db, { ...BASE, sessionId: 'done', endedAt: 5000 }, 1);
-    markVerified(db, 'done', { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600 }, 1);
+    markVerified(
+      db,
+      'done',
+      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
+      1,
+    );
     assert.deepEqual(
       listUnverified(db).map((session) => session.sessionId),
       ['newer', 'older'],
@@ -277,7 +288,12 @@ describe('catalogStats', () => {
       },
       1,
     );
-    markVerified(db, 'reaped', { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600 }, 1);
+    markVerified(
+      db,
+      'reaped',
+      { fileId: 'f', path: 'p', localMtime: 1000, localBytes: 600, bundleSha256: 'h' },
+      1,
+    );
     markLocalDeleted(db, 'reaped', 2);
 
     const stats = catalogStats(db);

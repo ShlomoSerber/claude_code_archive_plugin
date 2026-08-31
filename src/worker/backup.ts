@@ -6,17 +6,19 @@ import { extractFromFile } from '../adapters/transcript-file.ts';
 import { sha256File } from '../adapters/hashing.ts';
 import {
   markBundled,
+  getSession,
   markVerified,
   clearVerification,
   replaceFiles,
   replacePrompts,
   upsertSession,
 } from '../core/catalog.ts';
-import { RetryableError } from '../core/errors.ts';
+import { FatalError, RetryableError } from '../core/errors.ts';
 import { buildManifest } from '../core/manifest.ts';
 import { bundleBaseName, isoDate, isoYear } from '../core/slug.ts';
 import type { Job } from '../core/queue.ts';
 import type { RemoteFile } from '../ports/drive.ts';
+import type { SessionRecord } from '../core/catalog.ts';
 import type { WorkerContext } from './context.ts';
 import { uploadWithResume } from './upload.ts';
 
@@ -49,11 +51,14 @@ export async function backupSession(
   }
 
   const now = ctx.clock.now();
+  // Read before anything clears it: markBundled withdraws verification the
+  // moment a new bundle is built, and this is the record of what Drive held.
+  const previous = getSession(ctx.db, session.sessionId);
   const summary = await indexSession(ctx, session, now);
   const bundle = await buildBundle(ctx, session, summary, now);
 
   try {
-    const remote = await publish(ctx, job, session, bundle, summary, now);
+    const remote = await publish(ctx, job, session, bundle, summary, previous, now);
     log.info('backup.verified', { bytes: bundle.bytes, file_id: remote.id });
     return { status: 'verified', bundleBytes: bundle.bytes, remoteFileId: remote.id };
   } finally {
@@ -151,9 +156,9 @@ async function buildBundle(
   const stamp = (index.endedAt ?? index.startedAt ?? Math.trunc(session.mtimeMs)) || now;
   const title = index.title;
   const date = isoDate(stamp);
-  const base = bundleBaseName({ date, title, sessionId: session.sessionId });
-  const name = `${base}.tar.zst`;
-  const outputPath = path.join(ctx.paths.stagingDir, name);
+  // Staged under a provisional name; the remote name comes from the hash of
+  // the bytes that actually get written, which is not known until then.
+  const outputPath = path.join(ctx.paths.stagingDir, `${session.sessionId}.building.tar.zst`);
 
   const result = await createBundle({
     cwd: path.dirname(session.transcriptPath),
@@ -162,6 +167,13 @@ async function buildBundle(
     compressionLevel: ctx.config.zstdLevel,
     ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
   });
+
+  const name = `${bundleBaseName({
+    date,
+    title,
+    sessionId: session.sessionId,
+    contentHash: result.sha256,
+  })}.tar.zst`;
 
   markBundled(
     ctx.db,
@@ -192,6 +204,7 @@ async function publish(
   session: LocalSession,
   bundle: StagedBundle,
   index: IndexResult,
+  previous: SessionRecord | null,
   now: number,
 ): Promise<RemoteFile> {
   const folderPath = [ctx.config.driveRootFolder, session.encodedDir, bundle.year];
@@ -218,6 +231,20 @@ async function publish(
   const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError('the session changed while it was being archived');
+  }
+
+  // A session that has shrunk since it was archived is the signature of
+  // damage, not of normal use: a half-finished delete, a truncated restore, a
+  // filesystem error. Archiving over the good copy is precisely how that
+  // damage would become permanent, so stop and make a person look.
+  if (previous?.verifiedLocalBytes != null && archivedBytes < previous.verifiedLocalBytes) {
+    throw new FatalError(
+      `session ${session.sessionId} shrank from ${String(previous.verifiedLocalBytes)} to ` +
+        `${String(archivedBytes)} bytes since it was archived; refusing to overwrite the archive`,
+      'The copy on Drive is larger than what is on disk. Restore it with ' +
+        '/archive:resume before archiving again, or delete the local files if the ' +
+        'loss was intended.',
+    );
   }
 
   const remote = await uploadWithResume(ctx, {
@@ -265,6 +292,8 @@ async function publish(
   // The state recorded here is what later authorises deleting the local copy.
   // It comes from the stat taken immediately after the bundle was proved to
   // match the disk, so it describes exactly what Drive now holds.
+  const supersededId = previous?.remoteFileId ?? null;
+
   markVerified(
     ctx.db,
     session.sessionId,
@@ -273,9 +302,20 @@ async function publish(
       path: `${folderPath.join('/')}/${bundle.name}`,
       localMtime: Math.trunc(confirmed.mtimeMs),
       localBytes: archivedBytes,
+      bundleSha256: bundle.sha256,
     },
     ctx.clock.now(),
   );
+
+  // Only now, with the replacement verified and recorded, is the previous
+  // bundle safe to retire. Failing to remove it wastes space and loses nothing.
+  if (supersededId !== null && supersededId !== remote.id) {
+    try {
+      await ctx.drive.deleteFile(supersededId, ctx.signal);
+    } catch (err) {
+      ctx.logger.warn('backup.superseded_cleanup_failed', { file_id: supersededId }, err);
+    }
+  }
   return remote;
 }
 

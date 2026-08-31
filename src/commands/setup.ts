@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { openDatabase } from '../adapters/db.ts';
-import { setCleanupPeriodDays } from '../adapters/claude-settings.ts';
+import { competingCleanupSettings, setCleanupPeriodDays } from '../adapters/claude-settings.ts';
 import {
   loginWithDeviceCode,
   loginWithLoopback,
@@ -67,7 +67,20 @@ export async function runSetup(runtime: Runtime, options: SetupOptions = {}): Pr
     steps['signIn'] = 'already signed in';
   }
 
-  // From here on the plugin is the only thing that deletes a transcript.
+  // From here on the plugin is meant to be the only thing that deletes a
+  // transcript. If something outranks the file we write, that is not true, and
+  // the plugin would archive on the assumption of a safety it does not have.
+  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  if (competing.length > 0) {
+    const list = competing.map((entry) => `${entry.file} (${String(entry.value)})`).join(', ');
+    throw new FatalError(
+      `another settings file also sets cleanupPeriodDays: ${list}`,
+      'That file takes precedence over the one this plugin writes, so Claude Code ' +
+        'would keep deleting transcripts on its own schedule. Remove ' +
+        'cleanupPeriodDays from it, then run /archive:setup again.',
+    );
+  }
+
   const settings = await setCleanupPeriodDays(runtime.paths.settingsFile, CLEANUP_PERIOD_DAYS);
   steps['cleanupPeriodDays'] = settings;
   if (settings.changed) {

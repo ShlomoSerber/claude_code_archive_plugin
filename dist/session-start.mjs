@@ -263,6 +263,16 @@ var MIGRATIONS = [
   `
   ALTER TABLE sessions ADD COLUMN verified_local_mtime INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_local_bytes INTEGER;
+  `,
+  // 3 — the hash of the bundle that verification actually passed on.
+  //
+  // `bundle_sha256` describes the most recent bundle *built*, which a failed
+  // upload leaves pointing at bytes Drive never received, while
+  // `remote_file_id` still names the previous good copy. Restore then refuses
+  // a bundle that is perfectly fine. This column is written only by
+  // markVerified, so it always describes the copy Drive holds.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_bundle_sha256 TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;

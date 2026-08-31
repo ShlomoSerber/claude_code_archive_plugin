@@ -120,6 +120,7 @@ export async function extractBundle(args: {
   await tar.extract({
     file: args.bundlePath,
     cwd: args.targetDir,
+    ...(args.signal === undefined ? {} : { signal: args.signal }),
     filter: (entryPath) => {
       if (args.onlySession === undefined) return true;
       if (belongsToSession(entryPath, args.onlySession)) return true;

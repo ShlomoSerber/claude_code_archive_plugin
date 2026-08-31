@@ -64,8 +64,15 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       return existing;
     }
     if (existing !== null) {
-      log.warn('upload.replacing_mismatched_remote', { file_id: existing.id });
-      await ctx.drive.deleteFile(existing.id, ctx.signal);
+      // Refuse rather than replace. This used to delete the remote file and
+      // then upload — permanently, since Drive's DELETE bypasses the
+      // wastebasket — which meant an interrupted upload destroyed the archived
+      // copy and left nothing. Bundle names now carry a hash of their contents,
+      // so a same-name mismatch is a genuine anomaly rather than the ordinary
+      // case of a session that changed.
+      throw new RetryableError(
+        `a different file already exists on Drive as ${args.name}; refusing to replace it`,
+      );
     }
 
     uploadUri = await ctx.drive.startResumableUpload(

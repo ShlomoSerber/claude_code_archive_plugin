@@ -39,6 +39,8 @@ export type SessionRecord = {
    */
   verifiedLocalMtime: number | null;
   verifiedLocalBytes: number | null;
+  /** Hash of the bundle Drive was confirmed to hold. Written only by markVerified. */
+  verifiedBundleSha256: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -69,6 +71,7 @@ type SessionRow = {
   last_local_mtime: number | null;
   verified_local_mtime: number | null;
   verified_local_bytes: number | null;
+  verified_bundle_sha256: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -77,7 +80,7 @@ const SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, g
   started_at, ended_at, message_count, transcript_bytes, transcript_sha256, sidecar_bytes,
   bundle_name, bundle_bytes, bundle_sha256, remote_file_id, remote_path, backed_up_at,
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
-  verified_local_mtime, verified_local_bytes, created_at, updated_at`;
+  verified_local_mtime, verified_local_bytes, verified_bundle_sha256, created_at, updated_at`;
 
 /** The fields extraction knows about. Backup and verification fill the rest. */
 export type SessionUpsert = {
@@ -119,6 +122,8 @@ export function upsertSession(db: Db, session: SessionUpsert, now: number): void
                                    THEN sessions.verified_local_mtime ELSE NULL END,
        verified_local_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                    THEN sessions.verified_local_bytes ELSE NULL END,
+       verified_bundle_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
+                                     THEN sessions.verified_bundle_sha256 ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -214,15 +219,28 @@ export function markVerified(
     /** State of the local files that this Drive copy was made from. */
     localMtime: number | null;
     localBytes: number | null;
+    /** Hash of the bundle Drive was just confirmed to hold. */
+    bundleSha256: string;
   },
   now: number,
 ): void {
   db.prepare(
     `UPDATE sessions
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
-            verified_local_mtime = ?, verified_local_bytes = ?, updated_at = ?
+            verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
+            updated_at = ?
       WHERE session_id = ?`,
-  ).run(remote.fileId, remote.path, now, now, remote.localMtime, remote.localBytes, now, sessionId);
+  ).run(
+    remote.fileId,
+    remote.path,
+    now,
+    now,
+    remote.localMtime,
+    remote.localBytes,
+    remote.bundleSha256,
+    now,
+    sessionId,
+  );
 }
 
 /**
@@ -385,6 +403,7 @@ export function toRecord(row: SessionRow): SessionRecord {
     lastLocalMtime: row.last_local_mtime,
     verifiedLocalMtime: row.verified_local_mtime,
     verifiedLocalBytes: row.verified_local_bytes,
+    verifiedBundleSha256: row.verified_bundle_sha256,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

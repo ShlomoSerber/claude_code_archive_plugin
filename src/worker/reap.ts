@@ -183,7 +183,8 @@ function hasVerifiedState(record: SessionRecord): boolean {
     record.verifiedAt !== null &&
     record.bundleSha256 !== null &&
     record.remoteFileId !== null &&
-    record.verifiedLocalMtime !== null
+    record.verifiedLocalMtime !== null &&
+    record.verifiedBundleSha256 !== null
   );
 }
 
@@ -226,7 +227,12 @@ async function confirmRemote(
     // Deletion is irreversible, so the strong hash is required here even though
     // the upload path is willing to fall back to md5.
     if (remote.sha256 === null) return 'gone';
-    return remote.sha256.toLowerCase() === record.bundleSha256?.toLowerCase() ? 'ok' : 'gone';
+    // Compared against the hash verification actually passed on, not against
+    // bundle_sha256, which a later failed rebuild overwrites with bytes Drive
+    // never received.
+    return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase()
+      ? 'ok'
+      : 'gone';
   } catch (err) {
     // A 4xx is Drive saying the file is not there. Anything else is this run's
     // problem, not the archive's, so leave the row alone and try next time.

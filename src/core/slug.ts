@@ -97,10 +97,32 @@ export function bundleBaseName(args: {
   date: string;
   title: string | null | undefined;
   sessionId: string;
+  /**
+   * Hash of the bundle's bytes. Including a prefix of it makes the remote name
+   * describe the *content*, not the title.
+   *
+   * Without it, re-archiving a session whose content changed produces the same
+   * name as the existing archive, and the only way to store the new bundle is
+   * to destroy the old one first. With it, the two are different files, so a
+   * replacement is uploaded before anything is retired.
+   */
+  contentHash?: string | null;
 }): string {
   const slug = slugifyTitle(args.title ?? '');
-  const base = `${args.date}_${slug}_${shortSessionId(args.sessionId)}`;
-  return sanitizeFileName(base, `${args.date}_session_${shortSessionId(args.sessionId)}`);
+  const short = shortSessionId(args.sessionId);
+  const digest = contentTag(args.contentHash);
+  const base = `${args.date}_${slug}_${short}${digest}`;
+  return sanitizeFileName(base, `${args.date}_session_${short}${digest}`);
+}
+
+/** Eight hex characters of the bundle hash, or nothing when it is unknown. */
+export function contentTag(hash: string | null | undefined): string {
+  if (typeof hash !== 'string') return '';
+  const hex = hash
+    .replace(/[^0-9a-f]/gi, '')
+    .slice(0, 8)
+    .toLowerCase();
+  return hex.length === 8 ? `_${hex}` : '';
 }
 
 /** `YYYY-MM-DD` in UTC. Bundle names must not shift with the user's timezone. */

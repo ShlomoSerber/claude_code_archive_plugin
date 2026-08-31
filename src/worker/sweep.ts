@@ -106,7 +106,7 @@ export async function runSweep(
   const drained = await drain(ctx, deadline, report);
   report.budgetExhausted = drained.budgetExhausted;
 
-  if (!drained.budgetExhausted) {
+  if (!drained.budgetExhausted && clockLooksSane(ctx, startedAt)) {
     report.reap = await reapLocalCopies(ctx, ctx.clock.now());
   }
 
@@ -283,6 +283,32 @@ function noteSuccess(ctx: WorkerContext): void {
   if ((kvGetNumber(ctx.db, KV.circuitFailures) ?? 0) === 0) return;
   kvSetNumber(ctx.db, KV.circuitFailures, 0, now);
   kvSetNumber(ctx.db, KV.circuitUntil, 0, now);
+}
+
+/** A gap larger than this between sweeps means the clock moved, not the calendar. */
+const IMPLAUSIBLE_CLOCK_JUMP_MS = 180 * 24 * 3_600_000;
+
+/**
+ * Every idle test in the reaper is arithmetic on the system clock, so a clock
+ * that jumps forward makes the entire archive look ancient at once — including
+ * sessions open right now, whose heartbeat is measured against the same clock.
+ * A dead battery, a VM snapshot restore or a dual boot is enough.
+ *
+ * Skipping one sweep's reaping costs disk space. Not skipping it costs history.
+ */
+function clockLooksSane(ctx: WorkerContext, now: number): boolean {
+  const last = kvGetNumber(ctx.db, KV.lastSweepAt) ?? 0;
+  if (last === 0) return true;
+  if (now < last) {
+    ctx.logger.warn('sweep.clock_went_backwards', { last_sweep_at: last, now });
+    return false;
+  }
+  if (now - last > IMPLAUSIBLE_CLOCK_JUMP_MS) {
+    // The next sweep, with lastSweepAt refreshed, will reap normally.
+    ctx.logger.warn('sweep.clock_jumped_forward', { last_sweep_at: last, now });
+    return false;
+  }
+  return true;
 }
 
 const CATALOG_REFRESH_MS = 24 * 3_600_000;

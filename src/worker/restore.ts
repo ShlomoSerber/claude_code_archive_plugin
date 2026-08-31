@@ -76,7 +76,7 @@ export async function restoreSession(
     // Unconditional: requireRemote has already refused a row without a hash,
     // so there is no path here that unpacks unverified bytes.
     const actual = await sha256File(staged, ctx.signal);
-    if (actual !== record.bundleSha256) {
+    if (actual !== record.verifiedBundleSha256) {
       throw new RetryableError(
         `the downloaded bundle does not match the catalog hash for ${sessionId}`,
       );
@@ -100,15 +100,13 @@ export async function restoreSession(
       });
     }
 
-    // The transcript hash was recorded at backup time and never read until
-    // now. Comparing it here is what turns it from decoration into a check.
-    if (record.transcriptSha256 !== null) {
-      const restoredHash = await sha256File(path.join(targetDir, `${sessionId}.jsonl`)).catch(
-        () => null,
-      );
-      if (restoredHash !== null && restoredHash !== record.transcriptSha256) {
-        ctx.logger.error('restore.transcript_hash_mismatch', { session_id: sessionId });
-      }
+    // Check what actually landed. Extraction can end short without raising —
+    // a full disk, a quota, a signal — and a truncated transcript left on disk
+    // is worse than none: the next sweep would archive it over the good copy.
+    const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
+    if (problem !== null) {
+      await removePartialRestore(targetDir, sessionId);
+      throw new RetryableError(`the restored session is incomplete: ${problem}`);
     }
 
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
@@ -128,6 +126,41 @@ export async function restoreSession(
   } finally {
     await fsp.rm(staged, { force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Compare what was unpacked against what the catalog says the session was.
+ *
+ * Returns a reason when the restore is incomplete, or null when it is whole.
+ */
+async function describeRestoreProblem(
+  ctx: WorkerContext,
+  record: SessionRecord,
+  targetDir: string,
+  sessionId: string,
+): Promise<string | null> {
+  const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
+  if (restored === null) return 'the transcript is not there';
+
+  if (record.transcriptSha256 !== null) {
+    const hash = await sha256File(path.join(targetDir, `${sessionId}.jsonl`)).catch(() => null);
+    if (hash === null) return 'the transcript could not be read back';
+    if (hash !== record.transcriptSha256) return 'the transcript does not match its recorded hash';
+  }
+
+  const bytes = restored.transcriptBytes + restored.sidecarBytes;
+  if (record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes) {
+    return `${String(bytes)} bytes on disk, ${String(record.verifiedLocalBytes)} expected`;
+  }
+  return null;
+}
+
+/** Remove a half-written restore so nothing downstream mistakes it for data. */
+async function removePartialRestore(targetDir: string, sessionId: string): Promise<void> {
+  await fsp
+    .rm(path.join(targetDir, sessionId), { recursive: true, force: true })
+    .catch(() => undefined);
+  await fsp.rm(path.join(targetDir, `${sessionId}.jsonl`), { force: true }).catch(() => undefined);
 }
 
 async function isDirectory(candidate: string): Promise<boolean> {
@@ -153,9 +186,9 @@ function requireRemote(record: SessionRecord): string {
       'Run /archive:now to finish backing it up, then try again.',
     );
   }
-  if (record.bundleSha256 === null) {
+  if (record.verifiedBundleSha256 === null) {
     throw new FatalError(
-      `session ${record.sessionId} has no stored hash, so a download cannot be checked`,
+      `session ${record.sessionId} has no verified hash, so a download cannot be checked`,
       'Run /archive:now to archive it again, which records the hash.',
     );
   }
@@ -229,9 +262,11 @@ function describeMismatch(
   if (record.bundleBytes !== null && remoteSize !== null && remoteSize !== record.bundleBytes) {
     return `size ${String(remoteSize)} != ${String(record.bundleBytes)}`;
   }
-  if (record.bundleSha256 === null) return 'the catalog has no hash for this bundle';
+  if (record.verifiedBundleSha256 === null) {
+    return 'the catalog has no verified hash for this bundle';
+  }
   if (remoteSha256 === null) return 'Drive returned no checksum';
-  return remoteSha256.toLowerCase() === record.bundleSha256.toLowerCase()
+  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase()
     ? null
     : 'sha256 mismatch';
 }
