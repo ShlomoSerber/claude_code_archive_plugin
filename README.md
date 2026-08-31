@@ -10,6 +10,16 @@ them after 30 days by default. On a machine in daily use that is roughly 20–25
 a year if you keep them, and lost history if you do not. This plugin removes the
 choice: Drive holds everything, the disk holds a cache.
 
+## Install
+
+```bash
+claude plugin marketplace add ShlomoSerber/claude_code_archive_plugin && claude plugin install archive@claude-code-archive && claude "/archive:setup"
+```
+
+Needs [Node.js 22.16 or newer](#requirements). The last step opens your browser
+to sign in to Google, takes over transcript cleanup, and starts archiving the
+sessions you already have.
+
 ## How it works
 
 - **On session close**, a hook queues the session and starts a short-lived
@@ -47,16 +57,28 @@ end wake the worker; when you are not using Claude Code, nothing accumulates.
 - macOS, Windows, or Linux.
 - A Google account.
 
-## Install
+## What setup does
 
-Add the marketplace and install the plugin, then run setup once per machine:
+The one-liner above is three steps, and you can run them separately:
 
+```bash
+claude plugin marketplace add ShlomoSerber/claude_code_archive_plugin
+claude plugin install archive@claude-code-archive
+claude "/archive:setup"
 ```
-/archive:setup
-```
 
-Setup signs you in to Google, sets `cleanupPeriodDays` to 365000 so Claude Code
-stops deleting transcripts, and starts backing up the sessions you already have.
+There is no `git clone` in there on purpose: `marketplace add` clones the
+repository into `~/.claude/plugins/` itself, and a copy you cloned by hand is one
+Claude Code does not know about.
+
+`/archive:setup` signs you in to Google, sets `cleanupPeriodDays` to 365000 so
+Claude Code stops deleting transcripts, and backs up the sessions already on
+disk. On a machine with a year of history that first pass takes a while; it
+stops on a time budget and the next session picks up where it left off.
+
+Run it once per machine. On a machine that has lost its disk, it also pulls the
+catalog back down from Drive, so the whole history is searchable again straight
+away.
 
 ### Google OAuth client
 
