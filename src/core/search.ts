@@ -190,15 +190,35 @@ export function prefilter(
   const terms = parsed.terms;
 
   const rows = selectRows(db, { terms, since, until, project: options.project ?? null, scanLimit });
-  const promptStatement = db.prepare(
-    'SELECT text FROM prompts WHERE session_id = ? ORDER BY seq ASC LIMIT 200',
+  // The prompts a card shows must include the ones the query matched. Loading
+  // the oldest 200 meant a long session could be selected on a recent prompt
+  // and then scored — and shown to the reranker — without it.
+  const matchClause =
+    terms.length > 0
+      ? `AND (${terms.map(() => "text LIKE ? ESCAPE '\\'").join(' OR ')})`
+      : 'AND 1 = 0';
+  const matchedStatement = db.prepare(
+    `SELECT text FROM prompts WHERE session_id = ? ${matchClause} ORDER BY seq ASC LIMIT 120`,
   );
+  const recentStatement = db.prepare(
+    'SELECT text FROM prompts WHERE session_id = ? ORDER BY seq DESC LIMIT 80',
+  );
+  const openingStatement = db.prepare(
+    'SELECT text FROM prompts WHERE session_id = ? ORDER BY seq ASC LIMIT 80',
+  );
+  const termPatterns = terms.map((term) => likeTerm(term));
 
   const candidates = rows.map((row) => {
     const session = toRecord(row);
-    const prompts = (promptStatement.all(session.sessionId) as { text: string }[]).map(
-      (prompt) => prompt.text,
-    );
+    const matched =
+      terms.length > 0
+        ? (matchedStatement.all(session.sessionId, ...termPatterns) as { text: string }[])
+        : [];
+    const opening = openingStatement.all(session.sessionId) as { text: string }[];
+    const recent = recentStatement.all(session.sessionId) as { text: string }[];
+    const prompts = [
+      ...new Set([...matched, ...opening, ...recent].map((prompt) => prompt.text)),
+    ];
     return scoreCandidate(session, prompts, terms);
   });
 

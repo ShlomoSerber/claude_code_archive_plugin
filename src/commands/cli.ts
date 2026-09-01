@@ -48,7 +48,8 @@ search  --since <date>    ISO date lower bound
         --files           Include the files each session touched
         --text            Human-readable instead of JSON
 verify  --all             Check every archived session, not a sample
-status  --quota           Also ask Drive how much space is used`;
+status  --quota           Also ask Drive how much space is used
+        --projects        Also read every known project's .claude/settings.json`;
 
 async function main(): Promise<number> {
   ignoreClosedPipe();
@@ -90,7 +91,11 @@ async function main(): Promise<number> {
           json,
         });
       case 'status':
-        return await runStatus(runtime, { json, quota: values.quota === true });
+        return await runStatus(runtime, {
+          json,
+          quota: values.quota === true,
+          projects: values.projects === true,
+        });
       case 'now':
         return await runNow(runtime, { json });
       case 'search':
@@ -144,6 +149,7 @@ type CommandFlags = {
   all?: boolean;
   files?: boolean;
   quota?: boolean;
+  projects?: boolean;
   limit?: string;
   since?: string;
   until?: string;
@@ -168,6 +174,7 @@ function parseCommandLine(args: string[]): { values: CommandFlags; positionals: 
         all: { type: 'boolean' },
         files: { type: 'boolean' },
         quota: { type: 'boolean' },
+        projects: { type: 'boolean' },
         limit: { type: 'string' },
         since: { type: 'string' },
         until: { type: 'string' },

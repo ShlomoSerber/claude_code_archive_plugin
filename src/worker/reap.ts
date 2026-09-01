@@ -102,6 +102,17 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
     if (onDisk === null) {
+      // Only if it is not simply somewhere else. A project directory renamed
+      // by hand leaves the transcript on disk under a name the catalog has not
+      // caught up with, and recording that as deleted made /archive:status
+      // claim space it had never reclaimed and /archive:resume unpack a second
+      // copy into the directory the user had moved away from.
+      const elsewhere = await findSessionElsewhere(ctx, record);
+      if (elsewhere !== null) {
+        log.info('reap.session_moved', { encoded_dir: elsewhere });
+        report.skipped++;
+        continue;
+      }
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;
     }
@@ -330,6 +341,37 @@ async function confirmRemote(
     ctx.logger.warn('reap.remote_check_failed', { session_id: record.sessionId }, err);
     return 'unavailable';
   }
+}
+
+/**
+ * Is this session's transcript under some other project directory?
+ *
+ * Returns the directory it was found in, or null. Used only to keep the
+ * reaper from calling a moved session a deleted one; the scan corrects the
+ * catalog on its next pass.
+ */
+async function findSessionElsewhere(
+  ctx: WorkerContext,
+  record: SessionRecord,
+): Promise<string | null> {
+  let dirs: string[];
+  try {
+    dirs = await fsp.readdir(ctx.paths.projectsDir);
+  } catch {
+    return null;
+  }
+  for (const dir of dirs) {
+    if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
+    try {
+      const stat = await fsp.lstat(
+        path.join(ctx.paths.projectsDir, dir, `${record.sessionId}.jsonl`),
+      );
+      if (stat.isFile()) return dir;
+    } catch {
+      // Not here; keep looking.
+    }
+  }
+  return null;
 }
 
 /**

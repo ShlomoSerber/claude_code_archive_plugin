@@ -273,6 +273,9 @@ export class FakeDrive implements DriveTransport {
             : sha256,
       md5: this.options.omitSha256 === true ? null : md5,
       trashed: this.options.trashed === true || this.trashedIds.has(file.id),
+      // Drive returns what the uploader stamped. Omitting it here left the
+      // restore path's fallback hash with no coverage at all.
+      appProperties: file.appProperties,
     };
   }
 }

@@ -1558,8 +1558,14 @@ describe('a retired archive is never larger than its replacement', () => {
     fs.rmSync(path.join(renamed, SESSION_B), { recursive: true, force: true });
 
     for (const pass of [1, 2, 3]) {
-      const report = await runSweep(harness.ctx);
-      assert.equal(report.verified, 0, `sweep ${String(pass)} must not archive the remains`);
+      await runSweep(harness.ctx);
+      // The undamaged session in the same directory is re-archived under its
+      // new project, which is correct. The damaged one is not.
+      assert.equal(
+        getSession(harness.ctx.db, SESSION_B)?.remoteFileId,
+        original,
+        `sweep ${String(pass)} must not archive the remains`,
+      );
       assert.equal(harness.drive.trashedIds.has(original), false, `sweep ${String(pass)}`);
       assert.equal(harness.drive.files.has(original), true, `sweep ${String(pass)}`);
       harness.clock.advance(60_000);
@@ -2500,3 +2506,74 @@ function allArchivedRows(db: ReturnType<typeof openDatabase>) {
     .all() as SessionRow[];
   return rows.map(toRecord);
 }
+
+/**
+ * Twenty-second round. Objective 1 held again — ~400 sweep-caused deletions and
+ * ~1 200 retire checks under a Drive throwing at random call depths, with the
+ * worker aborted mid-backup. Objective 2 held for the first time. The finding
+ * was a catalog that disagreed with the disk about where a session lives.
+ */
+describe('a project directory renamed by hand', () => {
+  it('is not mistaken for a session that was deleted', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.localPresent, true);
+
+    const renamed = path.join(harness.ctx.paths.projectsDir, '-home-a-shop-moved');
+    fs.renameSync(harness.projectDir, renamed);
+
+    // A rename changes neither mtime nor size, so nothing else would notice.
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 0);
+    assert.equal(
+      getSession(harness.ctx.db, SESSION_A)?.localPresent,
+      true,
+      'a file that is still on this machine is not recorded as reclaimed',
+    );
+    assert.equal(catalogStats(harness.ctx.db).reclaimedBytes, 0);
+  });
+
+  it('is picked up by the next sweep and re-archived where it now lives', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const renamed = path.join(harness.ctx.paths.projectsDir, '-home-a-shop-moved');
+    fs.renameSync(harness.projectDir, renamed);
+
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.encodedDir, '-home-a-shop-moved');
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt);
+  });
+});
+
+describe('a retained bundle whose hash the catalog lost', () => {
+  it('is checked against the hash the uploader stamped on it', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const kept = listRetainedBundles(harness.ctx.db)[0];
+    assert.ok(kept);
+    // An older catalog recorded no hash for it.
+    harness.ctx.db.prepare('UPDATE retained_bundles SET bundle_sha256 = NULL').run();
+
+    const result = await restoreRetainedBundle(harness.ctx, kept.fileId);
+    assert.ok(result.recoveredTo, 'the stamped hash is enough to check it');
+
+    // And a bundle whose bytes do not match what was stamped is refused.
+    const stored = harness.drive.files.get(kept.fileId);
+    assert.ok(stored);
+    stored.content = Buffer.concat([stored.content, Buffer.from('rot')]);
+    await assert.rejects(() => restoreRetainedBundle(harness.ctx, kept.fileId));
+  });
+});

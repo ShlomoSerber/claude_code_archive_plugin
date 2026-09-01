@@ -47,7 +47,7 @@ function knownProjectDirs(db: ReturnType<Runtime['db']>): string[] {
 
 export async function runStatus(
   runtime: Runtime,
-  options: { json?: boolean; quota?: boolean },
+  options: { json?: boolean; quota?: boolean; projects?: boolean },
 ): Promise<number> {
   const db = runtime.db();
   const now = runtime.clock.now();
@@ -58,7 +58,12 @@ export async function runStatus(
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
-  const competingProjects = await projectCleanupSettings(knownProjectDirs(db));
+  // Off by default. A project_cwd is whatever directory a session was run
+  // from, which routinely includes network shares and removable volumes, and
+  // an open() on a dead NFS mount blocks uninterruptibly — so reading every
+  // one of them to print a status page could hang the command outright.
+  const competingProjects =
+    options.projects === true ? await projectCleanupSettings(knownProjectDirs(db)) : [];
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
@@ -176,6 +181,10 @@ export async function runStatus(
     print(
       `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`,
     );
+  }
+  if (options.projects !== true) {
+    print(`  Project settings:   not checked (pass --projects to read every project's`);
+    print(`                      .claude/settings.json; a dead network mount can hang it)`);
   }
   for (const other of competingProjects) {
     print(`  WARNING:            ${other.file} sets cleanupPeriodDays=${String(other.value)}`);

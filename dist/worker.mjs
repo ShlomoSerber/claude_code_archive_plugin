@@ -6632,6 +6632,12 @@ async function reapLocalCopies(ctx, now) {
       continue;
     }
     if (onDisk === null) {
+      const elsewhere = await findSessionElsewhere(ctx, record);
+      if (elsewhere !== null) {
+        log.info("reap.session_moved", { encoded_dir: elsewhere });
+        report.skipped++;
+        continue;
+      }
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;
     }
@@ -6758,6 +6764,25 @@ async function confirmRemote(ctx, record, report) {
     return "unavailable";
   }
 }
+async function findSessionElsewhere(ctx, record) {
+  let dirs;
+  try {
+    dirs = await fsp11.readdir(ctx.paths.projectsDir);
+  } catch {
+    return null;
+  }
+  for (const dir of dirs) {
+    if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
+    try {
+      const stat = await fsp11.lstat(
+        path14.join(ctx.paths.projectsDir, dir, `${record.sessionId}.jsonl`)
+      );
+      if (stat.isFile()) return dir;
+    } catch {
+    }
+  }
+  return null;
+}
 async function removeLocalCopy(ctx, onDisk, target) {
   const log = ctx.logger.child({ session_id: onDisk.sessionId });
   if (onDisk.hasSidecar) {
@@ -6882,7 +6907,11 @@ async function discover(ctx, now, flags) {
       markLocalPresent(ctx.db, session.sessionId, mtime, now);
     }
     const bytes = session.transcriptBytes + session.sidecarBytes;
-    const needsBackup = known?.verifiedAt == null || known.verifiedLocalMtime !== mtime || known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes;
+    const needsBackup = known?.verifiedAt == null || known.verifiedLocalMtime !== mtime || known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes || // A moved project directory changes neither the transcript's mtime nor
+    // its size, and markLocalPresent does not write encoded_dir — so the
+    // catalog kept pointing at the old directory, the reaper looked there,
+    // found nothing, and recorded a live session as locally deleted.
+    known.encodedDir !== session.encodedDir;
     if (needsBackup) {
       enqueue(
         ctx.db,

@@ -6829,6 +6829,12 @@ async function reapLocalCopies(ctx, now) {
       continue;
     }
     if (onDisk === null) {
+      const elsewhere = await findSessionElsewhere(ctx, record);
+      if (elsewhere !== null) {
+        log.info("reap.session_moved", { encoded_dir: elsewhere });
+        report.skipped++;
+        continue;
+      }
       markLocalDeleted(ctx.db, record.sessionId, now);
       continue;
     }
@@ -6955,6 +6961,25 @@ async function confirmRemote(ctx, record, report) {
     return "unavailable";
   }
 }
+async function findSessionElsewhere(ctx, record) {
+  let dirs;
+  try {
+    dirs = await fsp11.readdir(ctx.paths.projectsDir);
+  } catch {
+    return null;
+  }
+  for (const dir of dirs) {
+    if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
+    try {
+      const stat = await fsp11.lstat(
+        path13.join(ctx.paths.projectsDir, dir, `${record.sessionId}.jsonl`)
+      );
+      if (stat.isFile()) return dir;
+    } catch {
+    }
+  }
+  return null;
+}
 async function removeLocalCopy(ctx, onDisk, target) {
   const log = ctx.logger.child({ session_id: onDisk.sessionId });
   if (onDisk.hasSidecar) {
@@ -7079,7 +7104,11 @@ async function discover(ctx, now, flags) {
       markLocalPresent(ctx.db, session.sessionId, mtime, now);
     }
     const bytes = session.transcriptBytes + session.sidecarBytes;
-    const needsBackup = known?.verifiedAt == null || known.verifiedLocalMtime !== mtime || known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes;
+    const needsBackup = known?.verifiedAt == null || known.verifiedLocalMtime !== mtime || known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes || // A moved project directory changes neither the transcript's mtime nor
+    // its size, and markLocalPresent does not write encoded_dir — so the
+    // catalog kept pointing at the old directory, the reaper looked there,
+    // found nothing, and recorded a live session as locally deleted.
+    known.encodedDir !== session.encodedDir;
     if (needsBackup) {
       enqueue(
         ctx.db,
@@ -7718,14 +7747,25 @@ function prefilter(db, query, now, options = {}) {
   const scanLimit = options.scanLimit ?? 3e3;
   const terms = parsed.terms;
   const rows = selectRows(db, { terms, since, until, project: options.project ?? null, scanLimit });
-  const promptStatement = db.prepare(
-    "SELECT text FROM prompts WHERE session_id = ? ORDER BY seq ASC LIMIT 200"
+  const matchClause = terms.length > 0 ? `AND (${terms.map(() => "text LIKE ? ESCAPE '\\'").join(" OR ")})` : "AND 1 = 0";
+  const matchedStatement = db.prepare(
+    `SELECT text FROM prompts WHERE session_id = ? ${matchClause} ORDER BY seq ASC LIMIT 120`
   );
+  const recentStatement = db.prepare(
+    "SELECT text FROM prompts WHERE session_id = ? ORDER BY seq DESC LIMIT 80"
+  );
+  const openingStatement = db.prepare(
+    "SELECT text FROM prompts WHERE session_id = ? ORDER BY seq ASC LIMIT 80"
+  );
+  const termPatterns = terms.map((term) => likeTerm(term));
   const candidates = rows.map((row) => {
     const session = toRecord(row);
-    const prompts = promptStatement.all(session.sessionId).map(
-      (prompt) => prompt.text
-    );
+    const matched = terms.length > 0 ? matchedStatement.all(session.sessionId, ...termPatterns) : [];
+    const opening = openingStatement.all(session.sessionId);
+    const recent = recentStatement.all(session.sessionId);
+    const prompts = [
+      ...new Set([...matched, ...opening, ...recent].map((prompt) => prompt.text))
+    ];
     return scoreCandidate(session, prompts, terms);
   });
   candidates.sort((a, b2) => {
@@ -8634,7 +8674,7 @@ async function runStatus(runtime, options) {
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
-  const competingProjects = await projectCleanupSettings(knownProjectDirs(db));
+  const competingProjects = options.projects === true ? await projectCleanupSettings(knownProjectDirs(db)) : [];
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
@@ -8730,6 +8770,10 @@ async function runStatus(runtime, options) {
     print(
       `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`
     );
+  }
+  if (options.projects !== true) {
+    print(`  Project settings:   not checked (pass --projects to read every project's`);
+    print(`                      .claude/settings.json; a dead network mount can hang it)`);
   }
   for (const other of competingProjects) {
     print(`  WARNING:            ${other.file} sets cleanupPeriodDays=${String(other.value)}`);
@@ -8888,7 +8932,8 @@ search  --since <date>    ISO date lower bound
         --files           Include the files each session touched
         --text            Human-readable instead of JSON
 verify  --all             Check every archived session, not a sample
-status  --quota           Also ask Drive how much space is used`;
+status  --quota           Also ask Drive how much space is used
+        --projects        Also read every known project's .claude/settings.json`;
 async function main() {
   ignoreClosedPipe();
   const { values, positionals } = parseCommandLine(process.argv.slice(2));
@@ -8924,7 +8969,11 @@ async function main() {
           json
         });
       case "status":
-        return await runStatus(runtime, { json, quota: values.quota === true });
+        return await runStatus(runtime, {
+          json,
+          quota: values.quota === true,
+          projects: values.projects === true
+        });
       case "now":
         return await runNow(runtime, { json });
       case "search":
@@ -8975,6 +9024,7 @@ function parseCommandLine(args) {
         all: { type: "boolean" },
         files: { type: "boolean" },
         quota: { type: "boolean" },
+        projects: { type: "boolean" },
         limit: { type: "string" },
         since: { type: "string" },
         until: { type: "string" },

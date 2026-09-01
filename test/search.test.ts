@@ -224,3 +224,44 @@ describe('a number that is not a date', () => {
     assert.equal(parsed.since, Date.UTC(2026, 7, 1));
   });
 });
+
+describe('a session longer than the prompt window', () => {
+  it('shows the prompt that matched, not only the oldest ones', () => {
+    // The card is what the reranker reads. Loading the oldest 200 prompts
+    // meant a long session could be selected on a recent prompt and then
+    // handed over without it, scored as if nothing had matched.
+    const db = openDatabase(':memory:');
+    upsertSession(
+      db,
+      {
+        sessionId: 'long-one',
+        encodedDir: '-home-a-app',
+        projectCwd: '/home/a/app',
+        title: 'a long conversation',
+        summary: null,
+        gitBranch: null,
+        startedAt: 1,
+        endedAt: 2,
+        messageCount: 900,
+        transcriptBytes: 10,
+        transcriptSha256: null,
+        sidecarBytes: 0,
+        lastLocalMtime: 2,
+      },
+      1,
+    );
+    const prompts = Array.from({ length: 400 }, (_, index) => ({
+      seq: index,
+      ts: null,
+      text: index === 350 ? 'the zstd dictionary experiment' : `routine prompt ${String(index)}`,
+    }));
+    replacePrompts(db, 'long-one', prompts);
+
+    const found = prefilter(db, 'zstd dictionary', 10, { limit: 5 });
+    assert.equal(found.length, 1);
+    assert.ok(
+      found[0]?.matchedPrompts.some((text) => text.includes('zstd dictionary')),
+      'the matching prompt reaches the card',
+    );
+  });
+});

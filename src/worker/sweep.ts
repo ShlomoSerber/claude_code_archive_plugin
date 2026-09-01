@@ -208,7 +208,12 @@ async function discover(
     const needsBackup =
       known?.verifiedAt == null ||
       known.verifiedLocalMtime !== mtime ||
-      (known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes);
+      (known.verifiedLocalBytes !== null && known.verifiedLocalBytes !== bytes) ||
+      // A moved project directory changes neither the transcript's mtime nor
+      // its size, and markLocalPresent does not write encoded_dir — so the
+      // catalog kept pointing at the old directory, the reaper looked there,
+      // found nothing, and recorded a live session as locally deleted.
+      known.encodedDir !== session.encodedDir;
     if (needsBackup) {
       enqueue(
         ctx.db,
