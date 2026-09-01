@@ -9017,7 +9017,9 @@ async function runStatus(runtime, options) {
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
   const catalogUploadedAt = kvGetNumber(db, KV.catalogUploadedAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
-  const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
+  const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(
+    () => null
+  );
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const competingProjects = options.projects === true ? await projectCleanupSettings(knownProjectDirs(db)) : [];
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;

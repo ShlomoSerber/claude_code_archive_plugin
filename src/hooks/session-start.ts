@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { createRuntime } from '../composition.ts';
 import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
 import { isSafeSessionId } from '../core/identifiers.ts';
+import { countJobs } from '../core/queue.ts';
 import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { readCleanupPeriodDays } from '../adapters/claude-settings.ts';
 import { CLEANUP_PERIOD_DAYS, DAY_MS } from '../core/config.ts';
@@ -93,6 +94,22 @@ async function main(): Promise<void> {
 async function warnIfUnconfigured(runtime: Runtime, now: number): Promise<void> {
   const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
   if (now - lastWarned < DAY_MS) return;
+
+  // A refresh token Google has rejected is still a token file, so "signed in"
+  // stays true and this said nothing while every backup blocked on
+  // invalid_grant. An OAuth client in Testing status issues refresh tokens
+  // that expire after seven days, and this plugin ships a shared client id —
+  // so the archive stopping dead a week after install is an ordinary event,
+  // not an exotic one.
+  const queue = countJobs(runtime.db(), now);
+  if (queue.blocked > 0) {
+    kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);
+    emitSystemMessage(
+      `Claude Code Archive has ${String(queue.blocked)} session(s) it cannot back up. ` +
+        'Run /archive:status to see why — a signed-out account is the usual cause.',
+    );
+    return;
+  }
 
   // A token file that cannot be read is a token file that cannot be used, and
   // /archive:status says "not connected" for exactly this. The two readers

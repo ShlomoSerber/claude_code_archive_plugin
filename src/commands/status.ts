@@ -62,7 +62,12 @@ export async function runStatus(
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
   const catalogUploadedAt = kvGetNumber(db, KV.catalogUploadedAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
-  const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
+  // Guarded like competingCleanupSettings beside it: an EACCES settings.json
+  // used to kill the whole status page, which is the one place that explains
+  // every other failure.
+  const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(
+    () => null,
+  );
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   // Off by default. A project_cwd is whatever directory a session was run
   // from, which routinely includes network shares and removable volumes, and

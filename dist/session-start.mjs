@@ -1710,6 +1710,29 @@ function isSafePathSegment(value) {
 }
 var isSafeSessionId = isSafePathSegment;
 
+// src/core/queue.ts
+function countJobs(db, now) {
+  const row = db.prepare(
+    `SELECT
+         count(*) AS total,
+         sum(CASE WHEN blocked = 0 AND not_before <= ? AND visible_at <= ? THEN 1 ELSE 0 END)
+           AS runnable,
+         sum(CASE WHEN blocked = 1 THEN 1 ELSE 0 END) AS blocked,
+         -- attempts >= 1: a job that has failed once has attempts = 1, and
+         -- counting from 2 made every first failure invisible to the status
+         -- report \u2014 including one parked for hours by a Retry-After.
+         sum(CASE WHEN blocked = 0 AND attempts >= 1 AND not_before > ?
+                  THEN 1 ELSE 0 END) AS failing
+       FROM jobs`
+  ).get(now, now, now);
+  return {
+    total: row?.total ?? 0,
+    runnable: row?.runnable ?? 0,
+    blocked: row?.blocked ?? 0,
+    failing: row?.failing ?? 0
+  };
+}
+
 // src/core/state-keys.ts
 var KV = {
   /** No network work before this timestamp. */
@@ -2140,6 +2163,14 @@ async function main() {
 async function warnIfUnconfigured(runtime, now) {
   const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
   if (now - lastWarned < DAY_MS) return;
+  const queue = countJobs(runtime.db(), now);
+  if (queue.blocked > 0) {
+    kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);
+    emitSystemMessage(
+      `Claude Code Archive has ${String(queue.blocked)} session(s) it cannot back up. Run /archive:status to see why \u2014 a signed-out account is the usual cause.`
+    );
+    return;
+  }
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => void 0);
   const owned = cleanup === void 0 || cleanup === CLEANUP_PERIOD_DAYS;

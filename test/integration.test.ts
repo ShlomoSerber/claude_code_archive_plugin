@@ -28,6 +28,7 @@ import {
 } from '../src/core/config.ts';
 import { FatalError, RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
+import { CLEANUP_PERIOD_DAYS } from '../src/core/config.ts';
 import {
   block,
   claim,
@@ -3131,5 +3132,55 @@ describe('a session Claude Code still has open', () => {
       const id = `dddddddd-0000-0000-0000-${String(index).padStart(12, '0')}`;
       assert.equal(fs.existsSync(harness.transcriptOf(id)), true, 'and the open ones are kept');
     }
+  });
+});
+
+describe('an account whose token Google has rejected', () => {
+  it('is reported in the session, not only in a status command nobody ran', () => {
+    // A refresh token Google refuses is still a token file on disk, so
+    // "signed in" stays true. An OAuth client in Testing status issues refresh
+    // tokens that expire after seven days, so the archive stopping dead a week
+    // after install is ordinary, and until now nothing said a word about it.
+    const home = tempDir();
+    const dataDir = path.join(home, 'data');
+    fs.mkdirSync(path.join(home, '.claude', 'projects'), { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dataDir, 'tokens.json'),
+      JSON.stringify({
+        refreshToken: 'stale',
+        accessToken: 'x',
+        expiresAt: 0,
+        scope: '',
+        obtainedAt: 0,
+      }),
+    );
+    fs.writeFileSync(
+      path.join(home, '.claude', 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: CLEANUP_PERIOD_DAYS }),
+    );
+    const db = openDatabase(path.join(dataDir, 'archive.sqlite'));
+    const id = enqueue(db, { kind: 'backup', sessionId: SESSION_A }, 1000);
+    const job = claim(db, 1000, 60_000)!;
+    block(db, job, { error: 'Google rejected the refresh token', now: 1000 });
+    assert.equal(getJob(db, id)?.blocked, true);
+    db.close();
+
+    const result = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', '--no-warnings', path.resolve('src/hooks/session-start.ts')],
+      {
+        input: JSON.stringify({ session_id: SESSION_A, source: 'startup' }),
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+          ARCHIVE_DATA_DIR: dataDir,
+        },
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /cannot back up/);
+    assert.match(result.stdout, /archive:status/);
   });
 });
