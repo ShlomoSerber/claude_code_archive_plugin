@@ -1724,10 +1724,13 @@ function enqueue(db, args, now) {
          -- /archive:now appeared to have done nothing.
          visible_at  = CASE WHEN ? THEN 0 ELSE jobs.visible_at END,
          claim_token = NULL,
-         -- New work means a new bundle. A URI opened for the previous one would
-         -- otherwise be resumed against different bytes, and the "already
-         -- complete" answer would hand back the wrong file.
-         upload_uri  = NULL,
+         -- The URI is kept. It is stored tagged with the hash of the bundle it
+         -- was opened for, and uploadWithResume discards it when the rebuilt
+         -- bundle differs \u2014 so nothing can be resumed against the wrong bytes.
+         -- Nulling it here meant every sweep re-enqueued a session with an
+         -- upload in flight and destroyed its resume point, so a large bundle
+         -- on a link that drops mid-transfer restarted from zero for ever and
+         -- was never archived.
          updated_at  = excluded.updated_at
        RETURNING id`
   ).get(

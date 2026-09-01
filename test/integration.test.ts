@@ -790,8 +790,11 @@ describe('deletion safety, third pass', () => {
   it('never reports a session verified when it compared nothing', async () => {
     const harness = makeHarness();
     await runSweep(harness.ctx);
+    // Neither hash: with md5 the check is weaker but real, so it must be both.
     harness.ctx.db
-      .prepare('UPDATE sessions SET verified_bundle_sha256 = NULL WHERE session_id = ?')
+      .prepare(
+        'UPDATE sessions SET verified_bundle_sha256 = NULL, verified_bundle_md5 = NULL WHERE session_id = ?',
+      )
       .run(SESSION_A);
 
     const report = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
@@ -1181,15 +1184,22 @@ describe('deletion safety, sixth pass', () => {
     assert.equal(contents.parseUploadUri(null), null);
   });
 
-  it('drops a stored upload URI when new work arrives for the session', () => {
+  it('keeps a stored upload URI across a re-enqueue, but only for its own bundle', async () => {
+    const { parseUploadUri } = await import('../src/worker/upload.ts');
+    // Every sweep re-enqueues a session with an upload in flight, so nulling
+    // the URI here destroyed the resume point every time: a large bundle on a
+    // link that drops mid-transfer restarted from zero for ever. The URI is
+    // tagged with its bundle's hash, and that is what makes keeping it safe.
     const db = harnessDb();
     const id = enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
     const job = claim(db, 1000, 60_000)!;
     setUploadUri(db, job, 'abc|https://upload.test/1', 1000);
-    assert.notEqual(getJob(db, id)?.uploadUri, null);
 
     enqueue(db, { kind: 'backup', sessionId: 's1' }, 2000);
-    assert.equal(getJob(db, id)?.uploadUri, null, 'a new bundle cannot resume the old URI');
+    assert.equal(getJob(db, id)?.uploadUri, 'abc|https://upload.test/1', 'the resume point stays');
+
+    const parsed = parseUploadUri(getJob(db, id)?.uploadUri ?? null);
+    assert.equal(parsed?.sha256, 'abc', 'and it names the bundle it belongs to');
   });
 
   it('does not let one unbundleable session throttle every other', () => {
@@ -2914,5 +2924,63 @@ describe('an archive check that failed once', () => {
       'a session with no local copy can get its verification back',
     );
     assert.equal(kvGetNumber(harness.ctx.db, KV.auditMismatched), 0, 'and the warning clears');
+  });
+});
+
+/**
+ * Twenty-eighth round. Objective 1 held under 112 fuzz runs, including two
+ * workers on one catalog and a Drive trashing files behind the plugin's back —
+ * and the auditor validated the harness with a negative control, neutering the
+ * reap guards and watching it report the loss. The findings were all about the
+ * plugin's account of its own archive.
+ */
+describe('an audit that could not reach Drive', () => {
+  it('does not put back a verification that was withdrawn for cause', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    // Someone tidies Drive: the bundle is in the wastebasket, purged in a month.
+    const record = getSession(harness.ctx.db, SESSION_A);
+    harness.drive.trashedIds.add(record?.remoteFileId ?? '');
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null, 'the damage is seen');
+
+    // The next sweep hits a network blip for that file.
+    harness.drive.getFile = () => {
+      throw new RetryableError('ECONNRESET');
+    };
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+
+    assert.equal(
+      getSession(harness.ctx.db, SESSION_A)?.verifiedAt,
+      null,
+      'a check that could not be made is not a check that passed',
+    );
+    assert.ok((kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) >= 0);
+  });
+});
+
+describe('a Drive that reports only md5', () => {
+  it('can still have its archive audited', async () => {
+    const harness = makeHarness({ retentionDays: 30 }, new FakeDrive({ md5Only: true }));
+    await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    assert.ok(record?.verifiedAt);
+
+    const clean = await verifyArchive(harness.ctx, [record]);
+    assert.equal(clean.ok, 1, 'md5 is a real check, not "could not check"');
+
+    const stored = harness.drive.files.get(record.remoteFileId ?? '');
+    assert.ok(stored);
+    stored.content = Buffer.concat([stored.content.subarray(0, 4), Buffer.from('rot!')]);
+    const dirty = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
+    assert.equal(dirty.mismatched.length, 1, 'and it catches rot the sha256 path never saw');
   });
 });

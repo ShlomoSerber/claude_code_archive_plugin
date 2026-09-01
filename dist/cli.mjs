@@ -2720,10 +2720,13 @@ function enqueue(db, args, now) {
          -- /archive:now appeared to have done nothing.
          visible_at  = CASE WHEN ? THEN 0 ELSE jobs.visible_at END,
          claim_token = NULL,
-         -- New work means a new bundle. A URI opened for the previous one would
-         -- otherwise be resumed against different bytes, and the "already
-         -- complete" answer would hand back the wrong file.
-         upload_uri  = NULL,
+         -- The URI is kept. It is stored tagged with the hash of the bundle it
+         -- was opened for, and uploadWithResume discards it when the rebuilt
+         -- bundle differs \u2014 so nothing can be resumed against the wrong bytes.
+         -- Nulling it here meant every sweep re-enqueued a session with an
+         -- upload in flight and destroyed its resume point, so a large bundle
+         -- on a link that drops mid-transfer restarted from zero for ever and
+         -- was never archived.
          updated_at  = excluded.updated_at
        RETURNING id`
   ).get(
@@ -7526,7 +7529,14 @@ function compareHash(remote, recorded) {
   return remote.toLowerCase() === recorded.toLowerCase() ? "matches" : "differs";
 }
 async function verifyArchive(ctx, records) {
-  const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
+  const report = {
+    checked: 0,
+    ok: 0,
+    okIds: [],
+    mismatched: [],
+    missing: [],
+    unchecked: []
+  };
   for (const record of records) {
     ctx.signal?.throwIfAborted();
     if (record.remoteFileId === null) {
@@ -7536,7 +7546,8 @@ async function verifyArchive(ctx, records) {
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      if (remote.trashed !== true && remote.sha256 === null) {
+      const canCheck = remote.sha256 !== null || remote.md5 !== null && record.verifiedBundleMd5 !== null;
+      if (remote.trashed !== true && !canCheck) {
         report.checked--;
         report.unchecked.push({
           sessionId: record.sessionId,
@@ -7544,9 +7555,10 @@ async function verifyArchive(ctx, records) {
         });
         continue;
       }
-      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
+      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256, remote.md5);
       if (reason === null) {
         report.ok++;
+        report.okIds.push(record.sessionId);
       } else {
         clearVerification(ctx.db, record.sessionId, ctx.clock.now());
         report.mismatched.push({
@@ -7567,16 +7579,21 @@ async function verifyArchive(ctx, records) {
   }
   return report;
 }
-function describeMismatch(record, remoteSize, remoteSha256) {
+function describeMismatch(record, remoteSize, remoteSha256, remoteMd5) {
   const expectedBytes = record.verifiedBundleBytes;
   if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
     return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
   }
+  if (remoteSha256 !== null && record.verifiedBundleSha256 !== null) {
+    return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase() ? null : "sha256 mismatch";
+  }
+  if (remoteMd5 !== null && record.verifiedBundleMd5 !== null) {
+    return remoteMd5.toLowerCase() === record.verifiedBundleMd5.toLowerCase() ? null : "md5 mismatch";
+  }
   if (record.verifiedBundleSha256 === null) {
     return "the catalog has no verified hash for this bundle";
   }
-  if (remoteSha256 === null) return "Drive returned no checksum";
-  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase() ? null : "sha256 mismatch";
+  return "Drive returned no checksum";
 }
 
 // src/worker/sweep.ts
@@ -7619,7 +7636,12 @@ async function runSweep(ctx, options = {}) {
     report.durationMs = ctx.clock.now() - startedAt;
     return report;
   }
-  const removed = await removePartials(ctx.paths.stagingDir, ctx.clock.now());
+  const removed = [
+    ...await removePartials(ctx.paths.stagingDir, ctx.clock.now()),
+    // A restore downloads into its own directory; a killed one left the
+    // partial file there with nothing to clean it up.
+    ...await removePartials(ctx.paths.restoreDir, ctx.clock.now())
+  ];
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
   const revived = unblockStale(ctx.db, startedAt, BLOCK_RETRY_MS);
   if (revived > 0) ctx.logger.info("sweep.unblocked_stale", { count: revived });
@@ -7853,10 +7875,7 @@ async function auditReaped(ctx) {
     records.map((record) => record.sessionId),
     at2
   );
-  const bad = new Set(report.mismatched.map((item) => item.sessionId));
-  for (const record of records) {
-    if (!bad.has(record.sessionId)) restoreVerification(ctx.db, record.sessionId, at2);
-  }
+  for (const sessionId of report.okIds) restoreVerification(ctx.db, sessionId, at2);
   if (report.mismatched.length > 0) {
     ctx.logger.error("sweep.archive_damaged", {
       count: report.mismatched.length,

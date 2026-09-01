@@ -130,7 +130,12 @@ export async function runSweep(
   }
 
   // An interrupted bundle is never resumed, only rebuilt.
-  const removed = await removePartials(ctx.paths.stagingDir, ctx.clock.now());
+  const removed = [
+    ...(await removePartials(ctx.paths.stagingDir, ctx.clock.now())),
+    // A restore downloads into its own directory; a killed one left the
+    // partial file there with nothing to clean it up.
+    ...(await removePartials(ctx.paths.restoreDir, ctx.clock.now())),
+  ];
   if (removed.length > 0) ctx.logger.info('sweep.removed_partials', { count: removed.length });
 
   // A job parked by something transient — a rate limit, a full disk since
@@ -461,13 +466,11 @@ async function auditReaped(ctx: WorkerContext): Promise<number> {
     records.map((record) => record.sessionId),
     at,
   );
-  // A session that passes now gets its verification back. Drive answers badly
-  // for all sorts of transient reasons, and a withdrawn verification is
-  // otherwise permanent for a session with no local copy to re-archive.
-  const bad = new Set(report.mismatched.map((item) => item.sessionId));
-  for (const record of records) {
-    if (!bad.has(record.sessionId)) restoreVerification(ctx.db, record.sessionId, at);
-  }
+  // Only the sessions that actually passed. "Not in the mismatched list"
+  // also covers the ones Drive would not answer for — so a bundle the audit
+  // had proved bad got its verification back on the next sweep that hit a
+  // network blip, and the only warning about it cleared with it.
+  for (const sessionId of report.okIds) restoreVerification(ctx.db, sessionId, at);
   if (report.mismatched.length > 0) {
     ctx.logger.error('sweep.archive_damaged', {
       count: report.mismatched.length,

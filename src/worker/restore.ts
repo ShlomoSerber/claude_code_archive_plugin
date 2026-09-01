@@ -461,6 +461,8 @@ export type VerifyReport = {
   checked: number;
   ok: number;
   mismatched: { sessionId: string; reason: string; localDeleted: boolean }[];
+  /** The sessions that actually passed. "Not mismatched" is not the same set. */
+  okIds: string[];
   missing: string[];
   /** Rows Drive could not be asked about. Not a verdict, and not a failure. */
   unchecked: { sessionId: string; reason: string }[];
@@ -536,7 +538,8 @@ export async function verifyArchive(
   ctx: WorkerContext,
   records: SessionRecord[],
 ): Promise<VerifyReport> {
-  const report: VerifyReport = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
+  const report: VerifyReport = { checked: 0, ok: 0,
+    okIds: [], mismatched: [], missing: [], unchecked: [] };
   for (const record of records) {
     ctx.signal?.throwIfAborted();
     if (record.remoteFileId === null) {
@@ -546,7 +549,9 @@ export async function verifyArchive(
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      if (remote.trashed !== true && remote.sha256 === null) {
+      const canCheck =
+        remote.sha256 !== null || (remote.md5 !== null && record.verifiedBundleMd5 !== null);
+      if (remote.trashed !== true && !canCheck) {
         // Drive computes checksums asynchronously and sometimes answers without
         // one. That is "I could not check", the same class as a network
         // failure — not a mismatch, and certainly not grounds for withdrawing
@@ -561,9 +566,10 @@ export async function verifyArchive(
       const reason =
         remote.trashed === true
           ? 'the bundle is in the Drive wastebasket and will be purged'
-          : describeMismatch(record, remote.size, remote.sha256);
+          : describeMismatch(record, remote.size, remote.sha256, remote.md5);
       if (reason === null) {
         report.ok++;
+        report.okIds.push(record.sessionId);
       } else {
         // Drive answered, and its answer was bad. Withdrawing verification is
         // what stops the reaper deleting a local copy against a bundle Drive
@@ -596,16 +602,28 @@ function describeMismatch(
   record: SessionRecord,
   remoteSize: number | null,
   remoteSha256: string | null,
+  remoteMd5: string | null,
 ): string | null {
   const expectedBytes = record.verifiedBundleBytes;
   if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
     return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
   }
+  if (remoteSha256 !== null && record.verifiedBundleSha256 !== null) {
+    return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase()
+      ? null
+      : 'sha256 mismatch';
+  }
+  // The reaper already falls back to md5, because a Drive that answers with
+  // md5 alone would otherwise never let anything be reclaimed. Without the
+  // same fallback here, exactly those archives could be deleted locally and
+  // then never checked again, however badly they rotted.
+  if (remoteMd5 !== null && record.verifiedBundleMd5 !== null) {
+    return remoteMd5.toLowerCase() === record.verifiedBundleMd5.toLowerCase()
+      ? null
+      : 'md5 mismatch';
+  }
   if (record.verifiedBundleSha256 === null) {
     return 'the catalog has no verified hash for this bundle';
   }
-  if (remoteSha256 === null) return 'Drive returned no checksum';
-  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase()
-    ? null
-    : 'sha256 mismatch';
+  return 'Drive returned no checksum';
 }
