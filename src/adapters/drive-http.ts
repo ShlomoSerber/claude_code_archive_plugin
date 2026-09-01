@@ -493,5 +493,9 @@ function isRateLimited(body: unknown): boolean {
 
 function isQuotaExhausted(body: unknown): boolean {
   const text = JSON.stringify(body ?? '');
+  // A bare `quotaExceeded` is how some Google APIs label a *rate* limit, so it
+  // only counts as a full Drive when nothing says otherwise. Reading "slow
+  // down" as "your Drive is full" parked the job with advice nobody can act on.
+  if (isRateLimited(body)) return false;
   return text.includes('storageQuotaExceeded') || text.includes('quotaExceeded');
 }

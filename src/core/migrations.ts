@@ -169,6 +169,16 @@ export const MIGRATIONS: readonly string[] = [
 
   CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
   `,
+
+  // 8 — when a job was parked.
+  //
+  // unblockStale matched on updated_at, and every sweep's rescan re-enqueues
+  // each unarchived session, which refreshes updated_at on the blocked row.
+  // So for anyone who opens Claude Code daily the retry could never fire: a
+  // session parked by one transient failure was never archived again.
+  `
+  ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

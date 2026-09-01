@@ -345,6 +345,15 @@ var MIGRATIONS = [
   ) STRICT;
 
   CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
+  `,
+  // 8 — when a job was parked.
+  //
+  // unblockStale matched on updated_at, and every sweep's rescan re-enqueues
+  // each unarchived session, which refreshes updated_at on the blocked row.
+  // So for anyone who opens Claude Code daily the retry could never fire: a
+  // session parked by one transient failure was never archived again.
+  `
+  ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1348,6 +1357,7 @@ function isRateLimited(body) {
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
+  if (isRateLimited(body)) return false;
   return text.includes("storageQuotaExceeded") || text.includes("quotaExceeded");
 }
 
@@ -1794,6 +1804,12 @@ function emitSystemMessage(message) {
 // src/hooks/last-resort.ts
 import fs5 from "node:fs";
 import path8 from "node:path";
+function clearLastResort() {
+  try {
+    fs5.rmSync(path8.join(resolvePaths(process.env).dataDir, "hook-error.json"), { force: true });
+  } catch {
+  }
+}
 function logLastResort(event, err) {
   try {
     const paths = resolvePaths(process.env);
@@ -2040,6 +2056,7 @@ function workerPath() {
 }
 try {
   await main();
+  clearLastResort();
 } catch (err) {
   logLastResort("hook.session_start_failed", err);
 }

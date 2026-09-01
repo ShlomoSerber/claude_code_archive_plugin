@@ -105,6 +105,7 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
          not_before  = CASE WHEN ? THEN excluded.not_before
                             ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         blocked_at  = CASE WHEN ? THEN NULL ELSE jobs.blocked_at END,
          -- A block leaves the claim's visibility timeout in place, so without this
          -- an unblocked job stayed invisible for up to fifteen minutes and
          -- /archive:now appeared to have done nothing.
@@ -126,6 +127,7 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
       now,
       now,
       args.runNow === true ? 1 : 0,
+      args.unblock === true ? 1 : 0,
       args.unblock === true ? 1 : 0,
       args.unblock === true ? 1 : 0,
     ) as { id: number } | undefined;
@@ -211,9 +213,9 @@ export function retryLater(db: Db, job: Job, args: { at: number; error: string }
 export function block(db: Db, job: Job, args: { error: string; now: number }): void {
   db.prepare(
     `UPDATE jobs
-        SET blocked = 1, claim_token = NULL, last_error = ?, updated_at = ?
+        SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
       WHERE id = ?`,
-  ).run(args.error, args.now, job.id);
+  ).run(args.now, args.error, args.now, job.id);
 }
 
 /**
@@ -228,8 +230,9 @@ export function block(db: Db, job: Job, args: { error: string; now: number }): v
 export function unblockStale(db: Db, now: number, olderThanMs: number): number {
   const result = db
     .prepare(
-      `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
-        WHERE blocked = 1 AND updated_at <= ?`,
+      `UPDATE jobs SET blocked = 0, blocked_at = NULL, visible_at = 0,
+              not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND COALESCE(blocked_at, updated_at) <= ?`,
     )
     .run(now, now, now - olderThanMs);
   return Number(result.changes);

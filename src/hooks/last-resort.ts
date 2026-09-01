@@ -12,6 +12,15 @@ import { resolvePaths } from '../core/paths.ts';
  * produced a hook that did nothing, said nothing, and left no log file at all.
  * This path depends on no database, no config and no runtime object.
  */
+/** Clear the marker after a run that worked, so the warning is never stale. */
+export function clearLastResort(): void {
+  try {
+    fs.rmSync(path.join(resolvePaths(process.env).dataDir, 'hook-error.json'), { force: true });
+  } catch {
+    // Nothing to do; the marker carries its own timestamp.
+  }
+}
+
 export function logLastResort(event: string, err: unknown): void {
   try {
     const paths = resolvePaths(process.env);

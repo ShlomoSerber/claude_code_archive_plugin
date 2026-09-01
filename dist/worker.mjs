@@ -494,6 +494,15 @@ var MIGRATIONS = [
   ) STRICT;
 
   CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
+  `,
+  // 8 — when a job was parked.
+  //
+  // unblockStale matched on updated_at, and every sweep's rescan re-enqueues
+  // each unarchived session, which refreshes updated_at on the blocked row.
+  // So for anyone who opens Claude Code daily the retry could never fire: a
+  // session parked by one transient failure was never archived again.
+  `
+  ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1562,6 +1571,7 @@ function isRateLimited(body) {
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
+  if (isRateLimited(body)) return false;
   return text.includes("storageQuotaExceeded") || text.includes("quotaExceeded");
 }
 
@@ -2471,6 +2481,7 @@ function enqueue(db, args, now) {
          not_before  = CASE WHEN ? THEN excluded.not_before
                             ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         blocked_at  = CASE WHEN ? THEN NULL ELSE jobs.blocked_at END,
          -- A block leaves the claim's visibility timeout in place, so without this
          -- an unblocked job stayed invisible for up to fifteen minutes and
          -- /archive:now appeared to have done nothing.
@@ -2491,6 +2502,7 @@ function enqueue(db, args, now) {
     now,
     now,
     args.runNow === true ? 1 : 0,
+    args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0
   );
@@ -2534,14 +2546,15 @@ function retryLater(db, job, args) {
 function block(db, job, args) {
   db.prepare(
     `UPDATE jobs
-        SET blocked = 1, claim_token = NULL, last_error = ?, updated_at = ?
+        SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
       WHERE id = ?`
-  ).run(args.error, args.now, job.id);
+  ).run(args.now, args.error, args.now, job.id);
 }
 function unblockStale(db, now, olderThanMs) {
   const result = db.prepare(
-    `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
-        WHERE blocked = 1 AND updated_at <= ?`
+    `UPDATE jobs SET blocked = 0, blocked_at = NULL, visible_at = 0,
+              not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND COALESCE(blocked_at, updated_at) <= ?`
   ).run(now, now, now - olderThanMs);
   return Number(result.changes);
 }
@@ -6538,8 +6551,12 @@ function describeShrink(previous, now) {
   return complaints.length === 0 ? null : complaints.join("; ");
 }
 function compareChecksums(remote, bundle) {
-  if (remote.size !== null && remote.size !== bundle.bytes) {
-    return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
+  const sizeProblem = remote.size !== null && remote.size !== bundle.bytes ? `size ${String(remote.size)} != ${String(bundle.bytes)}` : null;
+  if (sizeProblem !== null && remote.sha256 === null && remote.md5 === null) return sizeProblem;
+  if (sizeProblem !== null) {
+    const hashAgrees = remote.sha256 !== null && remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() || remote.md5 !== null && remote.md5.toLowerCase() === bundle.md5.toLowerCase();
+    if (!hashAgrees) return sizeProblem;
+    return null;
   }
   if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {

@@ -8,7 +8,7 @@ import { isSafeSessionId } from '../core/identifiers.ts';
 import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
-import { logLastResort } from './last-resort.ts';
+import { clearLastResort, logLastResort } from './last-resort.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
 import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
 import { resolvePaths } from '../core/paths.ts';
@@ -81,6 +81,8 @@ function workerPath(): string {
 
 try {
   await main();
+  // A run that finished means the last failure is history, not the state.
+  clearLastResort();
 } catch (err) {
   // Never let a hook disturb a session that is just starting — but never
   // silently: see last-resort.ts.

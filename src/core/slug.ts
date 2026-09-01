@@ -164,4 +164,3 @@ export function truncateUtf8(input: string, maxBytes: number): string {
   }
   return out;
 }
-

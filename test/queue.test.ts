@@ -23,6 +23,7 @@ import {
   parsePayload,
   retryLater,
   setUploadUri,
+  unblockStale,
 } from '../src/core/queue.ts';
 import { SCHEMA_VERSION } from '../src/core/migrations.ts';
 import { MAX_RETRY_AFTER_MS, nextAttemptAt } from '../src/core/backoff.ts';
@@ -300,5 +301,37 @@ describe('a server that asks for an unreasonable wait', () => {
     const job = claim(db, 1_000, 60_000)!;
     retryLater(db, job, { at: 500_000, error: 'rate limited' });
     assert.equal(countJobs(db, 2_000).failing, 1, 'the first failure was invisible');
+  });
+});
+
+describe('a job parked while the user keeps working', () => {
+  it('is still retried a day later, even though every sweep re-enqueues it', () => {
+    // unblockStale used to match on updated_at, which the sweep's rescan
+    // refreshes on every pass — so for anyone who opens Claude Code daily the
+    // automatic retry could never fire, and a session parked by one transient
+    // failure was never archived again.
+    const db = openDatabase(':memory:');
+    const day = 24 * 60 * 60_000;
+    const at = 1_000_000_000;
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, at);
+    const job = claim(db, at, 60_000)!;
+    block(db, job, { error: 'Drive is full', now: at });
+
+    // Four sweeps a day for two days, each rescan re-enqueueing the session.
+    for (let tick = 1; tick <= 8; tick++) {
+      enqueue(db, { kind: 'backup', sessionId: 's1' }, at + tick * (day / 4));
+    }
+    assert.equal(unblockStale(db, at + day + 1, day), 1, 'the block is a day old');
+    assert.equal(getJob(db, job.id)?.blocked, false);
+  });
+
+  it('leaves a fresh block alone', () => {
+    const db = openDatabase(':memory:');
+    const at = 1_000_000_000;
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, at);
+    const job = claim(db, at, 60_000)!;
+    block(db, job, { error: 'Drive is full', now: at });
+    assert.equal(unblockStale(db, at + 60_000, 24 * 60 * 60_000), 0);
+    assert.equal(getJob(db, job.id)?.blocked, true);
   });
 });

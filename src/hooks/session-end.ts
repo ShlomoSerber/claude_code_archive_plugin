@@ -10,7 +10,7 @@ import { kvDelete, kvSetNumber } from '../adapters/db.ts';
 import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
-import { logLastResort } from './last-resort.ts';
+import { clearLastResort, logLastResort } from './last-resort.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
 import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
 import { resolvePaths } from '../core/paths.ts';
@@ -107,6 +107,8 @@ function workerPath(): string {
 
 try {
   await main();
+  // A run that finished means the last failure is history, not the state.
+  clearLastResort();
 } catch (err) {
   // Swallowed on purpose — the session must not care — but never silently:
   // this writes with node:fs alone, so it still works when the catalog is

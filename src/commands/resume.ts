@@ -1,5 +1,5 @@
 import { prefilter } from '../core/search.ts';
-import { restoreSession, resumeCommand } from '../worker/restore.ts';
+import { restoreRetainedBundle, restoreSession, resumeCommand } from '../worker/restore.ts';
 import type { Runtime } from '../composition.ts';
 import { commandContext } from './context.ts';
 import { print, printJson } from './output.ts';
@@ -16,11 +16,24 @@ export type ResumeOptions = {
   query: string;
   limit?: number;
   json?: boolean;
+  /** Drive file id of a bundle /archive:status listed as kept, not replaced. */
+  bundle?: string | null;
 };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function runResume(runtime: Runtime, options: ResumeOptions): Promise<number> {
+  if (typeof options.bundle === 'string' && options.bundle.length > 0) {
+    const ctx = commandContext(runtime);
+    const result = await restoreRetainedBundle(ctx, options.bundle);
+    if (options.json !== false) {
+      printJson({ action: 'restored-retained', ...result });
+      return 0;
+    }
+    print(`Unpacked the kept bundle into ${result.recoveredTo ?? ''}`);
+    print('It sits beside the session; nothing was overwritten.');
+    return 0;
+  }
   const query = options.query.trim();
   const sessionId = resolveSessionId(runtime, query);
 

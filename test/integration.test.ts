@@ -36,7 +36,7 @@ import {
 } from '../src/core/queue.ts';
 import { catalogFileName, machineId, runSweep } from '../src/worker/sweep.ts';
 import { importCatalogFile } from '../src/commands/setup.ts';
-import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
+import { restoreRetainedBundle, restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
@@ -2378,5 +2378,41 @@ describe('a worker that never starts', () => {
     // queued a job for ever, and gave no other signal.
     assert.equal(started, false);
     assert.deepEqual(logged, ['worker.missing']);
+  });
+});
+
+describe('a bundle the plugin kept', () => {
+  it('can be unpacked beside its session', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+
+    // The archived subagent transcript is replaced by a larger, different file,
+    // so containment cannot be proved and the old bundle is kept.
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const kept = listRetainedBundles(harness.ctx.db);
+    assert.equal(kept.length, 1);
+
+    // Until now nothing could retrieve it: remote_file_id had moved on, and
+    // restore only ever downloads what remote_file_id names.
+    const result = await restoreRetainedBundle(harness.ctx, kept[0]?.fileId ?? '');
+    assert.ok(result.recoveredTo);
+    const recovered = path.join(result.recoveredTo, SESSION_B, 'agent-1.jsonl');
+    assert.equal(fs.existsSync(recovered), true, 'the file only that bundle held is back');
+    assert.equal(
+      fs.existsSync(path.join(harness.projectDir, `${SESSION_B}.jsonl`)),
+      true,
+      'and the live session is untouched',
+    );
   });
 });

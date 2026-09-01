@@ -1,5 +1,5 @@
 import { getFiles } from '../core/catalog.ts';
-import { prefilter, type Candidate } from '../core/search.ts';
+import { prefilter, prefilterTruncated, type Candidate } from '../core/search.ts';
 import type { Runtime } from '../composition.ts';
 import { formatDate, print, printJson, snippet } from './output.ts';
 
@@ -36,6 +36,13 @@ export function runSearch(runtime: Runtime, options: SearchOptions): number {
     printJson({
       query: options.query,
       count: candidates.length,
+      // The scan orders by recency, so a truncated one hides older matches.
+      // Saying so lets the reranker narrow the window rather than reword.
+      truncated: prefilterTruncated(db, options.query, now, {
+        since: options.since ?? null,
+        until: options.until ?? null,
+        project: options.project ?? null,
+      }),
       candidates: candidates.map((candidate) => toCard(runtime, candidate, options.files === true)),
     });
     return 0;

@@ -344,6 +344,15 @@ var MIGRATIONS = [
   ) STRICT;
 
   CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
+  `,
+  // 8 — when a job was parked.
+  //
+  // unblockStale matched on updated_at, and every sweep's rescan re-enqueues
+  // each unarchived session, which refreshes updated_at on the blocked row.
+  // So for anyone who opens Claude Code daily the retry could never fire: a
+  // session parked by one transient failure was never archived again.
+  `
+  ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1669,6 +1678,7 @@ function isRateLimited(body) {
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
+  if (isRateLimited(body)) return false;
   return text.includes("storageQuotaExceeded") || text.includes("quotaExceeded");
 }
 
@@ -2605,6 +2615,7 @@ function enqueue(db, args, now) {
          not_before  = CASE WHEN ? THEN excluded.not_before
                             ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         blocked_at  = CASE WHEN ? THEN NULL ELSE jobs.blocked_at END,
          -- A block leaves the claim's visibility timeout in place, so without this
          -- an unblocked job stayed invisible for up to fifteen minutes and
          -- /archive:now appeared to have done nothing.
@@ -2625,6 +2636,7 @@ function enqueue(db, args, now) {
     now,
     now,
     args.runNow === true ? 1 : 0,
+    args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0
   );
@@ -2668,14 +2680,15 @@ function retryLater(db, job, args) {
 function block(db, job, args) {
   db.prepare(
     `UPDATE jobs
-        SET blocked = 1, claim_token = NULL, last_error = ?, updated_at = ?
+        SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
       WHERE id = ?`
-  ).run(args.error, args.now, job.id);
+  ).run(args.now, args.error, args.now, job.id);
 }
 function unblockStale(db, now, olderThanMs) {
   const result = db.prepare(
-    `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
-        WHERE blocked = 1 AND updated_at <= ?`
+    `UPDATE jobs SET blocked = 0, blocked_at = NULL, visible_at = 0,
+              not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND COALESCE(blocked_at, updated_at) <= ?`
   ).run(now, now, now - olderThanMs);
   return Number(result.changes);
 }
@@ -6735,8 +6748,12 @@ function describeShrink(previous, now) {
   return complaints.length === 0 ? null : complaints.join("; ");
 }
 function compareChecksums(remote, bundle) {
-  if (remote.size !== null && remote.size !== bundle.bytes) {
-    return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
+  const sizeProblem = remote.size !== null && remote.size !== bundle.bytes ? `size ${String(remote.size)} != ${String(bundle.bytes)}` : null;
+  if (sizeProblem !== null && remote.sha256 === null && remote.md5 === null) return sizeProblem;
+  if (sizeProblem !== null) {
+    const hashAgrees = remote.sha256 !== null && remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() || remote.md5 !== null && remote.md5.toLowerCase() === bundle.md5.toLowerCase();
+    if (!hashAgrees) return sizeProblem;
+    return null;
   }
   if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
@@ -7671,7 +7688,7 @@ function prefilter(db, query, now, options = {}) {
   const since = options.since ?? parsed.since;
   const until = options.until ?? parsed.until;
   const limit = options.limit ?? 30;
-  const scanLimit = options.scanLimit ?? 400;
+  const scanLimit = options.scanLimit ?? 3e3;
   const terms = parsed.terms;
   const rows = selectRows(db, { terms, since, until, project: options.project ?? null, scanLimit });
   const promptStatement = db.prepare(
@@ -7689,6 +7706,18 @@ function prefilter(db, query, now, options = {}) {
     return recency(b2.session) - recency(a.session);
   });
   return candidates.slice(0, limit);
+}
+function prefilterTruncated(db, query, now, options = {}) {
+  const parsed = parseQuery(query, now);
+  const scanLimit = options.scanLimit ?? 3e3;
+  const rows = selectRows(db, {
+    terms: parsed.terms,
+    since: options.since ?? parsed.since,
+    until: options.until ?? parsed.until,
+    project: options.project ?? null,
+    scanLimit
+  });
+  return rows.length >= scanLimit;
 }
 function selectRows(db, args) {
   const where = [];
@@ -7794,6 +7823,63 @@ import path16 from "node:path";
 function isIncomplete(record, onDisk) {
   const smaller = (floor, current) => floor !== null && current < floor;
   return smaller(record.verifiedTranscriptBytes, onDisk.transcriptBytes) || smaller(record.verifiedSidecarBytes, onDisk.sidecarBytes);
+}
+async function restoreRetainedBundle(ctx, fileId) {
+  const retained = listRetainedBundles(ctx.db).find((entry) => entry.fileId === fileId);
+  if (retained === void 0) {
+    throw new FatalError(
+      `no retained bundle with the id ${fileId}`,
+      "Run /archive:status to see the bundles that were kept, with their ids."
+    );
+  }
+  const record = getSession(ctx.db, retained.sessionId);
+  if (record === null || !isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+    throw new FatalError(
+      `the catalog entry for ${retained.sessionId} cannot be located on disk`,
+      "Run /archive:now to rescan, then try again."
+    );
+  }
+  const targetDir = path16.join(ctx.paths.projectsDir, record.encodedDir);
+  const destination = path16.join(
+    targetDir,
+    `${record.sessionId}.retained-${String(ctx.clock.now())}`
+  );
+  const staged = path16.join(ctx.paths.restoreDir, `${record.sessionId}.retained.tar.zst`);
+  let entries = [];
+  try {
+    await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
+    if (retained.bundleSha256 !== null) {
+      const actual = await sha256File(staged, ctx.signal);
+      if (actual !== retained.bundleSha256) {
+        throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
+      }
+    }
+    await fsp14.mkdir(destination, { recursive: true });
+    const result = await extractBundle({
+      bundlePath: staged,
+      targetDir: destination,
+      onlySession: record.sessionId,
+      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+    });
+    entries = result.entries;
+  } finally {
+    await fsp14.rm(staged, { force: true }).catch(() => void 0);
+  }
+  if (entries.length === 0) {
+    await fsp14.rm(destination, { recursive: true, force: true }).catch(() => void 0);
+    throw new RetryableError(`nothing could be unpacked from ${fileId}`);
+  }
+  ctx.logger.info("restore.retained", { session_id: record.sessionId, path: destination });
+  return {
+    sessionId: record.sessionId,
+    encodedDir: record.encodedDir,
+    projectCwd: record.projectCwd,
+    transcriptPath: path16.join(destination, `${record.sessionId}.jsonl`),
+    entries,
+    alreadyLocal: false,
+    recoveredTo: destination,
+    resumeCommand: resumeCommand(record.sessionId)
+  };
 }
 async function restoreSession(ctx, sessionId) {
   const record = getSession(ctx.db, sessionId);
@@ -8056,6 +8142,13 @@ function runSearch(runtime, options) {
     printJson({
       query: options.query,
       count: candidates.length,
+      // The scan orders by recency, so a truncated one hides older matches.
+      // Saying so lets the reranker narrow the window rather than reword.
+      truncated: prefilterTruncated(db, options.query, now, {
+        since: options.since ?? null,
+        until: options.until ?? null,
+        project: options.project ?? null
+      }),
       candidates: candidates.map((candidate) => toCard(runtime, candidate, options.files === true))
     });
     return 0;
@@ -8098,6 +8191,17 @@ function toCard(runtime, candidate, includeFiles) {
 // src/commands/resume.ts
 var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 async function runResume(runtime, options) {
+  if (typeof options.bundle === "string" && options.bundle.length > 0) {
+    const ctx2 = commandContext(runtime);
+    const result2 = await restoreRetainedBundle(ctx2, options.bundle);
+    if (options.json !== false) {
+      printJson({ action: "restored-retained", ...result2 });
+      return 0;
+    }
+    print(`Unpacked the kept bundle into ${result2.recoveredTo ?? ""}`);
+    print("It sits beside the session; nothing was overwritten.");
+    return 0;
+  }
   const query = options.query.trim();
   const sessionId = resolveSessionId(runtime, query);
   if (sessionId === null) {
@@ -8407,7 +8511,9 @@ async function readHookError(dataDir) {
     const raw = await fsp17.readFile(path19.join(dataDir, "hook-error.json"), "utf8");
     const parsed = JSON.parse(raw);
     const message = parsed?.message;
-    return typeof message === "string" ? message.slice(0, 300) : null;
+    if (typeof message !== "string") return null;
+    const at2 = typeof parsed?.at === "number" ? new Date(parsed.at).toISOString() : "unknown time";
+    return `${at2}: ${message.slice(0, 300)}`;
   } catch {
     return null;
   }
@@ -8519,9 +8625,7 @@ async function runStatus(runtime, options) {
     print(`                      Nothing is being backed up or deleted.`);
   }
   if (queue.failing > 0) {
-    print(
-      `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`
-    );
+    print(`  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`);
   }
   if (workerNeverRan) {
     print(`  WARNING:            the background worker was started but never ran.`);
@@ -8551,9 +8655,10 @@ async function runStatus(runtime, options) {
     );
     for (const entry of retained.slice(0, 5)) {
       print(`    ${entry.sessionId}: ${entry.reason}`);
-      print(`      ${entry.remotePath ?? entry.fileId}`);
+      print(`      ${entry.remotePath ?? "(path unknown)"}  id: ${entry.fileId}`);
     }
     print(`  They hold data the newer bundle does not. Nothing deletes them.`);
+    print(`  Unpack one beside its session with: /archive:resume --bundle <file id>`);
   }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);
@@ -8640,6 +8745,7 @@ Common options
 setup   --device          Use the no-browser device flow
         --reauth          Sign in again even if a token exists
         --skip-backfill   Do not back up existing sessions now
+resume  --bundle <id>     Unpack a kept bundle /archive:status listed, beside the session
 search  --since <date>    ISO date lower bound
         --until <date>    ISO date upper bound
         --project <path>  Restrict to one project directory
@@ -8700,6 +8806,7 @@ async function main() {
         return await runResume(runtime, {
           query,
           limit: parseLimit(values.limit, 30),
+          bundle: typeof values.bundle === "string" ? values.bundle : null,
           json: values.text !== true
         });
       case "verify":
@@ -8736,6 +8843,7 @@ function parseCommandLine(args) {
         since: { type: "string" },
         until: { type: "string" },
         project: { type: "string" },
+        bundle: { type: "string" },
         help: { type: "boolean", short: "h" },
         version: { type: "boolean" }
       }

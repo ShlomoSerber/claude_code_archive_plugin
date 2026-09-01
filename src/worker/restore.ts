@@ -3,7 +3,12 @@ import path from 'node:path';
 import { extractBundle } from '../adapters/bundle.ts';
 import { sha256File } from '../adapters/hashing.ts';
 import { statSession, type LocalSession } from '../adapters/session-scan.ts';
-import { getSession, markLocalPresent, type SessionRecord } from '../core/catalog.ts';
+import {
+  getSession,
+  markLocalPresent,
+  type SessionRecord,
+  listRetainedBundles,
+} from '../core/catalog.ts';
 import { FatalError, RetryableError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { clearVerification, markVerified } from '../core/catalog.ts';
@@ -39,6 +44,81 @@ export type RestoreResult = {
   recoveredTo?: string;
   resumeCommand: string;
 };
+
+/**
+ * Unpack a bundle the plugin deliberately kept, beside the current session.
+ *
+ * When a new bundle cannot be proved to contain the old one, the old one stays
+ * on Drive and `remote_file_id` moves on — so its unique contents survived with
+ * no command that could get them back. /archive:status names these; this is how
+ * they are retrieved.
+ */
+export async function restoreRetainedBundle(
+  ctx: WorkerContext,
+  fileId: string,
+): Promise<RestoreResult> {
+  const retained = listRetainedBundles(ctx.db).find((entry) => entry.fileId === fileId);
+  if (retained === undefined) {
+    throw new FatalError(
+      `no retained bundle with the id ${fileId}`,
+      'Run /archive:status to see the bundles that were kept, with their ids.',
+    );
+  }
+  const record = getSession(ctx.db, retained.sessionId);
+  if (
+    record === null ||
+    !isSafeSessionId(record.sessionId) ||
+    !isSafeEncodedDir(record.encodedDir)
+  ) {
+    throw new FatalError(
+      `the catalog entry for ${retained.sessionId} cannot be located on disk`,
+      'Run /archive:now to rescan, then try again.',
+    );
+  }
+
+  const targetDir = path.join(ctx.paths.projectsDir, record.encodedDir);
+  // Beside, never over: the live session is the one the user is working with.
+  const destination = path.join(
+    targetDir,
+    `${record.sessionId}.retained-${String(ctx.clock.now())}`,
+  );
+  const staged = path.join(ctx.paths.restoreDir, `${record.sessionId}.retained.tar.zst`);
+  let entries: string[] = [];
+  try {
+    await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
+    if (retained.bundleSha256 !== null) {
+      const actual = await sha256File(staged, ctx.signal);
+      if (actual !== retained.bundleSha256) {
+        throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
+      }
+    }
+    await fsp.mkdir(destination, { recursive: true });
+    const result = await extractBundle({
+      bundlePath: staged,
+      targetDir: destination,
+      onlySession: record.sessionId,
+      ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+    });
+    entries = result.entries;
+  } finally {
+    await fsp.rm(staged, { force: true }).catch(() => undefined);
+  }
+  if (entries.length === 0) {
+    await fsp.rm(destination, { recursive: true, force: true }).catch(() => undefined);
+    throw new RetryableError(`nothing could be unpacked from ${fileId}`);
+  }
+  ctx.logger.info('restore.retained', { session_id: record.sessionId, path: destination });
+  return {
+    sessionId: record.sessionId,
+    encodedDir: record.encodedDir,
+    projectCwd: record.projectCwd,
+    transcriptPath: path.join(destination, `${record.sessionId}.jsonl`),
+    entries,
+    alreadyLocal: false,
+    recoveredTo: destination,
+    resumeCommand: resumeCommand(record.sessionId),
+  };
+}
 
 export async function restoreSession(
   ctx: WorkerContext,
@@ -353,9 +433,10 @@ export async function verifyArchive(
         });
         continue;
       }
-      const reason = remote.trashed === true
-        ? 'the bundle is in the Drive wastebasket and will be purged'
-        : describeMismatch(record, remote.size, remote.sha256);
+      const reason =
+        remote.trashed === true
+          ? 'the bundle is in the Drive wastebasket and will be purged'
+          : describeMismatch(record, remote.size, remote.sha256);
       if (reason === null) {
         report.ok++;
       } else {

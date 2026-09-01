@@ -17,6 +17,10 @@ With free text it returns `"action": "choose"` and a list of candidates instead.
 In that case: rank them yourself, show the user the best 2 to 4, and ask which
 one. Then rerun with the chosen session id.
 
+If `/archive:status` listed a bundle that was kept rather than replaced, unpack
+it with `node "${CLAUDE_PLUGIN_ROOT}/dist/cli.mjs" resume --bundle <file id>`.
+It lands in a directory beside the session and overwrites nothing.
+
 After a restore, give the user the `resumeCommand` and tell them to run it from
 `projectCwd`. Do not run it yourself — a session that is already running cannot
 become an older one.

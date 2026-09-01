@@ -174,7 +174,10 @@ export function prefilter(
   const since = options.since ?? parsed.since;
   const until = options.until ?? parsed.until;
   const limit = options.limit ?? 30;
-  const scanLimit = options.scanLimit ?? 400;
+  // Wide enough that a two-word query still reaches years back at the
+  // measured rate of ~600 sessions a month. The scan is a keyword filter over
+  // one SQLite table; the cost of a larger window is milliseconds.
+  const scanLimit = options.scanLimit ?? 3_000;
   const terms = parsed.terms;
 
   const rows = selectRows(db, { terms, since, until, project: options.project ?? null, scanLimit });
@@ -195,6 +198,32 @@ export function prefilter(
     return recency(b.session) - recency(a.session);
   });
   return candidates.slice(0, limit);
+}
+
+/**
+ * Did the keyword scan hit its ceiling?
+ *
+ * The scan orders by recency, so a truncated one silently hides older matches —
+ * and "try different keywords", which is the advice the skill gives, is the
+ * wrong remedy for a recency cut. The caller reports this so the reranker can
+ * narrow the window instead.
+ */
+export function prefilterTruncated(
+  db: Db,
+  query: string,
+  now: number,
+  options: SearchOptions = {},
+): boolean {
+  const parsed = parseQuery(query, now);
+  const scanLimit = options.scanLimit ?? 3_000;
+  const rows = selectRows(db, {
+    terms: parsed.terms,
+    since: options.since ?? parsed.since,
+    until: options.until ?? parsed.until,
+    project: options.project ?? null,
+    scanLimit,
+  });
+  return rows.length >= scanLimit;
 }
 
 function selectRows(

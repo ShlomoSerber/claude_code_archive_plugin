@@ -8,7 +8,12 @@ import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
 import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, upsertSession } from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
-import { FatalError, isRetryableNetworkError, toErrorInfo, RetryableError } from '../core/errors.ts';
+import {
+  FatalError,
+  isRetryableNetworkError,
+  toErrorInfo,
+  RetryableError,
+} from '../core/errors.ts';
 import {
   claim,
   complete,
@@ -347,7 +352,6 @@ function handleJobFailure(ctx: WorkerContext, job: Job, err: unknown, report: Sw
     ...(err instanceof RetryableError && err.retryAfterSeconds !== undefined
       ? { retryAfterSeconds: err.retryAfterSeconds }
       : {}),
-
   });
   ctx.logger.warn('sweep.job_retry', { session_id: job.sessionId, attempt: job.attempts, at }, err);
   retryLater(ctx.db, job, { at, error: message });
@@ -495,7 +499,6 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
       );
       if (stored.trashed === true) return false;
     }
-
 
     const now = ctx.clock.now();
     kvSet(ctx.db, KV.catalogFileId, stored.id, now);

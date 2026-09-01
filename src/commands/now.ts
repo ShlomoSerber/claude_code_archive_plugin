@@ -11,10 +11,7 @@ import { formatBytes, print, printJson, warn } from './output.ts';
  * It takes the same lock the background worker does, so an explicit sweep and a
  * hook-triggered one can never run at once.
  */
-export async function runNow(
-  runtime: Runtime,
-  options: { json?: boolean } = {},
-): Promise<number> {
+export async function runNow(runtime: Runtime, options: { json?: boolean } = {}): Promise<number> {
   const lock = acquireLock(runtime.paths.lockDir, { logger: runtime.logger, clock: runtime.clock });
   if (lock === null) {
     const message = 'A background sweep is already running. Try again in a moment.';

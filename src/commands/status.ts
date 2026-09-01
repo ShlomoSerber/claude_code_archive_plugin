@@ -20,9 +20,11 @@ import { formatBytes, formatDate, formatRelative, print, printJson } from './out
 async function readHookError(dataDir: string): Promise<string | null> {
   try {
     const raw = await fsp.readFile(path.join(dataDir, 'hook-error.json'), 'utf8');
-    const parsed: unknown = JSON.parse(raw);
-    const message = (parsed as { message?: unknown } | null)?.message;
-    return typeof message === 'string' ? message.slice(0, 300) : null;
+    const parsed = JSON.parse(raw) as { message?: unknown; at?: unknown } | null;
+    const message = parsed?.message;
+    if (typeof message !== 'string') return null;
+    const at = typeof parsed?.at === 'number' ? new Date(parsed.at).toISOString() : 'unknown time';
+    return `${at}: ${message.slice(0, 300)}`;
   } catch {
     return null;
   }
@@ -151,9 +153,7 @@ export async function runStatus(
     print(`                      Nothing is being backed up or deleted.`);
   }
   if (queue.failing > 0) {
-    print(
-      `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`,
-    );
+    print(`  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`);
   }
   if (workerNeverRan) {
     print(`  WARNING:            the background worker was started but never ran.`);
@@ -188,9 +188,10 @@ export async function runStatus(
     );
     for (const entry of retained.slice(0, 5)) {
       print(`    ${entry.sessionId}: ${entry.reason}`);
-      print(`      ${entry.remotePath ?? entry.fileId}`);
+      print(`      ${entry.remotePath ?? '(path unknown)'}  id: ${entry.fileId}`);
     }
     print(`  They hold data the newer bundle does not. Nothing deletes them.`);
+    print(`  Unpack one beside its session with: /archive:resume --bundle <file id>`);
   }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);

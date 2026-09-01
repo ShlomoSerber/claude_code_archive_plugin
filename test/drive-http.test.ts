@@ -184,13 +184,26 @@ describe('compareChecksums', () => {
     );
   });
 
-  it('fails on a size mismatch before looking at hashes', () => {
+  it('fails on a size mismatch when no hash agrees', () => {
     assert.match(
       compareChecksums(
-        { id: 'x', name: 'n', size: 7, sha256: 'aa', md5: 'bb', trashed: false },
+        { id: 'x', name: 'n', size: 7, sha256: 'ff', md5: 'ff', trashed: false },
         bundle,
       ) ?? '',
       /^size /,
+    );
+  });
+
+  it('trusts a matching hash over a size Drive contradicts itself on', () => {
+    // The answer to a size mismatch is to trash the remote file. Doing that on
+    // the strength of a size, against a hash that proves the bytes are right,
+    // destroys a copy that was correct.
+    assert.equal(
+      compareChecksums(
+        { id: 'x', name: 'n', size: 7, sha256: 'aa', md5: 'bb', trashed: false },
+        bundle,
+      ),
+      null,
     );
   });
 

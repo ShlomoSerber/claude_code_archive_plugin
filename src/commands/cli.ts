@@ -41,6 +41,7 @@ Common options
 setup   --device          Use the no-browser device flow
         --reauth          Sign in again even if a token exists
         --skip-backfill   Do not back up existing sessions now
+resume  --bundle <id>     Unpack a kept bundle /archive:status listed, beside the session
 search  --since <date>    ISO date lower bound
         --until <date>    ISO date upper bound
         --project <path>  Restrict to one project directory
@@ -107,6 +108,7 @@ async function main(): Promise<number> {
         return await runResume(runtime, {
           query,
           limit: parseLimit(values.limit, 30),
+          bundle: typeof values.bundle === 'string' ? values.bundle : null,
           json: values.text !== true,
         });
       case 'verify':
@@ -146,6 +148,7 @@ type CommandFlags = {
   since?: string;
   until?: string;
   project?: string;
+  bundle?: string;
   help?: boolean;
   version?: boolean;
 };
@@ -169,6 +172,7 @@ function parseCommandLine(args: string[]): { values: CommandFlags; positionals: 
         since: { type: 'string' },
         until: { type: 'string' },
         project: { type: 'string' },
+        bundle: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean' },
       },
