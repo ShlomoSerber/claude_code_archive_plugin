@@ -58,9 +58,11 @@ export async function backupSession(
     // verified, with the tool results and subagent transcripts on Drive nowhere
     // and nothing anywhere saying so.
     throw new FatalError(
-      `the sidecar directory for ${args.sessionId} exists but cannot be read`,
-      `Fix the permissions on the session directory beside its transcript, then ` +
-        `run /archive:now. Nothing has been archived or deleted for this session.`,
+      `the sidecar directory for ${args.sessionId} cannot be read as a plain directory`,
+      `Check the session directory beside its transcript: a permission problem ` +
+        `or a symbolic link both land here, and a link cannot be archived ` +
+        `consistently. Fix it and run /archive:now. Nothing has been archived ` +
+        `or deleted for this session.`,
     );
   }
 

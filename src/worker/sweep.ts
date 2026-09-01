@@ -97,6 +97,7 @@ export async function runSweep(
       skipped: 0,
       unverified: 0,
       unconfirmable: 0,
+      orphanSidecars: 0,
       blockedReason: null,
     },
     catalogUploaded: false,
@@ -120,7 +121,7 @@ export async function runSweep(
   }
 
   // An interrupted bundle is never resumed, only rebuilt.
-  const removed = await removePartials(ctx.paths.stagingDir);
+  const removed = await removePartials(ctx.paths.stagingDir, ctx.clock.now());
   if (removed.length > 0) ctx.logger.info('sweep.removed_partials', { count: removed.length });
 
   // A job parked by something transient — a rate limit, a full disk since
@@ -144,6 +145,7 @@ export async function runSweep(
     const at = ctx.clock.now();
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at);
+    kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? '', at);
   }
 

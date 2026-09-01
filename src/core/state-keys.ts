@@ -27,6 +27,8 @@ export const KV = {
   workerSpawnedAt: 'worker.spawned_at',
   /** Last time a worker actually reached its main loop. */
   workerRanAt: 'worker.ran_at',
+  /** Sidecar directories left on disk by a transcript that vanished. */
+  orphanSidecars: 'reap.orphan_sidecars',
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: 'reap.blocked_reason',
   /** Archived sessions the last reap found missing or changed on Drive. */

@@ -160,6 +160,15 @@ export async function* scanSessions(
 async function measureDirectory(
   dir: string,
 ): Promise<{ bytes: number; mtimeMs: number; unreadable?: boolean } | null> {
+  // A symlinked sidecar can never be archived consistently: the manifest walk
+  // lstats and skips the link, while a readdir through it counts the target's
+  // bytes — so the two disagree for ever and the session failed with "the
+  // session changed while it was being archived", which is not what happened.
+  try {
+    if ((await fsp.lstat(dir)).isSymbolicLink()) return { bytes: 0, mtimeMs: 0, unreadable: true };
+  } catch {
+    // Absent, or unreadable: handled by the readdir below.
+  }
   let entries: string[];
   try {
     entries = await fsp.readdir(dir);

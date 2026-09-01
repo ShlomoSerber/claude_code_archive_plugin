@@ -68,6 +68,7 @@ export async function runStatus(
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
+  const orphanSidecars = kvGetNumber(db, KV.orphanSidecars) ?? 0;
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
   const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
   const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
@@ -119,6 +120,7 @@ export async function runStatus(
       unreadable,
       unconfirmable,
       reapUnverified,
+      orphanSidecars,
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
@@ -221,6 +223,10 @@ export async function runStatus(
     // verified, with nothing saying why.
     print(`  WARNING:            Drive would not answer the last check:`);
     print(`                      ${reapBlocked}`);
+  }
+  if (orphanSidecars > 0) {
+    print(`  ${String(orphanSidecars)} session(s) have a sidecar directory but no transcript.`);
+    print(`  Nothing removes those, and their bytes are not counted as reclaimed.`);
   }
   if (reapUnverified > 0) {
     print(

@@ -2577,3 +2577,43 @@ describe('a retained bundle whose hash the catalog lost', () => {
     await assert.rejects(() => restoreRetainedBundle(harness.ctx, kept.fileId));
   });
 });
+
+describe('a sidecar that outlives its transcript', () => {
+  it('is reported instead of counted as space reclaimed', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    // What Claude Code's own reaper leaves behind on a project that still
+    // has a competing cleanupPeriodDays: the transcript gone, the sidecar not.
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    fs.rmSync(harness.transcriptOf(SESSION_B));
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.orphanSidecars, 1);
+    assert.equal(
+      getSession(harness.ctx.db, SESSION_B)?.localDeletedAt,
+      null,
+      'half a session on disk is not a session reclaimed',
+    );
+    assert.equal(fs.existsSync(path.join(harness.projectDir, SESSION_B)), true);
+  });
+});
+
+describe('a sidecar that is a symbolic link', () => {
+  it('says what is actually wrong', async () => {
+    if (process.platform === 'win32') return;
+    const harness = makeHarness();
+    const real = path.join(tempDir(), 'elsewhere');
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, 'tool.json'), '{"ok":true}');
+    fs.rmSync(path.join(harness.projectDir, SESSION_B), { recursive: true, force: true });
+    fs.symlinkSync(real, path.join(harness.projectDir, SESSION_B));
+
+    await runSweep(harness.ctx);
+    const blocked = listJobs(harness.ctx.db).filter((job) => job.blocked || job.attempts > 0);
+    const message = blocked.map((job) => job.lastError ?? '').join(' ');
+    assert.match(message, /cannot be read as a plain directory/);
+  });
+});

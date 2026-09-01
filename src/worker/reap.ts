@@ -55,9 +55,18 @@ export type ReapReport = {
    * verified, nothing is ever freed, and no message says why.
    */
   unconfirmable: number;
+  /** Sessions whose transcript is gone while their sidecar directory remains. */
+  orphanSidecars: number;
 };
 
 export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<ReapReport> {
+  // Read once. A readdir per reapable row is seconds on an SSD with a few
+  // hundred project directories, and minutes on a network home directory.
+  let projectDirsCache: string[] | null = null;
+  const projectDirs = async (): Promise<string[]> => {
+    projectDirsCache ??= await fsp.readdir(ctx.paths.projectsDir).catch(() => []);
+    return projectDirsCache;
+  };
   const report: ReapReport = {
     deleted: 0,
     bytesFreed: 0,
@@ -65,6 +74,7 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
     skipped: 0,
     unverified: 0,
     unconfirmable: 0,
+    orphanSidecars: 0,
     blockedReason: null,
   };
   // `enabled: false` has to stop deletion, not merely stop the hooks, or
@@ -102,12 +112,24 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
     if (onDisk === null) {
+      // The transcript is gone but its sidecar is not: tool results and
+      // subagent transcripts, sometimes hundreds of megabytes, that nothing
+      // will ever remove and that /archive:status was counting as reclaimed.
+      // Claude Code's own reaper produces exactly this shape on any project
+      // that still has a competing cleanupPeriodDays.
+      const sidecar = path.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
+      if (await isDirectory(sidecar)) {
+        log.warn('reap.orphan_sidecar', { encoded_dir: record.encodedDir });
+        report.orphanSidecars++;
+        report.skipped++;
+        continue;
+      }
       // Only if it is not simply somewhere else. A project directory renamed
       // by hand leaves the transcript on disk under a name the catalog has not
       // caught up with, and recording that as deleted made /archive:status
       // claim space it had never reclaimed and /archive:resume unpack a second
       // copy into the directory the user had moved away from.
-      const elsewhere = await findSessionElsewhere(ctx, record);
+      const elsewhere = await findSessionElsewhere(ctx, record, await projectDirs());
       if (elsewhere !== null) {
         log.info('reap.session_moved', { encoded_dir: elsewhere });
         report.skipped++;
@@ -343,6 +365,15 @@ async function confirmRemote(
   }
 }
 
+/** Does this path exist and is it a directory? */
+async function isDirectory(candidate: string): Promise<boolean> {
+  try {
+    return (await fsp.lstat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Is this session's transcript under some other project directory?
  *
@@ -353,13 +384,8 @@ async function confirmRemote(
 async function findSessionElsewhere(
   ctx: WorkerContext,
   record: SessionRecord,
+  dirs: readonly string[],
 ): Promise<string | null> {
-  let dirs: string[];
-  try {
-    dirs = await fsp.readdir(ctx.paths.projectsDir);
-  } catch {
-    return null;
-  }
   for (const dir of dirs) {
     if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
     try {

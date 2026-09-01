@@ -216,9 +216,7 @@ export function prefilter(
         : [];
     const opening = openingStatement.all(session.sessionId) as { text: string }[];
     const recent = recentStatement.all(session.sessionId) as { text: string }[];
-    const prompts = [
-      ...new Set([...matched, ...opening, ...recent].map((prompt) => prompt.text)),
-    ];
+    const prompts = [...new Set([...matched, ...opening, ...recent].map((prompt) => prompt.text))];
     return scoreCandidate(session, prompts, terms);
   });
 

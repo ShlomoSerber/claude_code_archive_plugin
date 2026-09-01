@@ -625,6 +625,8 @@ var KV = {
   workerSpawnedAt: "worker.spawned_at",
   /** Last time a worker actually reached its main loop. */
   workerRanAt: "worker.ran_at",
+  /** Sidecar directories left on disk by a transcript that vanished. */
+  orphanSidecars: "reap.orphan_sidecars",
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: "reap.blocked_reason",
   /** Archived sessions the last reap found missing or changed on Drive. */
@@ -2164,6 +2166,10 @@ async function* scanSessions(paths, skipped) {
   }
 }
 async function measureDirectory(dir) {
+  try {
+    if ((await fsp6.lstat(dir)).isSymbolicLink()) return { bytes: 0, mtimeMs: 0, unreadable: true };
+  } catch {
+  }
   let entries;
   try {
     entries = await fsp6.readdir(dir);
@@ -6255,8 +6261,8 @@ async function backupSession(ctx, job, args) {
   }
   if (session.sidecarUnreadable) {
     throw new FatalError(
-      `the sidecar directory for ${args.sessionId} exists but cannot be read`,
-      `Fix the permissions on the session directory beside its transcript, then run /archive:now. Nothing has been archived or deleted for this session.`
+      `the sidecar directory for ${args.sessionId} cannot be read as a plain directory`,
+      `Check the session directory beside its transcript: a permission problem or a symbolic link both land here, and a link cannot be archived consistently. Fix it and run /archive:now. Nothing has been archived or deleted for this session.`
     );
   }
   const now = ctx.clock.now();
@@ -6596,6 +6602,11 @@ function compareChecksums(remote, bundle) {
 import fsp11 from "node:fs/promises";
 import path14 from "node:path";
 async function reapLocalCopies(ctx, now) {
+  let projectDirsCache = null;
+  const projectDirs = async () => {
+    projectDirsCache ??= await fsp11.readdir(ctx.paths.projectsDir).catch(() => []);
+    return projectDirsCache;
+  };
   const report = {
     deleted: 0,
     bytesFreed: 0,
@@ -6603,6 +6614,7 @@ async function reapLocalCopies(ctx, now) {
     skipped: 0,
     unverified: 0,
     unconfirmable: 0,
+    orphanSidecars: 0,
     blockedReason: null
   };
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
@@ -6632,7 +6644,14 @@ async function reapLocalCopies(ctx, now) {
       continue;
     }
     if (onDisk === null) {
-      const elsewhere = await findSessionElsewhere(ctx, record);
+      const sidecar = path14.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
+      if (await isDirectory(sidecar)) {
+        log.warn("reap.orphan_sidecar", { encoded_dir: record.encodedDir });
+        report.orphanSidecars++;
+        report.skipped++;
+        continue;
+      }
+      const elsewhere = await findSessionElsewhere(ctx, record, await projectDirs());
       if (elsewhere !== null) {
         log.info("reap.session_moved", { encoded_dir: elsewhere });
         report.skipped++;
@@ -6764,13 +6783,14 @@ async function confirmRemote(ctx, record, report) {
     return "unavailable";
   }
 }
-async function findSessionElsewhere(ctx, record) {
-  let dirs;
+async function isDirectory(candidate) {
   try {
-    dirs = await fsp11.readdir(ctx.paths.projectsDir);
+    return (await fsp11.lstat(candidate)).isDirectory();
   } catch {
-    return null;
+    return false;
   }
+}
+async function findSessionElsewhere(ctx, record, dirs) {
   for (const dir of dirs) {
     if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
     try {
@@ -6828,6 +6848,7 @@ async function runSweep(ctx, options = {}) {
       skipped: 0,
       unverified: 0,
       unconfirmable: 0,
+      orphanSidecars: 0,
       blockedReason: null
     },
     catalogUploaded: false,
@@ -6847,7 +6868,7 @@ async function runSweep(ctx, options = {}) {
     report.durationMs = ctx.clock.now() - startedAt;
     return report;
   }
-  const removed = await removePartials(ctx.paths.stagingDir);
+  const removed = await removePartials(ctx.paths.stagingDir, ctx.clock.now());
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
   const revived = unblockStale(ctx.db, startedAt, BLOCK_RETRY_MS);
   if (revived > 0) ctx.logger.info("sweep.unblocked_stale", { count: revived });
@@ -6865,6 +6886,7 @@ async function runSweep(ctx, options = {}) {
     const at2 = ctx.clock.now();
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at2);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at2);
+    kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at2);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
