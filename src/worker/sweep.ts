@@ -16,6 +16,7 @@ import {
   enqueue,
   block,
   nextRunnableAt,
+  unblockStale,
   retryLater,
   parsePayload,
   type Job,
@@ -116,6 +117,11 @@ export async function runSweep(
   // An interrupted bundle is never resumed, only rebuilt.
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info('sweep.removed_partials', { count: removed.length });
+
+  // A job parked by something transient — a rate limit, a full disk since
+  // emptied — is retried once a day without waiting for the user to notice.
+  const revived = unblockStale(ctx.db, startedAt, BLOCK_RETRY_MS);
+  if (revived > 0) ctx.logger.info('sweep.unblocked_stale', { count: revived });
 
   const discovery = await discover(ctx, startedAt, {
     unblock: options.unblock === true,
@@ -392,6 +398,9 @@ function clockLooksSane(ctx: WorkerContext, now: number): boolean {
   return true;
 }
 
+/** How long a parked job waits before the sweep gives it another chance. */
+const BLOCK_RETRY_MS = 24 * 60 * 60_000;
+
 /** How long a worker will wait for a job whose debounce has not elapsed. */
 const DEBOUNCE_WAIT_MS = 60_000;
 
@@ -466,20 +475,32 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
       },
       ctx.signal,
     );
-    if (uploaded.trashed) {
+    let stored = uploaded;
+    if (stored.trashed === true) {
       // Drive accepts an update to a file in the wastebasket, so this kept
       // reporting success while a replacement machine — whose search excludes
-      // trashed files — would have found no catalog at all.
+      // trashed files — would have found no catalog at all. Replace it now
+      // rather than next sweep: until this succeeds the only catalog copy is
+      // in a wastebasket Drive empties after thirty days.
+      ctx.logger.warn('catalog.copy_trashed', { file_id: stored.id });
       kvSet(ctx.db, KV.catalogFileId, '', ctx.clock.now());
-      ctx.logger.warn('catalog.copy_trashed', { file_id: uploaded.id });
-      return false;
+      stored = await ctx.drive.uploadSmallFile(
+        {
+          name: catalogFileName(machineId(ctx)),
+          parentId,
+          mimeType: 'application/vnd.sqlite3',
+          body: await fsp.readFile(destination),
+        },
+        ctx.signal,
+      );
+      if (stored.trashed === true) return false;
     }
 
 
     const now = ctx.clock.now();
-    kvSet(ctx.db, KV.catalogFileId, uploaded.id, now);
+    kvSet(ctx.db, KV.catalogFileId, stored.id, now);
     kvSetNumber(ctx.db, KV.catalogUploadedAt, now, now);
-    ctx.logger.info('catalog.uploaded', { file_id: uploaded.id });
+    ctx.logger.info('catalog.uploaded', { file_id: stored.id });
     return true;
   } catch (err) {
     // The catalog copy is a convenience for a lost laptop; failing to refresh

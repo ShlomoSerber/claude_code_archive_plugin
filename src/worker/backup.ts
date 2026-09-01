@@ -6,6 +6,7 @@ import { extractFromFile } from '../adapters/transcript-file.ts';
 import { sha256File, sha256Prefix } from '../adapters/hashing.ts';
 import {
   countPrompts,
+  countSessionFiles,
   markBundled,
   getSession,
   markVerified,
@@ -152,7 +153,11 @@ async function indexSession(
     if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
       replacePrompts(ctx.db, session.sessionId, summary.prompts);
     }
-    replaceFiles(ctx.db, session.sessionId, summary.files);
+    // Same reasoning for the file list: a format change that yields nothing is
+    // not a session that touched nothing.
+    if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
+      replaceFiles(ctx.db, session.sessionId, summary.files);
+    }
     if (summary.malformedLines > 0) {
       log.warn('catalog.malformed_lines', { count: summary.malformedLines });
     }
@@ -593,7 +598,7 @@ export function compareChecksums(
   // Drive purges the wastebasket after thirty days, so a trashed file is not a
   // copy of anything. The reaper checks this before deleting; checking it here
   // too means a row is never marked verified against one.
-  if (remote.trashed) return 'the remote copy is in the wastebasket';
+  if (remote.trashed === true) return 'the remote copy is in the wastebasket';
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : 'sha256 mismatch';
   }

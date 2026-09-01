@@ -281,7 +281,9 @@ async function confirmRemote(
     // purges the wastebasket after thirty days. Treating that as "stored" is
     // how the last copy of a conversation quietly becomes the only copy, and
     // then no copy at all.
-    if (remote.trashed) return 'gone';
+    if (remote.trashed === true) return 'gone';
+    // Drive did not say. That is not permission to delete the local copy.
+    if (remote.trashed === null) return 'unavailable';
     // Against the size verification recorded, not bundle_bytes, which
     // describes the last bundle *built* — a failed re-upload leaves that
     // pointing at bytes Drive never received while the pointer still names the

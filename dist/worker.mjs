@@ -186,10 +186,6 @@ function sleepSync(ms2) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms2);
 }
 
-// src/composition.ts
-import fsp5 from "node:fs/promises";
-import path8 from "node:path";
-
 // src/adapters/db.ts
 import fs2 from "node:fs";
 import path2 from "node:path";
@@ -596,6 +592,46 @@ function kvSetNumber(db, key, value, now) {
   kvSet(db, key, String(value), now);
 }
 
+// src/core/state-keys.ts
+var KV = {
+  /** No network work before this timestamp. */
+  circuitUntil: "circuit.until",
+  /** Consecutive failed runs, which set the length of the next cool-down. */
+  circuitFailures: "circuit.failures",
+  /** Last completed sweep, for the minimum-interval check. */
+  lastSweepAt: "sweep.last_at",
+  /** Last time the catalog copy reached Drive. */
+  catalogUploadedAt: "catalog.uploaded_at",
+  /** Drive file id of the catalog copy, so it is replaced and not duplicated. */
+  catalogFileId: "catalog.file_id",
+  /** Sessions counted at the last full scan, shown by /archive:status. */
+  lastScanAt: "scan.last_at",
+  /** Sessions or projects the last scan could not archive, for /archive:status. */
+  skippedCount: "scan.skipped_count",
+  /** How many of those were unreadable rather than badly named. */
+  unreadableCount: "scan.unreadable_count",
+  /** Stable id for this installation, so two machines never share a catalog file. */
+  machineId: "machine.id",
+  /** Last time a hook started a worker. Compared with workerRanAt. */
+  workerSpawnedAt: "worker.spawned_at",
+  /** Last time a worker actually reached its main loop. */
+  workerRanAt: "worker.ran_at",
+  /** Why the last reap stopped asking Drive, if it did. */
+  reapBlockedReason: "reap.blocked_reason",
+  /** Archived sessions the last reap found missing or changed on Drive. */
+  reapUnverified: "reap.unverified_count",
+  /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
+  unconfirmableCount: "reap.unconfirmable_count"
+};
+function activeSessionKey(sessionId) {
+  return `active.${sessionId}`;
+}
+var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+
+// src/composition.ts
+import fsp5 from "node:fs/promises";
+import path8 from "node:path";
+
 // src/adapters/ndjson-logger.ts
 import fs3 from "node:fs";
 import path3 from "node:path";
@@ -672,7 +708,9 @@ function rotateIfLarge(state) {
   if (size <= state.maxBytes) return;
   try {
     fs3.renameSync(state.file, `${state.file}.1`);
-  } catch {
+  } catch (err) {
+    const code = err.code;
+    if (code === "ENOENT") return;
     try {
       fs3.rmSync(`${state.file}.1`, { force: true });
       fs3.renameSync(state.file, `${state.file}.1`);
@@ -1377,11 +1415,19 @@ function createDriveTransport(deps) {
       if (response.body === null) throw new RetryableError("Drive returned an empty body");
       await fsp4.mkdir(path6.dirname(args.destination), { recursive: true });
       const temp = siblingTempPath(args.destination);
+      const declared = asNumber(response.headers.get("content-length"));
       try {
         await pipeline(
           Readable.fromWeb(response.body),
           fs5.createWriteStream(temp, { flags: "wx", mode: 384 })
         );
+        const written = (await fsp4.stat(temp)).size;
+        if (declared !== null && written !== declared) {
+          throw new RetryableError(
+            `Drive sent ${String(written)} bytes of ${String(declared)} for ${args.fileId}`
+          );
+        }
+        if (written === 0) throw new RetryableError(`Drive sent nothing for ${args.fileId}`);
         await renameWithRetry(temp, args.destination);
       } catch (err) {
         await fsp4.rm(temp, { force: true }).catch(() => void 0);
@@ -1423,6 +1469,19 @@ async function interpretUploadResponse(response, totalBytes) {
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  if (response.status === 403 && isQuotaExhausted(body)) {
+    throw new FatalError(
+      `Drive refused the upload: ${message}`,
+      "Free space in Google Drive, then run /archive:now.",
+      { status: response.status }
+    );
+  }
+  if (response.status === 403 && isRateLimited(body)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response)
+    });
+  }
   if (isRetryableHttpStatus(response.status)) {
     throw new RetryableError(`Drive upload failed: ${message}`, {
       status: response.status,
@@ -1445,6 +1504,7 @@ function confirmedFromRange(header) {
   if (header === null) return 0;
   const match = /bytes=(\d+)-(\d+)/.exec(header.trim());
   if (match === null) return 0;
+  if (Number(match[1]) !== 0) return 0;
   return Number(match[2]) + 1;
 }
 function alignChunkSize(size) {
@@ -1484,7 +1544,9 @@ function toRemoteFile(value) {
     size: asNumber(record["size"]),
     sha256: typeof record["sha256Checksum"] === "string" ? record["sha256Checksum"] : null,
     md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
-    trashed: record["trashed"] === true
+    // Unknown, not false: false is the direction that would let the reaper
+    // authorise a deletion against a file in the wastebasket.
+    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null
   };
 }
 function asNumber(value) {
@@ -1495,7 +1557,8 @@ function asNumber(value) {
 }
 function isRateLimited(body) {
   const text = JSON.stringify(body ?? "");
-  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded") || // Not a permanent refusal either: the window resets.
+  text.includes("dailyLimitExceeded") || text.includes("rateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -2225,6 +2288,10 @@ function countPrompts(db, sessionId) {
   const row = db.prepare("SELECT count(*) AS n FROM prompts WHERE session_id = ?").get(sessionId);
   return row?.n ?? 0;
 }
+function countSessionFiles(db, sessionId) {
+  const row = db.prepare("SELECT count(*) AS n FROM session_files WHERE session_id = ?").get(sessionId);
+  return row?.n ?? 0;
+}
 function recordRetainedBundle(db, entry, now) {
   db.prepare(
     `INSERT INTO retained_bundles
@@ -2471,6 +2538,13 @@ function block(db, job, args) {
       WHERE id = ?`
   ).run(args.error, args.now, job.id);
 }
+function unblockStale(db, now, olderThanMs) {
+  const result = db.prepare(
+    `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND updated_at <= ?`
+  ).run(now, now, now - olderThanMs);
+  return Number(result.changes);
+}
 function setUploadUri(db, job, uri, now) {
   db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?").run(uri, now, job.id);
 }
@@ -2532,38 +2606,6 @@ function toJob(row) {
     updatedAt: row.updated_at
   };
 }
-
-// src/core/state-keys.ts
-var KV = {
-  /** No network work before this timestamp. */
-  circuitUntil: "circuit.until",
-  /** Consecutive failed runs, which set the length of the next cool-down. */
-  circuitFailures: "circuit.failures",
-  /** Last completed sweep, for the minimum-interval check. */
-  lastSweepAt: "sweep.last_at",
-  /** Last time the catalog copy reached Drive. */
-  catalogUploadedAt: "catalog.uploaded_at",
-  /** Drive file id of the catalog copy, so it is replaced and not duplicated. */
-  catalogFileId: "catalog.file_id",
-  /** Sessions counted at the last full scan, shown by /archive:status. */
-  lastScanAt: "scan.last_at",
-  /** Sessions or projects the last scan could not archive, for /archive:status. */
-  skippedCount: "scan.skipped_count",
-  /** How many of those were unreadable rather than badly named. */
-  unreadableCount: "scan.unreadable_count",
-  /** Stable id for this installation, so two machines never share a catalog file. */
-  machineId: "machine.id",
-  /** Why the last reap stopped asking Drive, if it did. */
-  reapBlockedReason: "reap.blocked_reason",
-  /** Archived sessions the last reap found missing or changed on Drive. */
-  reapUnverified: "reap.unverified_count",
-  /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
-  unconfirmableCount: "reap.unconfirmable_count"
-};
-function activeSessionKey(sessionId) {
-  return `active.${sessionId}`;
-}
-var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
 import fsp10 from "node:fs/promises";
@@ -6241,7 +6283,9 @@ async function indexSession(ctx, session, previous, now) {
     if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
       replacePrompts(ctx.db, session.sessionId, summary.prompts);
     }
-    replaceFiles(ctx.db, session.sessionId, summary.files);
+    if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
+      replaceFiles(ctx.db, session.sessionId, summary.files);
+    }
     if (summary.malformedLines > 0) {
       log.warn("catalog.malformed_lines", { count: summary.malformedLines });
     }
@@ -6497,7 +6541,7 @@ function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
     return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
   }
-  if (remote.trashed) return "the remote copy is in the wastebasket";
+  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6650,7 +6694,8 @@ async function confirmRemote(ctx, record, report) {
   if (record.remoteFileId === null) return "gone";
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-    if (remote.trashed) return "gone";
+    if (remote.trashed === true) return "gone";
+    if (remote.trashed === null) return "unavailable";
     const expectedBytes = record.verifiedBundleBytes;
     if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return "gone";
@@ -6739,6 +6784,8 @@ async function runSweep(ctx, options = {}) {
   }
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
+  const revived = unblockStale(ctx.db, startedAt, BLOCK_RETRY_MS);
+  if (revived > 0) ctx.logger.info("sweep.unblocked_stale", { count: revived });
   const discovery = await discover(ctx, startedAt, {
     unblock: options.unblock === true,
     runNow: options.runNow === true
@@ -6937,6 +6984,7 @@ function clockLooksSane(ctx, now) {
   }
   return true;
 }
+var BLOCK_RETRY_MS = 24 * 60 * 6e4;
 var DEBOUNCE_WAIT_MS = 6e4;
 var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
@@ -6974,15 +7022,25 @@ async function uploadCatalogCopy(ctx) {
       },
       ctx.signal
     );
-    if (uploaded.trashed) {
+    let stored = uploaded;
+    if (stored.trashed === true) {
+      ctx.logger.warn("catalog.copy_trashed", { file_id: stored.id });
       kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
-      ctx.logger.warn("catalog.copy_trashed", { file_id: uploaded.id });
-      return false;
+      stored = await ctx.drive.uploadSmallFile(
+        {
+          name: catalogFileName(machineId(ctx)),
+          parentId,
+          mimeType: "application/vnd.sqlite3",
+          body: await fsp12.readFile(destination)
+        },
+        ctx.signal
+      );
+      if (stored.trashed === true) return false;
     }
     const now = ctx.clock.now();
-    kvSet(ctx.db, KV.catalogFileId, uploaded.id, now);
+    kvSet(ctx.db, KV.catalogFileId, stored.id, now);
     kvSetNumber(ctx.db, KV.catalogUploadedAt, now, now);
-    ctx.logger.info("catalog.uploaded", { file_id: uploaded.id });
+    ctx.logger.info("catalog.uploaded", { file_id: stored.id });
     return true;
   } catch (err) {
     kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
@@ -7053,6 +7111,7 @@ async function main() {
     runtime.close();
     return;
   }
+  kvSetNumber(runtime.db(), KV.workerRanAt, runtime.clock.now(), runtime.clock.now());
   const lock = acquireLock(runtime.paths.lockDir, { logger: runtime.logger, clock: runtime.clock });
   if (lock === null) {
     runtime.logger.debug("worker.already_running");

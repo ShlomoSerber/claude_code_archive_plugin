@@ -23,6 +23,10 @@ export const KV = {
   unreadableCount: 'scan.unreadable_count',
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: 'machine.id',
+  /** Last time a hook started a worker. Compared with workerRanAt. */
+  workerSpawnedAt: 'worker.spawned_at',
+  /** Last time a worker actually reached its main loop. */
+  workerRanAt: 'worker.ran_at',
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: 'reap.blocked_reason',
   /** Archived sessions the last reap found missing or changed on Drive. */

@@ -341,7 +341,7 @@ export async function verifyArchive(
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      if (!remote.trashed && remote.sha256 === null) {
+      if (remote.trashed !== true && remote.sha256 === null) {
         // Drive computes checksums asynchronously and sometimes answers without
         // one. That is "I could not check", the same class as a network
         // failure — not a mismatch, and certainly not grounds for withdrawing
@@ -353,7 +353,7 @@ export async function verifyArchive(
         });
         continue;
       }
-      const reason = remote.trashed
+      const reason = remote.trashed === true
         ? 'the bundle is in the Drive wastebasket and will be purged'
         : describeMismatch(record, remote.size, remote.sha256);
       if (reason === null) {

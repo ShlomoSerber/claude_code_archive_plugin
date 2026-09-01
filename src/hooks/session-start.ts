@@ -8,6 +8,7 @@ import { isSafeSessionId } from '../core/identifiers.ts';
 import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
+import { logLastResort } from './last-resort.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
 import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
 import { resolvePaths } from '../core/paths.ts';
@@ -62,6 +63,7 @@ async function main(): Promise<void> {
     }
 
     runtime.logger.info('hook.session_start.sweeping', { source: input?.source ?? null });
+    kvSetNumber(runtime.db(), KV.workerSpawnedAt, now, now);
     spawnWorker({
       workerPath: workerPath(),
       env: process.env,
@@ -79,7 +81,9 @@ function workerPath(): string {
 
 try {
   await main();
-} catch {
-  // Never let a hook disturb a session that is just starting.
+} catch (err) {
+  // Never let a hook disturb a session that is just starting — but never
+  // silently: see last-resort.ts.
+  logLastResort('hook.session_start_failed', err);
 }
 process.exit(0);

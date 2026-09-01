@@ -30,7 +30,7 @@ function warningType(warning, rest) {
 silenceSqliteWarning();
 
 // src/hooks/session-start.ts
-import path9 from "node:path";
+import path10 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/composition.ts
@@ -505,7 +505,9 @@ function rotateIfLarge(state) {
   if (size <= state.maxBytes) return;
   try {
     fs2.renameSync(state.file, `${state.file}.1`);
-  } catch {
+  } catch (err) {
+    const code = err.code;
+    if (code === "ENOENT") return;
     try {
       fs2.rmSync(`${state.file}.1`, { force: true });
       fs2.renameSync(state.file, `${state.file}.1`);
@@ -1203,11 +1205,19 @@ function createDriveTransport(deps) {
       if (response.body === null) throw new RetryableError("Drive returned an empty body");
       await fsp4.mkdir(path5.dirname(args.destination), { recursive: true });
       const temp = siblingTempPath(args.destination);
+      const declared = asNumber(response.headers.get("content-length"));
       try {
         await pipeline(
           Readable.fromWeb(response.body),
           fs4.createWriteStream(temp, { flags: "wx", mode: 384 })
         );
+        const written = (await fsp4.stat(temp)).size;
+        if (declared !== null && written !== declared) {
+          throw new RetryableError(
+            `Drive sent ${String(written)} bytes of ${String(declared)} for ${args.fileId}`
+          );
+        }
+        if (written === 0) throw new RetryableError(`Drive sent nothing for ${args.fileId}`);
         await renameWithRetry(temp, args.destination);
       } catch (err) {
         await fsp4.rm(temp, { force: true }).catch(() => void 0);
@@ -1249,6 +1259,19 @@ async function interpretUploadResponse(response, totalBytes) {
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  if (response.status === 403 && isQuotaExhausted(body)) {
+    throw new FatalError(
+      `Drive refused the upload: ${message}`,
+      "Free space in Google Drive, then run /archive:now.",
+      { status: response.status }
+    );
+  }
+  if (response.status === 403 && isRateLimited(body)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response)
+    });
+  }
   if (isRetryableHttpStatus(response.status)) {
     throw new RetryableError(`Drive upload failed: ${message}`, {
       status: response.status,
@@ -1271,6 +1294,7 @@ function confirmedFromRange(header) {
   if (header === null) return 0;
   const match = /bytes=(\d+)-(\d+)/.exec(header.trim());
   if (match === null) return 0;
+  if (Number(match[1]) !== 0) return 0;
   return Number(match[2]) + 1;
 }
 function multipartBody(boundary, metadata, mimeType, content) {
@@ -1306,7 +1330,9 @@ function toRemoteFile(value) {
     size: asNumber(record["size"]),
     sha256: typeof record["sha256Checksum"] === "string" ? record["sha256Checksum"] : null,
     md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
-    trashed: record["trashed"] === true
+    // Unknown, not false: false is the direction that would let the reaper
+    // authorise a deletion against a file in the wastebasket.
+    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null
   };
 }
 function asNumber(value) {
@@ -1317,7 +1343,8 @@ function asNumber(value) {
 }
 function isRateLimited(body) {
   const text = JSON.stringify(body ?? "");
-  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded") || // Not a permanent refusal either: the window resets.
+  text.includes("dailyLimitExceeded") || text.includes("rateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -1649,6 +1676,10 @@ var KV = {
   unreadableCount: "scan.unreadable_count",
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
+  /** Last time a hook started a worker. Compared with workerRanAt. */
+  workerSpawnedAt: "worker.spawned_at",
+  /** Last time a worker actually reached its main loop. */
+  workerRanAt: "worker.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: "reap.blocked_reason",
   /** Archived sessions the last reap found missing or changed on Drive. */
@@ -1663,6 +1694,7 @@ var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/adapters/spawn-worker.ts
 import { spawn } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 
 // src/core/spawn.ts
 function workerSpawnSpec(args) {
@@ -1690,6 +1722,10 @@ function detachDisabled(env) {
 // src/adapters/spawn-worker.ts
 function spawnWorker(args) {
   const logger = args.logger ?? nullLogger;
+  if (!existsSync2(args.workerPath)) {
+    logger.error("worker.missing", { path: args.workerPath });
+    return false;
+  }
   const attached = detachDisabled(args.env);
   const spec = workerSpawnSpec({
     execPath: process.execPath,
@@ -1755,10 +1791,38 @@ function emitSystemMessage(message) {
 `);
 }
 
-// src/adapters/node-locator.ts
+// src/hooks/last-resort.ts
 import fs5 from "node:fs";
-import os2 from "node:os";
 import path8 from "node:path";
+function logLastResort(event, err) {
+  try {
+    const paths = resolvePaths(process.env);
+    fs5.mkdirSync(paths.dataDir, { recursive: true });
+    const line = JSON.stringify({
+      ts: (/* @__PURE__ */ new Date()).toISOString(),
+      level: "error",
+      event,
+      err: {
+        name: err instanceof Error ? err.name : "Error",
+        message: err instanceof Error ? err.message : String(err)
+      }
+    });
+    fs5.appendFileSync(paths.logFile, `${line}
+`, { mode: 384 });
+    fs5.writeFileSync(
+      path8.join(paths.dataDir, "hook-error.json"),
+      `${JSON.stringify({ at: Date.now(), event, message: line })}
+`,
+      { mode: 384 }
+    );
+  } catch {
+  }
+}
+
+// src/adapters/node-locator.ts
+import fs6 from "node:fs";
+import os2 from "node:os";
+import path9 from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/core/node-discovery.ts
@@ -1812,7 +1876,7 @@ function findCompatibleNode(options = {}) {
   const minVersion = options.minVersion ?? MIN_NODE_VERSION;
   const now = (options.now ?? Date.now)();
   const cached2 = readCache(options.cacheFile);
-  if (cached2 !== null && fs5.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
+  if (cached2 !== null && fs6.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
     return cached2;
   }
   if (recentMiss(options.cacheFile, now)) return null;
@@ -1835,39 +1899,39 @@ function collectCandidates(env, homedir) {
   const addVersioned = (root, ...tail) => {
     let entries;
     try {
-      entries = fs5.readdirSync(root);
+      entries = fs6.readdirSync(root);
     } catch {
       return;
     }
     for (const entry of entries) {
-      const full = path8.join(root, entry, ...tail, exe);
-      if (fs5.existsSync(full)) add(full);
+      const full = path9.join(root, entry, ...tail, exe);
+      if (fs6.existsSync(full)) add(full);
     }
   };
   if (process.platform === "win32") {
     const appData = env["APPDATA"];
     const localAppData = env["LOCALAPPDATA"];
     const programFiles = env["ProgramFiles"];
-    if (appData !== void 0) addVersioned(path8.join(appData, "nvm"));
+    if (appData !== void 0) addVersioned(path9.join(appData, "nvm"));
     if (localAppData !== void 0) {
-      addVersioned(path8.join(localAppData, "fnm", "node-versions"), "installation");
-      addVersioned(path8.join(localAppData, "Volta", "tools", "image", "node"));
-      addIfPresent(path8.join(localAppData, "Programs", "nodejs", exe), add);
+      addVersioned(path9.join(localAppData, "fnm", "node-versions"), "installation");
+      addVersioned(path9.join(localAppData, "Volta", "tools", "image", "node"));
+      addIfPresent(path9.join(localAppData, "Programs", "nodejs", exe), add);
     }
-    if (programFiles !== void 0) addIfPresent(path8.join(programFiles, "nodejs", exe), add);
+    if (programFiles !== void 0) addIfPresent(path9.join(programFiles, "nodejs", exe), add);
   } else {
-    const nvm = env["NVM_DIR"] ?? path8.join(homedir, ".nvm");
-    addVersioned(path8.join(nvm, "versions", "node"), "bin");
+    const nvm = env["NVM_DIR"] ?? path9.join(homedir, ".nvm");
+    addVersioned(path9.join(nvm, "versions", "node"), "bin");
     for (const fnm of [
       env["FNM_DIR"],
-      path8.join(homedir, ".fnm"),
-      path8.join(homedir, ".local", "share", "fnm")
+      path9.join(homedir, ".fnm"),
+      path9.join(homedir, ".local", "share", "fnm")
     ]) {
-      if (fnm !== void 0) addVersioned(path8.join(fnm, "node-versions"), "installation", "bin");
+      if (fnm !== void 0) addVersioned(path9.join(fnm, "node-versions"), "installation", "bin");
     }
-    addVersioned(path8.join(homedir, ".volta", "tools", "image", "node"), "bin");
-    addVersioned(path8.join(homedir, ".local", "share", "mise", "installs", "node"), "bin");
-    addVersioned(path8.join(homedir, ".asdf", "installs", "nodejs"), "bin");
+    addVersioned(path9.join(homedir, ".volta", "tools", "image", "node"), "bin");
+    addVersioned(path9.join(homedir, ".local", "share", "mise", "installs", "node"), "bin");
+    addVersioned(path9.join(homedir, ".asdf", "installs", "nodejs"), "bin");
     for (const fixed of ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]) {
       addIfPresent(fixed, add);
     }
@@ -1875,7 +1939,7 @@ function collectCandidates(env, homedir) {
   return candidates;
 }
 function addIfPresent(candidatePath, add) {
-  if (fs5.existsSync(candidatePath)) add(candidatePath);
+  if (fs6.existsSync(candidatePath)) add(candidatePath);
 }
 function reexec(nodePath, env = process.env) {
   const result = spawnSync(nodePath, [...process.execArgv, ...process.argv.slice(1)], {
@@ -1892,7 +1956,7 @@ function alreadyReexeced(env) {
 function readCache(file) {
   if (file === void 0) return null;
   try {
-    const parsed = JSON.parse(fs5.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs6.readFileSync(file, "utf8"));
     if (typeof parsed !== "object" || parsed === null) return null;
     const { path: cachedPath, version } = parsed;
     if (typeof cachedPath !== "string" || typeof version !== "string") return null;
@@ -1905,7 +1969,7 @@ var MISS_TTL_MS = 10 * 6e4;
 function recentMiss(file, now) {
   if (file === void 0) return false;
   try {
-    const parsed = JSON.parse(fs5.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs6.readFileSync(file, "utf8"));
     const missedAt = parsed?.missedAt;
     return typeof missedAt === "number" && now - missedAt < MISS_TTL_MS;
   } catch {
@@ -1915,8 +1979,8 @@ function recentMiss(file, now) {
 function writeMiss(file, now) {
   if (file === void 0) return;
   try {
-    fs5.mkdirSync(path8.dirname(file), { recursive: true });
-    fs5.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
+    fs6.mkdirSync(path9.dirname(file), { recursive: true });
+    fs6.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
 `, { mode: 384 });
   } catch {
   }
@@ -1924,8 +1988,8 @@ function writeMiss(file, now) {
 function writeCache(file, found) {
   if (file === void 0) return;
   try {
-    fs5.mkdirSync(path8.dirname(file), { recursive: true });
-    fs5.writeFileSync(file, `${JSON.stringify(found)}
+    fs6.mkdirSync(path9.dirname(file), { recursive: true });
+    fs6.writeFileSync(file, `${JSON.stringify(found)}
 `, { mode: 384 });
   } catch {
   }
@@ -1960,6 +2024,7 @@ async function main() {
       return;
     }
     runtime.logger.info("hook.session_start.sweeping", { source: input?.source ?? null });
+    kvSetNumber(runtime.db(), KV.workerSpawnedAt, now, now);
     spawnWorker({
       workerPath: workerPath(),
       env: process.env,
@@ -1971,10 +2036,11 @@ async function main() {
   }
 }
 function workerPath() {
-  return path9.join(path9.dirname(fileURLToPath(import.meta.url)), "worker.mjs");
+  return path10.join(path10.dirname(fileURLToPath(import.meta.url)), "worker.mjs");
 }
 try {
   await main();
-} catch {
+} catch (err) {
+  logLastResort("hook.session_start_failed", err);
 }
 process.exit(0);

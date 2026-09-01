@@ -302,11 +302,23 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
 
       await fsp.mkdir(path.dirname(args.destination), { recursive: true });
       const temp = siblingTempPath(args.destination);
+      const declared = asNumber(response.headers.get('content-length'));
       try {
         await pipeline(
           Readable.fromWeb(response.body),
           fs.createWriteStream(temp, { flags: 'wx', mode: 0o600 }),
         );
+        // A connection dropped mid-body arrives as a short file with no error.
+        // Callers hash what they downloaded, so this is a second line — but
+        // the catalog import has no hash to check, and a truncated SQLite file
+        // is exactly the shape that costs someone their history.
+        const written = (await fsp.stat(temp)).size;
+        if (declared !== null && written !== declared) {
+          throw new RetryableError(
+            `Drive sent ${String(written)} bytes of ${String(declared)} for ${args.fileId}`,
+          );
+        }
+        if (written === 0) throw new RetryableError(`Drive sent nothing for ${args.fileId}`);
         await renameWithRetry(temp, args.destination);
       } catch (err) {
         await fsp.rm(temp, { force: true }).catch(() => undefined);
@@ -361,9 +373,24 @@ export async function interpretUploadResponse(
   const message = describeApiError(response.status, body);
   // Chunks are uploaded with retry disabled, because replaying one blindly is
   // how a resumable upload corrupts itself. That left this the only classifier
-  // for a chunk's status — and it called 429 a refusal, so a single rate limit
-  // during the initial backfill blocked that session's backup for good, with no
-  // circuit breaker and nothing that ever retried it.
+  // for a chunk's status — and it called a rate limit a refusal, so one during
+  // the initial backfill (the heaviest Drive traffic this plugin ever makes)
+  // blocked that session's backup for good.
+  if (response.status === 403 && isQuotaExhausted(body)) {
+    throw new FatalError(
+      `Drive refused the upload: ${message}`,
+      'Free space in Google Drive, then run /archive:now.',
+      { status: response.status },
+    );
+  }
+  // 403 is Drive's other way of saying "slow down", and it is the one the
+  // sibling classifier already handled and this one did not.
+  if (response.status === 403 && isRateLimited(body)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response),
+    });
+  }
   if (isRetryableHttpStatus(response.status)) {
     throw new RetryableError(`Drive upload failed: ${message}`, {
       status: response.status,
@@ -390,6 +417,9 @@ export function confirmedFromRange(header: string | null): number {
   if (header === null) return 0;
   const match = /bytes=(\d+)-(\d+)/.exec(header.trim());
   if (match === null) return 0;
+  // A range that does not start at 0 describes a hole, not a prefix. Resuming
+  // from its upper bound would upload bytes around a gap.
+  if (Number(match[1]) !== 0) return 0;
   return Number(match[2]) + 1;
 }
 
@@ -435,7 +465,9 @@ export function toRemoteFile(value: unknown): RemoteFile {
     size: asNumber(record['size']),
     sha256: typeof record['sha256Checksum'] === 'string' ? record['sha256Checksum'] : null,
     md5: typeof record['md5Checksum'] === 'string' ? record['md5Checksum'] : null,
-    trashed: record['trashed'] === true,
+    // Unknown, not false: false is the direction that would let the reaper
+    // authorise a deletion against a file in the wastebasket.
+    trashed: typeof record['trashed'] === 'boolean' ? record['trashed'] : null,
   };
 }
 
@@ -452,7 +484,10 @@ function isRateLimited(body: unknown): boolean {
   return (
     text.includes('rateLimitExceeded') ||
     text.includes('userRateLimitExceeded') ||
-    text.includes('sharingRateLimitExceeded')
+    text.includes('sharingRateLimitExceeded') ||
+    // Not a permanent refusal either: the window resets.
+    text.includes('dailyLimitExceeded') ||
+    text.includes('rateLimitExceeded')
   );
 }
 

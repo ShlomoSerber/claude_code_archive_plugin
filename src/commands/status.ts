@@ -5,6 +5,8 @@ import { KV } from '../core/state-keys.ts';
 import { competingCleanupSettings, readCleanupPeriodDays } from '../adapters/claude-settings.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { readStatusFile } from '../worker/status.ts';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import type { Runtime } from '../composition.ts';
 import { formatBytes, formatDate, formatRelative, print, printJson } from './output.ts';
 
@@ -14,6 +16,18 @@ import { formatBytes, formatDate, formatRelative, print, printJson } from './out
  * It reads state rather than doing work, so it stays instant and never needs
  * the network unless the user asks for the Drive quota.
  */
+/** The line a hook wrote when it could not even open the catalog. */
+async function readHookError(dataDir: string): Promise<string | null> {
+  try {
+    const raw = await fsp.readFile(path.join(dataDir, 'hook-error.json'), 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    const message = (parsed as { message?: unknown } | null)?.message;
+    return typeof message === 'string' ? message.slice(0, 300) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function runStatus(
   runtime: Runtime,
   options: { json?: boolean; quota?: boolean },
@@ -32,6 +46,12 @@ export async function runStatus(
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
+  const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
+  const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
+  // A worker that dies on its first line looks exactly like a healthy one:
+  // spawn() succeeds because the interpreter exists, and stdio is discarded.
+  const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 60_000;
+  const hookError = await readHookError(runtime.paths.dataDir);
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore
     .read()
@@ -61,6 +81,10 @@ export async function runStatus(
       unreadable,
       unconfirmable,
       reapUnverified,
+      workerSpawnedAt,
+      workerRanAt,
+      workerNeverRan,
+      hookError,
       reapBlocked: reapBlocked === '' ? null : reapBlocked,
       retainedBundles: retained.map((entry) => ({
         sessionId: entry.sessionId,
@@ -130,6 +154,13 @@ export async function runStatus(
     print(
       `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`,
     );
+  }
+  if (workerNeverRan) {
+    print(`  WARNING:            the background worker was started but never ran.`);
+    print(`                      Nothing is being archived. Run /archive:now and check the log.`);
+  }
+  if (hookError !== null) {
+    print(`  WARNING:            a hook failed: ${hookError}`);
   }
   if (reapBlocked !== '') {
     // The remediation Drive's refusal came with. It used to be swallowed here,

@@ -39,6 +39,33 @@ export async function runSetup(runtime: Runtime, options: SetupOptions = {}): Pr
   const client = await resolveOAuthClient(runtime.env, runtime.paths.dataDir);
   steps['clientId'] = `${client.clientId.slice(0, 12)}…`;
 
+  // From here on the plugin is meant to be the only thing that deletes a
+  // transcript. If something outranks the file we write, that is not true, and
+  // the plugin would archive on the assumption of a safety it does not have.
+  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  if (competing.length > 0) {
+    const list = competing.map((entry) => `${entry.file} (${String(entry.value)})`).join(', ');
+    throw new FatalError(
+      `another settings file also sets cleanupPeriodDays: ${list}`,
+      'That file takes precedence over the one this plugin writes, so Claude Code ' +
+        'would keep deleting transcripts on its own schedule. Remove ' +
+        'cleanupPeriodDays from it, then run /archive:setup again.',
+    );
+  }
+
+  // Before the sign-in, deliberately. Claude Code's own reaper deletes
+  // transcripts after 30 days, and the plugin looks installed from the moment
+  // the hooks land — so every minute between installing it and finishing a
+  // login was a minute where nothing was archived and the reaper was still
+  // running. Writing the setting first costs nothing and stops that clock.
+  const settings = await setCleanupPeriodDays(runtime.paths.settingsFile, CLEANUP_PERIOD_DAYS);
+  steps['cleanupPeriodDays'] = settings;
+  if (settings.changed) {
+    print(
+      `Set cleanupPeriodDays to ${String(settings.current)} so Claude Code stops deleting transcripts.`,
+    );
+  }
+
   const auth = await runtime.auth();
   const alreadySignedIn = await auth.hasCredentials();
   if (!alreadySignedIn || options.reauth === true) {
@@ -63,28 +90,6 @@ export async function runSetup(runtime: Runtime, options: SetupOptions = {}): Pr
     }
   } else {
     steps['signIn'] = 'already signed in';
-  }
-
-  // From here on the plugin is meant to be the only thing that deletes a
-  // transcript. If something outranks the file we write, that is not true, and
-  // the plugin would archive on the assumption of a safety it does not have.
-  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
-  if (competing.length > 0) {
-    const list = competing.map((entry) => `${entry.file} (${String(entry.value)})`).join(', ');
-    throw new FatalError(
-      `another settings file also sets cleanupPeriodDays: ${list}`,
-      'That file takes precedence over the one this plugin writes, so Claude Code ' +
-        'would keep deleting transcripts on its own schedule. Remove ' +
-        'cleanupPeriodDays from it, then run /archive:setup again.',
-    );
-  }
-
-  const settings = await setCleanupPeriodDays(runtime.paths.settingsFile, CLEANUP_PERIOD_DAYS);
-  steps['cleanupPeriodDays'] = settings;
-  if (settings.changed) {
-    print(
-      `Set cleanupPeriodDays to ${String(settings.current)} so Claude Code stops deleting transcripts.`,
-    );
   }
 
   const imported = await importCatalogIfEmpty(runtime);
@@ -228,6 +233,18 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
       }
       const values = row as unknown as Record<string, string | number | null | undefined>;
       const inserted = insertSession.run(...columnNames.map((name) => values[name] ?? null));
+      // An older catalog may predate verified_bundle_sha256, and restore needs
+      // a hash or it refuses for ever — on the machine whose disk is gone,
+      // which is the only machine that ever runs this. bundle_sha256 described
+      // the same bundle in the schema that had only that column.
+      if (Number(inserted.changes) > 0) {
+        db.prepare(
+          `UPDATE sessions
+              SET verified_bundle_sha256 = bundle_sha256
+            WHERE session_id = ? AND verified_bundle_sha256 IS NULL
+              AND bundle_sha256 IS NOT NULL AND verified_at IS NOT NULL`,
+        ).run(record.sessionId);
+      }
       // The prompts and the file list are what search runs on, and both inserts
       // ignore conflicts, so they are worth doing for a row we already had.
       for (const prompt of selectPrompts.all(record.sessionId) as {

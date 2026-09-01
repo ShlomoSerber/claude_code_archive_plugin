@@ -518,7 +518,9 @@ function rotateIfLarge(state) {
   if (size <= state.maxBytes) return;
   try {
     fs2.renameSync(state.file, `${state.file}.1`);
-  } catch {
+  } catch (err) {
+    const code = err.code;
+    if (code === "ENOENT") return;
     try {
       fs2.rmSync(`${state.file}.1`, { force: true });
       fs2.renameSync(state.file, `${state.file}.1`);
@@ -1520,11 +1522,19 @@ function createDriveTransport(deps) {
       if (response.body === null) throw new RetryableError("Drive returned an empty body");
       await fsp4.mkdir(path5.dirname(args.destination), { recursive: true });
       const temp = siblingTempPath(args.destination);
+      const declared = asNumber(response.headers.get("content-length"));
       try {
         await pipeline(
           Readable.fromWeb(response.body),
           fs4.createWriteStream(temp, { flags: "wx", mode: 384 })
         );
+        const written = (await fsp4.stat(temp)).size;
+        if (declared !== null && written !== declared) {
+          throw new RetryableError(
+            `Drive sent ${String(written)} bytes of ${String(declared)} for ${args.fileId}`
+          );
+        }
+        if (written === 0) throw new RetryableError(`Drive sent nothing for ${args.fileId}`);
         await renameWithRetry(temp, args.destination);
       } catch (err) {
         await fsp4.rm(temp, { force: true }).catch(() => void 0);
@@ -1566,6 +1576,19 @@ async function interpretUploadResponse(response, totalBytes) {
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  if (response.status === 403 && isQuotaExhausted(body)) {
+    throw new FatalError(
+      `Drive refused the upload: ${message}`,
+      "Free space in Google Drive, then run /archive:now.",
+      { status: response.status }
+    );
+  }
+  if (response.status === 403 && isRateLimited(body)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response)
+    });
+  }
   if (isRetryableHttpStatus(response.status)) {
     throw new RetryableError(`Drive upload failed: ${message}`, {
       status: response.status,
@@ -1588,6 +1611,7 @@ function confirmedFromRange(header) {
   if (header === null) return 0;
   const match = /bytes=(\d+)-(\d+)/.exec(header.trim());
   if (match === null) return 0;
+  if (Number(match[1]) !== 0) return 0;
   return Number(match[2]) + 1;
 }
 function alignChunkSize(size) {
@@ -1627,7 +1651,9 @@ function toRemoteFile(value) {
     size: asNumber(record["size"]),
     sha256: typeof record["sha256Checksum"] === "string" ? record["sha256Checksum"] : null,
     md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
-    trashed: record["trashed"] === true
+    // Unknown, not false: false is the direction that would let the reaper
+    // authorise a deletion against a file in the wastebasket.
+    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null
   };
 }
 function asNumber(value) {
@@ -1638,7 +1664,8 @@ function asNumber(value) {
 }
 function isRateLimited(body) {
   const text = JSON.stringify(body ?? "");
-  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded");
+  return text.includes("rateLimitExceeded") || text.includes("userRateLimitExceeded") || text.includes("sharingRateLimitExceeded") || // Not a permanent refusal either: the window resets.
+  text.includes("dailyLimitExceeded") || text.includes("rateLimitExceeded");
 }
 function isQuotaExhausted(body) {
   const text = JSON.stringify(body ?? "");
@@ -2369,6 +2396,10 @@ function countPrompts(db, sessionId) {
   const row = db.prepare("SELECT count(*) AS n FROM prompts WHERE session_id = ?").get(sessionId);
   return row?.n ?? 0;
 }
+function countSessionFiles(db, sessionId) {
+  const row = db.prepare("SELECT count(*) AS n FROM session_files WHERE session_id = ?").get(sessionId);
+  return row?.n ?? 0;
+}
 function recordRetainedBundle(db, entry, now) {
   db.prepare(
     `INSERT INTO retained_bundles
@@ -2641,6 +2672,13 @@ function block(db, job, args) {
       WHERE id = ?`
   ).run(args.error, args.now, job.id);
 }
+function unblockStale(db, now, olderThanMs) {
+  const result = db.prepare(
+    `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND updated_at <= ?`
+  ).run(now, now, now - olderThanMs);
+  return Number(result.changes);
+}
 function setUploadUri(db, job, uri, now) {
   db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?").run(uri, now, job.id);
 }
@@ -2723,6 +2761,10 @@ var KV = {
   unreadableCount: "scan.unreadable_count",
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
+  /** Last time a hook started a worker. Compared with workerRanAt. */
+  workerSpawnedAt: "worker.spawned_at",
+  /** Last time a worker actually reached its main loop. */
+  workerRanAt: "worker.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: "reap.blocked_reason",
   /** Archived sessions the last reap found missing or changed on Drive. */
@@ -6438,7 +6480,9 @@ async function indexSession(ctx, session, previous, now) {
     if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
       replacePrompts(ctx.db, session.sessionId, summary.prompts);
     }
-    replaceFiles(ctx.db, session.sessionId, summary.files);
+    if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
+      replaceFiles(ctx.db, session.sessionId, summary.files);
+    }
     if (summary.malformedLines > 0) {
       log.warn("catalog.malformed_lines", { count: summary.malformedLines });
     }
@@ -6694,7 +6738,7 @@ function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
     return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
   }
-  if (remote.trashed) return "the remote copy is in the wastebasket";
+  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6847,7 +6891,8 @@ async function confirmRemote(ctx, record, report) {
   if (record.remoteFileId === null) return "gone";
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-    if (remote.trashed) return "gone";
+    if (remote.trashed === true) return "gone";
+    if (remote.trashed === null) return "unavailable";
     const expectedBytes = record.verifiedBundleBytes;
     if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return "gone";
@@ -6936,6 +6981,8 @@ async function runSweep(ctx, options = {}) {
   }
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
+  const revived = unblockStale(ctx.db, startedAt, BLOCK_RETRY_MS);
+  if (revived > 0) ctx.logger.info("sweep.unblocked_stale", { count: revived });
   const discovery = await discover(ctx, startedAt, {
     unblock: options.unblock === true,
     runNow: options.runNow === true
@@ -7134,6 +7181,7 @@ function clockLooksSane(ctx, now) {
   }
   return true;
 }
+var BLOCK_RETRY_MS = 24 * 60 * 6e4;
 var DEBOUNCE_WAIT_MS = 6e4;
 var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
@@ -7171,15 +7219,25 @@ async function uploadCatalogCopy(ctx) {
       },
       ctx.signal
     );
-    if (uploaded.trashed) {
+    let stored = uploaded;
+    if (stored.trashed === true) {
+      ctx.logger.warn("catalog.copy_trashed", { file_id: stored.id });
       kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
-      ctx.logger.warn("catalog.copy_trashed", { file_id: uploaded.id });
-      return false;
+      stored = await ctx.drive.uploadSmallFile(
+        {
+          name: catalogFileName(machineId(ctx)),
+          parentId,
+          mimeType: "application/vnd.sqlite3",
+          body: await fsp12.readFile(destination)
+        },
+        ctx.signal
+      );
+      if (stored.trashed === true) return false;
     }
     const now = ctx.clock.now();
-    kvSet(ctx.db, KV.catalogFileId, uploaded.id, now);
+    kvSet(ctx.db, KV.catalogFileId, stored.id, now);
     kvSetNumber(ctx.db, KV.catalogUploadedAt, now, now);
-    ctx.logger.info("catalog.uploaded", { file_id: uploaded.id });
+    ctx.logger.info("catalog.uploaded", { file_id: stored.id });
     return true;
   } catch (err) {
     kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
@@ -7947,7 +8005,7 @@ async function verifyArchive(ctx, records) {
     report.checked++;
     try {
       const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      if (!remote.trashed && remote.sha256 === null) {
+      if (remote.trashed !== true && remote.sha256 === null) {
         report.checked--;
         report.unchecked.push({
           sessionId: record.sessionId,
@@ -7955,7 +8013,7 @@ async function verifyArchive(ctx, records) {
         });
         continue;
       }
-      const reason = remote.trashed ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
+      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
       if (reason === null) {
         report.ok++;
       } else {
@@ -8174,6 +8232,21 @@ async function runSetup(runtime, options = {}) {
   const steps = {};
   const client = await resolveOAuthClient(runtime.env, runtime.paths.dataDir);
   steps["clientId"] = `${client.clientId.slice(0, 12)}\u2026`;
+  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  if (competing.length > 0) {
+    const list = competing.map((entry) => `${entry.file} (${String(entry.value)})`).join(", ");
+    throw new FatalError(
+      `another settings file also sets cleanupPeriodDays: ${list}`,
+      "That file takes precedence over the one this plugin writes, so Claude Code would keep deleting transcripts on its own schedule. Remove cleanupPeriodDays from it, then run /archive:setup again."
+    );
+  }
+  const settings = await setCleanupPeriodDays(runtime.paths.settingsFile, CLEANUP_PERIOD_DAYS);
+  steps["cleanupPeriodDays"] = settings;
+  if (settings.changed) {
+    print(
+      `Set cleanupPeriodDays to ${String(settings.current)} so Claude Code stops deleting transcripts.`
+    );
+  }
   const auth = await runtime.auth();
   const alreadySignedIn = await auth.hasCredentials();
   if (!alreadySignedIn || options.reauth === true) {
@@ -8198,21 +8271,6 @@ async function runSetup(runtime, options = {}) {
     }
   } else {
     steps["signIn"] = "already signed in";
-  }
-  const competing = await competingCleanupSettings(runtime.paths.claudeDir);
-  if (competing.length > 0) {
-    const list = competing.map((entry) => `${entry.file} (${String(entry.value)})`).join(", ");
-    throw new FatalError(
-      `another settings file also sets cleanupPeriodDays: ${list}`,
-      "That file takes precedence over the one this plugin writes, so Claude Code would keep deleting transcripts on its own schedule. Remove cleanupPeriodDays from it, then run /archive:setup again."
-    );
-  }
-  const settings = await setCleanupPeriodDays(runtime.paths.settingsFile, CLEANUP_PERIOD_DAYS);
-  steps["cleanupPeriodDays"] = settings;
-  if (settings.changed) {
-    print(
-      `Set cleanupPeriodDays to ${String(settings.current)} so Claude Code stops deleting transcripts.`
-    );
   }
   const imported = await importCatalogIfEmpty(runtime);
   if (imported > 0) {
@@ -8308,6 +8366,14 @@ function importCatalogFile(runtime, file) {
       }
       const values = row;
       const inserted = insertSession.run(...columnNames.map((name) => values[name] ?? null));
+      if (Number(inserted.changes) > 0) {
+        db.prepare(
+          `UPDATE sessions
+              SET verified_bundle_sha256 = bundle_sha256
+            WHERE session_id = ? AND verified_bundle_sha256 IS NULL
+              AND bundle_sha256 IS NOT NULL AND verified_at IS NOT NULL`
+        ).run(record.sessionId);
+      }
       for (const prompt of selectPrompts.all(record.sessionId)) {
         insertPrompt.run(record.sessionId, prompt.seq, prompt.ts, prompt.text);
       }
@@ -8334,6 +8400,18 @@ function importCatalogFile(runtime, file) {
 }
 
 // src/commands/status.ts
+import fsp17 from "node:fs/promises";
+import path19 from "node:path";
+async function readHookError(dataDir) {
+  try {
+    const raw = await fsp17.readFile(path19.join(dataDir, "hook-error.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    const message = parsed?.message;
+    return typeof message === "string" ? message.slice(0, 300) : null;
+  } catch {
+    return null;
+  }
+}
 async function runStatus(runtime, options) {
   const db = runtime.db();
   const now = runtime.clock.now();
@@ -8349,6 +8427,10 @@ async function runStatus(runtime, options) {
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? "";
+  const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
+  const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
+  const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 6e4;
+  const hookError = await readHookError(runtime.paths.dataDir);
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
@@ -8372,6 +8454,10 @@ async function runStatus(runtime, options) {
       unreadable,
       unconfirmable,
       reapUnverified,
+      workerSpawnedAt,
+      workerRanAt,
+      workerNeverRan,
+      hookError,
       reapBlocked: reapBlocked === "" ? null : reapBlocked,
       retainedBundles: retained.map((entry) => ({
         sessionId: entry.sessionId,
@@ -8436,6 +8522,13 @@ async function runStatus(runtime, options) {
     print(
       `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`
     );
+  }
+  if (workerNeverRan) {
+    print(`  WARNING:            the background worker was started but never ran.`);
+    print(`                      Nothing is being archived. Run /archive:now and check the log.`);
+  }
+  if (hookError !== null) {
+    print(`  WARNING:            a hook failed: ${hookError}`);
   }
   if (reapBlocked !== "") {
     print(`  WARNING:            Drive would not answer the last check:`);

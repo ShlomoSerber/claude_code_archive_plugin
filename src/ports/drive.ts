@@ -23,7 +23,8 @@ export type RemoteFile = {
    * conflates them will delete a local copy against a bundle that has about
    * thirty days left to live.
    */
-  trashed: boolean;
+  /** null when Drive did not say, which is never read as "not trashed". */
+  trashed: boolean | null;
 };
 
 export type UploadProgress = {

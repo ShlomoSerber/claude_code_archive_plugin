@@ -1,6 +1,8 @@
 // Must come first: it silences the node:sqlite warning before SQLite loads.
 import '../core/quiet.ts';
 import { acquireLock } from '../adapters/lock.ts';
+import { kvSetNumber } from '../adapters/db.ts';
+import { KV } from '../core/state-keys.ts';
 import { createRuntime } from '../composition.ts';
 import { FatalError, toErrorInfo } from '../core/errors.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
@@ -46,6 +48,11 @@ async function main(): Promise<void> {
     runtime.close();
     return;
   }
+
+  // Proof of life, compared against the hooks' spawn timestamp by
+  // /archive:status: spawn() succeeds even when the worker bundle is missing
+  // or dies on its first line, and nothing else would ever notice.
+  kvSetNumber(runtime.db(), KV.workerRanAt, runtime.clock.now(), runtime.clock.now());
 
   const lock = acquireLock(runtime.paths.lockDir, { logger: runtime.logger, clock: runtime.clock });
   if (lock === null) {

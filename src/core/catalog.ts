@@ -264,6 +264,14 @@ export function countPrompts(db: Db, sessionId: string): number {
   return row?.n ?? 0;
 }
 
+/** How many touched-file rows the catalog already holds for a session. */
+export function countSessionFiles(db: Db, sessionId: string): number {
+  const row = db
+    .prepare('SELECT count(*) AS n FROM session_files WHERE session_id = ?')
+    .get(sessionId) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 export function recordRetainedBundle(
   db: Db,
   entry: {

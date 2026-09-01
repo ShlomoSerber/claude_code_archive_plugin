@@ -6,10 +6,11 @@ import { createRuntime } from '../composition.ts';
 import { enqueue } from '../core/queue.ts';
 import { encodedDirOfTranscript, sessionIdOfTranscript } from '../core/paths.ts';
 import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
-import { kvDelete } from '../adapters/db.ts';
-import { activeSessionKey } from '../core/state-keys.ts';
+import { kvDelete, kvSetNumber } from '../adapters/db.ts';
+import { KV, activeSessionKey } from '../core/state-keys.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
+import { logLastResort } from './last-resort.ts';
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
 import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
 import { resolvePaths } from '../core/paths.ts';
@@ -88,6 +89,7 @@ async function main(): Promise<void> {
       reason: input?.reason ?? null,
     });
 
+    kvSetNumber(runtime.db(), KV.workerSpawnedAt, now, now);
     spawnWorker({
       workerPath: workerPath(),
       env: process.env,
@@ -105,7 +107,10 @@ function workerPath(): string {
 
 try {
   await main();
-} catch {
-  // Swallowed on purpose: the log has it, and the session must not care.
+} catch (err) {
+  // Swallowed on purpose — the session must not care — but never silently:
+  // this writes with node:fs alone, so it still works when the catalog is
+  // corrupt or the data directory is not writable by this user.
+  logLastResort('hook.session_end_failed', err);
 }
 process.exit(0);

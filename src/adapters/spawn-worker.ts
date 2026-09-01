@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { detachDisabled, workerSpawnSpec } from '../core/spawn.ts';
 import { nullLogger, type Logger } from '../ports/logger.ts';
 
@@ -17,6 +18,13 @@ export function spawnWorker(args: {
   logger?: Logger;
 }): boolean {
   const logger = args.logger ?? nullLogger;
+  // spawn() reports success as long as `process.execPath` exists — the worker
+  // file is only an argument, so a missing or quarantined bundle produced a
+  // "worker.spawned" log line, a job queued for ever, and no other signal.
+  if (!existsSync(args.workerPath)) {
+    logger.error('worker.missing', { path: args.workerPath });
+    return false;
+  }
   const attached = detachDisabled(args.env);
   const spec = workerSpawnSpec({
     execPath: process.execPath,

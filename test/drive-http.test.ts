@@ -265,3 +265,41 @@ describe('classifying a chunk upload response', () => {
     assert.ok(err instanceof FatalError);
   });
 });
+
+describe('a rate limit on a chunk upload', () => {
+  it('is retryable, not a refusal', async () => {
+    // The heaviest Drive traffic this plugin ever makes is the initial
+    // backfill, and 403 is Drive's other way of saying "slow down". Calling it
+    // fatal blocked that session's backup permanently.
+    const body = JSON.stringify({
+      error: {
+        code: 403,
+        message: 'Rate Limit Exceeded',
+        errors: [{ reason: 'rateLimitExceeded' }],
+      },
+    });
+    const err = await interpretUploadResponse(new Response(body, { status: 403 }), 10).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    assert.ok(err instanceof RetryableError, `classified as ${String(err)}`);
+  });
+
+  it('is still fatal when Drive is actually full', async () => {
+    const body = JSON.stringify({
+      error: { code: 403, errors: [{ reason: 'storageQuotaExceeded' }] },
+    });
+    const err = await interpretUploadResponse(new Response(body, { status: 403 }), 10).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    assert.ok(err instanceof FatalError);
+  });
+});
+
+describe('a resumable range that is not a prefix', () => {
+  it('restarts rather than uploading around a hole', () => {
+    assert.equal(confirmedFromRange('bytes=0-99'), 100);
+    assert.equal(confirmedFromRange('bytes=100-200'), 0, 'a gap is not a resume point');
+  });
+});

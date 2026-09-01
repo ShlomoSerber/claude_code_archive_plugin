@@ -112,12 +112,18 @@ function rotateIfLarge(state: WriterState): void {
     // backup another had just written and then fail its own rename, leaving
     // neither file. Windows needs the remove, so it is the fallback.
     fs.renameSync(state.file, `${state.file}.1`);
-  } catch {
+  } catch (err) {
+    // ENOENT means another process rotated first — its backup is the one to
+    // keep, and removing it here would destroy a generation of the log for
+    // nothing. Only Windows' "cannot rename onto an existing file" is worth
+    // the destructive retry.
+    const code = (err as { code?: string }).code;
+    if (code === 'ENOENT') return;
     try {
       fs.rmSync(`${state.file}.1`, { force: true });
       fs.renameSync(state.file, `${state.file}.1`);
     } catch {
-      // Another process rotated first; either way, keep appending.
+      // Keep appending to the file we have.
     }
   }
 }

@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { spawnWorker } from '../src/adapters/spawn-worker.ts';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import {
@@ -1749,12 +1752,13 @@ describe('the plugin keeps archiving', () => {
     // whole archive behind advice that did nothing.
     const harness = makeHarness();
     const db = harness.ctx.db;
-    enqueue(db, { kind: 'backup', sessionId: SESSION_A, payload: { encodedDir: ENCODED } }, 1000);
-    const job = claim(db, 1000, 60_000)!;
-    block(db, job, { error: 'Drive is full', now: 1000 });
+    const at = harness.clock.now();
+    enqueue(db, { kind: 'backup', sessionId: SESSION_A, payload: { encodedDir: ENCODED } }, at);
+    const job = claim(db, at, 60_000)!;
+    block(db, job, { error: 'Drive is full', now: at });
     assert.equal(getJob(db, job.id)?.blocked, true);
 
-    // A background sweep leaves it parked.
+    // A background sweep leaves a fresh block parked.
     await runSweep(harness.ctx);
     assert.equal(getJob(db, job.id)?.blocked, true, 'a rescan does not unblock');
 
@@ -1762,6 +1766,22 @@ describe('the plugin keeps archiving', () => {
     harness.clock.advance(60_000);
     await runSweep(harness.ctx, { force: true, unblock: true });
     assert.ok(getSession(db, SESSION_A)?.verifiedAt, 'the session is archived after the retry');
+  });
+
+  it('gives a job parked a day ago another chance on its own', async () => {
+    // A block is for a fault a person must fix — but a rate limit and a full
+    // disk park a job the same way, and a session nobody opens again would
+    // then never be archived again.
+    const harness = makeHarness();
+    const db = harness.ctx.db;
+    const at = harness.clock.now();
+    enqueue(db, { kind: 'backup', sessionId: SESSION_A, payload: { encodedDir: ENCODED } }, at);
+    const job = claim(db, at, 60_000)!;
+    block(db, job, { error: 'rate limited', now: at });
+
+    harness.clock.advance(25 * 60 * 60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.ok(getSession(db, SESSION_A)?.verifiedAt, 'the plugin picks it up again by itself');
   });
 
   it('keeps an open session safe for longer than the retention window', () => {
@@ -2268,10 +2288,7 @@ describe('a damaged local file does not damage the index of the archived one', (
       .get(SESSION_A) as { n: number };
 
     // Same size and then some, but nothing the extractor understands.
-    fs.appendFileSync(
-      harness.transcriptOf(SESSION_A),
-      '{"v":2,"kind":"unknown"}\n'.repeat(40),
-    );
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"v":2,"kind":"unknown"}\n'.repeat(40));
     harness.clock.advance(60_000);
     await runSweep(harness.ctx, { force: true });
 
@@ -2303,5 +2320,63 @@ describe('the catalog copy on Drive', () => {
       (file) => file.name === name && !harness.drive.trashedIds.has(file.id),
     );
     assert.equal(live.length, 1, 'a live catalog copy exists again');
+  });
+});
+
+/**
+ * Nineteenth round. Objective 1 held under 650 randomized runs, concurrent
+ * workers with the lock removed, hostile bundles and injected filesystem
+ * faults. All three findings were silent stoppage: the plugin holding the
+ * data and no longer doing its job, with nothing saying so.
+ */
+describe('a hook that cannot even open the catalog', () => {
+  it('leaves a record instead of failing in silence', () => {
+    const home = tempDir();
+    const dataDir = path.join(home, 'data');
+    const projectDir = path.join(home, '.claude', 'projects', ENCODED);
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(projectDir, { recursive: true });
+    const transcript = path.join(projectDir, `${SESSION_A}.jsonl`);
+    fs.writeFileSync(transcript, '{"type":"user"}\n');
+    // What a hard power-off leaves behind.
+    fs.writeFileSync(path.join(dataDir, 'archive.sqlite'), randomBytes(4096));
+
+    const result = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', '--no-warnings', path.resolve('src/hooks/session-end.ts')],
+      {
+        input: JSON.stringify({ session_id: SESSION_A, transcript_path: transcript }),
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+          ARCHIVE_DATA_DIR: dataDir,
+        },
+        encoding: 'utf8',
+      },
+    );
+
+    assert.equal(result.status, 0, 'a hook never disturbs the session');
+    const wrote = fs.existsSync(path.join(dataDir, 'hook-error.json'));
+    assert.ok(wrote, 'the failure is recorded where /archive:status reads it');
+  });
+});
+
+describe('a worker that never starts', () => {
+  it('is refused rather than reported as spawned', () => {
+    const logged: string[] = [];
+    const started = spawnWorker({
+      workerPath: path.join(tempDir(), 'worker.mjs'),
+      env: process.env,
+      cwd: tempDir(),
+      logger: {
+        ...nullLogger,
+        error: (event: string) => logged.push(event),
+      },
+    });
+    // spawn() succeeds whenever process.execPath exists — the worker file is
+    // only an argument — so a quarantined bundle logged "worker.spawned",
+    // queued a job for ever, and gave no other signal.
+    assert.equal(started, false);
+    assert.deepEqual(logged, ['worker.missing']);
   });
 });

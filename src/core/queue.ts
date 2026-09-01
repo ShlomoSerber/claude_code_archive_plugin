@@ -216,6 +216,25 @@ export function block(db: Db, job: Job, args: { error: string; now: number }): v
   ).run(args.error, args.now, job.id);
 }
 
+/**
+ * Retry jobs that were parked long enough ago that the cause may have passed.
+ *
+ * A block is meant for a fault a person has to fix, and /archive:now is what
+ * clears it. But a rate limit or a full disk parks a job the same way, and a
+ * session that is never opened again is never archived again — the plugin
+ * silently gives up on one conversation for ever. Once a day is rare enough
+ * not to hammer a Drive that is genuinely refusing us.
+ */
+export function unblockStale(db: Db, now: number, olderThanMs: number): number {
+  const result = db
+    .prepare(
+      `UPDATE jobs SET blocked = 0, visible_at = 0, not_before = ?, updated_at = ?
+        WHERE blocked = 1 AND updated_at <= ?`,
+    )
+    .run(now, now, now - olderThanMs);
+  return Number(result.changes);
+}
+
 /** Record the resumable-upload session URI: it is the upload's idempotency key. */
 export function setUploadUri(db: Db, job: Job, uri: string | null, now: number): void {
   db.prepare('UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?').run(uri, now, job.id);
