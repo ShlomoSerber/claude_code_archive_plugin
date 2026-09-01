@@ -198,7 +198,9 @@ describe('queries that are not in English', () => {
     // ASCII-only tokenizing returned nothing at all for these, and a query
     // with no terms silently degrades to "the most recent sessions", which
     // looks like an answer.
-    assert.deepEqual(extractTerms('認証リダイレクト'), ['認証リダイレクト']);
+    // No segmenter, so a CJK clause becomes character bigrams: LIKE can match
+    // those, where the whole clause as one token matched nothing.
+    assert.deepEqual(extractTerms('認証リダイレクト').slice(0, 3), ['認証', '証リ', 'リダ']);
     assert.deepEqual(extractTerms('поиск счетов'), ['поиск', 'счетов']);
     assert.deepEqual(extractTerms('búsqueda facturación'), ['búsqueda', 'facturación']);
   });

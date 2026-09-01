@@ -5,6 +5,7 @@ import { bundleEntries, statSession, type LocalSession } from '../adapters/sessi
 import { extractFromFile } from '../adapters/transcript-file.ts';
 import { sha256File, sha256Prefix } from '../adapters/hashing.ts';
 import {
+  countPrompts,
   markBundled,
   getSession,
   markVerified,
@@ -66,7 +67,7 @@ export async function backupSession(
   // Read before anything clears it: markBundled withdraws verification the
   // moment a new bundle is built, and this is the record of what Drive held.
   const previous = getSession(ctx.db, session.sessionId);
-  const summary = await indexSession(ctx, session, now);
+  const summary = await indexSession(ctx, session, previous, now);
   const bundle = await buildBundle(ctx, session, summary, now);
 
   try {
@@ -97,6 +98,7 @@ type IndexResult = {
 async function indexSession(
   ctx: WorkerContext,
   session: LocalSession,
+  previous: SessionRecord | null,
   now: number,
 ): Promise<IndexResult> {
   const log = ctx.logger.child({ session_id: session.sessionId });
@@ -128,8 +130,28 @@ async function indexSession(
     },
     now,
   );
-  if (summary !== null) {
-    replacePrompts(ctx.db, session.sessionId, summary.prompts);
+  // replacePrompts and replaceFiles delete before they insert, and this runs
+  // before every guard in publish(). So a transcript truncated by a crashed
+  // write replaced the catalog's prompts with the truncated set, and *then*
+  // the shrink guard correctly refused to archive it: the bundle on Drive was
+  // saved, and the only index of it was gone. Those verbatim prompts are how
+  // an old session is found at all (SPEC §5).
+  const shrunk =
+    previous?.verifiedTranscriptBytes != null &&
+    session.transcriptBytes < previous.verifiedTranscriptBytes;
+  if (shrunk) {
+    log.warn('catalog.index_kept', {
+      transcript_bytes: session.transcriptBytes,
+      archived_bytes: previous.verifiedTranscriptBytes,
+    });
+  }
+  if (summary !== null && !shrunk) {
+    // An extraction that found nothing is not evidence there is nothing: a
+    // format change makes every line unparseable, and replacing a good index
+    // with an empty one loses the session in search while it sits on Drive.
+    if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+      replacePrompts(ctx.db, session.sessionId, summary.prompts);
+    }
     replaceFiles(ctx.db, session.sessionId, summary.files);
     if (summary.malformedLines > 0) {
       log.warn('catalog.malformed_lines', { count: summary.malformedLines });

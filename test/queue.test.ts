@@ -276,9 +276,22 @@ describe('a server that asks for an unreasonable wait', () => {
     retryLater(db, job, { at: 1_000 + 6 * 60 * 60_000, error: 'rate limited' });
     assert.equal(claim(db, 2_000, 60_000), null, 'it is waiting');
 
-    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 2_000);
+    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true, runNow: true }, 2_000);
     assert.ok(claim(db, 2_000, 60_000), 'the user asking for it now means now');
     assert.ok(getJob(db, id));
+  });
+
+  it('does not let a closing session cancel a server-mandated wait', () => {
+    // The SessionEnd hook sets unblock, which is what clears a parked job. It
+    // must not also discard an hour of Retry-After: resuming a session and
+    // closing it again is ordinary, and Drive asked us to wait.
+    const db = openDatabase(':memory:');
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, 1_000);
+    const job = claim(db, 1_000, 60_000)!;
+    retryLater(db, job, { at: 1_000 + 60 * 60_000, error: 'rate limited' });
+
+    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 2_000);
+    assert.equal(claim(db, 3_000, 60_000), null, 'the wait survives the hook');
   });
 
   it('counts a job that has failed once as failing', () => {

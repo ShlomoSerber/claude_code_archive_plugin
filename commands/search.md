@@ -7,7 +7,7 @@ argument-hint: '<what you remember about the session>'
 Search the archive for: **$ARGUMENTS**
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/dist/cli.mjs" search "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/dist/cli.mjs" search -- "$ARGUMENTS"
 ```
 
 The CLI does a keyword prefilter over the local catalog and returns up to 30

@@ -256,6 +256,14 @@ export type RetainedBundle = {
  * pointed at it and its unique contents were reachable only by browsing Drive
  * by hand. This row is that pointer.
  */
+/** How many verbatim prompts the catalog already holds for a session. */
+export function countPrompts(db: Db, sessionId: string): number {
+  const row = db
+    .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+    .get(sessionId) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 export function recordRetainedBundle(
   db: Db,
   entry: {
@@ -485,7 +493,10 @@ export function catalogStats(db: Db): CatalogStats {
          -- bundle that was *built*, so a session that never uploaded still
          -- counted towards "On Drive".
          sum(COALESCE(verified_bundle_bytes, 0)) AS archived_bytes,
-         sum(CASE WHEN local_present = 0
+         -- local_deleted_at, not local_present = 0: rows recovered from
+         -- another machine's catalog are also not local here, and counting
+         -- them told the user we had reclaimed space we never held.
+         sum(CASE WHEN local_deleted_at IS NOT NULL
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS reclaimed_bytes,
          min(COALESCE(started_at, ended_at)) AS oldest,

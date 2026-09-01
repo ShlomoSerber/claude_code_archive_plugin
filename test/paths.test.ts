@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { tempDir } from './helpers.ts';
 import {
   encodeProjectDir,
   encodedDirOfTranscript,
@@ -49,10 +51,20 @@ describe('resolveDataDir', () => {
   });
 
   it('falls back to the location Claude Code would have used', () => {
+    // <plugin name>-<marketplace name>, which is what Claude Code derives.
+    // A slug of our own invention here meant a bare CLI run opened a second,
+    // empty catalog beside the real one and reported an empty archive.
     assert.equal(
       resolveDataDir({}, claudeDir),
-      path.join(claudeDir, 'plugins', 'data', 'claude-code-archive-plugin'),
+      path.join(claudeDir, 'plugins', 'data', 'archive-claude-code-archive'),
     );
+  });
+
+  it('keeps using a directory an earlier naming already created', () => {
+    const older = path.join(tempDir(), '.claude');
+    const legacy = path.join(older, 'plugins', 'data', 'claude-code-archive-plugin');
+    fs.mkdirSync(legacy, { recursive: true });
+    assert.equal(resolveDataDir({}, older), legacy, 'an early install keeps its catalog');
   });
 });
 

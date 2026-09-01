@@ -36,7 +36,11 @@ export function workerSpawnSpec(args: {
     args: [args.workerPath, ...(args.extraArgs ?? [])],
     options: {
       detached: args.attached !== true,
-      stdio: args.attached === true ? 'inherit' : 'ignore',
+      // Never 'inherit', even attached: the hook's stdout pipe would stay open
+      // for the worker's whole life, so the session waited on it and the
+      // worker's output landed on the hook's JSON channel. The worker logs to
+      // a file; that is where its output belongs.
+      stdio: 'ignore',
       windowsHide: true,
       env: args.env,
       cwd: args.cwd,

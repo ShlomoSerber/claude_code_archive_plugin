@@ -133,8 +133,29 @@ export function extractTerms(text: string): string[] {
     .split(/[^\p{L}\p{N}_./\\:-]+/u)
     .map((word) => word.replace(/^[-.]+|[-.]+$/g, ''))
     .filter((word) => word.length >= 2 && !STOP_WORDS.has(word));
-  const all = [...quoted.map((term) => term.toLowerCase()), ...words];
+  const all = [...quoted.map((term) => term.toLowerCase()), ...words.flatMap(expandCjk)];
   return [...new Set(all)].slice(0, 12);
+}
+
+/**
+ * Japanese and Chinese are written without spaces, so a whole clause tokenizes
+ * as one word and `LIKE '%<clause>%'` matches nothing at all. Character
+ * bigrams are what a search engine without a segmenter can offer: they match
+ * on the pieces, and scoring still favours the sessions that match more of them.
+ */
+const CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
+
+export function expandCjk(word: string): string[] {
+  if (!CJK.test(word) || word.length <= 3) return [word];
+  // Code points, deliberately: CJK is exactly the case this exists for, and a
+  // pair of them is the unit that matches. Intl.Segmenter would be right for
+  // grapheme clusters, which is not the question here.
+  const characters = Array.from(word);
+  const bigrams: string[] = [];
+  for (let index = 0; index + 1 < characters.length; index++) {
+    bigrams.push(`${characters[index] ?? ''}${characters[index + 1] ?? ''}`);
+  }
+  return bigrams;
 }
 
 /**

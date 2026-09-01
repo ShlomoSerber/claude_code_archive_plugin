@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 
 /**
@@ -52,10 +53,25 @@ export function resolveDataDir(env: Environment, claudeDir: string): string {
   if (override !== undefined) return path.resolve(override);
   const provided = trimmed(env['CLAUDE_PLUGIN_DATA']);
   if (provided !== undefined) return path.resolve(provided);
-  return path.join(claudeDir, 'plugins', 'data', DEFAULT_PLUGIN_SLUG);
+  const root = path.join(claudeDir, 'plugins', 'data');
+  // The name Claude Code itself derives: plugin name, then marketplace name.
+  // The fallback used to be a slug of my own invention, so any run without
+  // CLAUDE_PLUGIN_DATA — a bare CLI invocation — opened a second, empty
+  // catalog and a second token file next to the real ones, reported "0
+  // sessions, not connected", and would have signed in to a token file the
+  // hooks never read.
+  const canonical = path.join(root, PLUGIN_DATA_SLUG);
+  if (existsSync(canonical)) return canonical;
+  // A directory the previous naming created, so an early install keeps its
+  // catalog rather than silently starting again.
+  const legacy = path.join(root, LEGACY_PLUGIN_SLUG);
+  if (existsSync(legacy)) return legacy;
+  return canonical;
 }
 
-const DEFAULT_PLUGIN_SLUG = 'claude-code-archive-plugin';
+/** `<plugin name>-<marketplace name>`, as Claude Code composes it. */
+const PLUGIN_DATA_SLUG = 'archive-claude-code-archive';
+const LEGACY_PLUGIN_SLUG = 'claude-code-archive-plugin';
 
 export function resolvePaths(env: Environment, homedir: () => string = os.homedir): ArchivePaths {
   const claudeDir = resolveClaudeDir(env, homedir);

@@ -103,6 +103,8 @@ export function createHttpClient(options: HttpClientOptions = {}): HttpClient {
         });
         // The body must be drained or the connection leaks.
         await response.body?.cancel().catch(() => undefined);
+        // No point sleeping sixteen seconds when there is no attempt left.
+        if (attempt + 1 >= maxAttempts) throw asThrowable(lastError, url);
         const waited = await waitBeforeRetry({
           attempt,
           clock,

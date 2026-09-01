@@ -31,6 +31,7 @@ export async function runNow(
     const report = await runSweep(ctx, {
       force: true,
       unblock: true,
+      runNow: true,
     });
     await writeStatusFile(ctx, report);
 

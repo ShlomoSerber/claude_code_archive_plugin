@@ -2233,3 +2233,75 @@ describe('a projects directory the plugin cannot read', () => {
     }
   });
 });
+
+/**
+ * Eighteenth round. Objective 1 held under ~4 000 sweeps with a byte-level
+ * oracle, two workers with the lock removed, writes landing inside every Drive
+ * call, and hostile bundles. The breaks were all in findability: the archive
+ * intact, and the plugin no longer able to point at it.
+ */
+describe('a damaged local file does not damage the index of the archived one', () => {
+  it('keeps the prompts of a session whose transcript was truncated', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const before = harness.ctx.db
+      .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+      .get(SESSION_A) as { n: number };
+    assert.ok(before.n > 0);
+
+    // A crashed write. The archive on Drive is fine; the local file is not.
+    fs.writeFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+
+    const after = harness.ctx.db
+      .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+      .get(SESSION_A) as { n: number };
+    assert.equal(after.n, before.n, 'the index of what Drive holds survives');
+  });
+
+  it('keeps the prompts when a format change makes the transcript unparseable', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const before = harness.ctx.db
+      .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+      .get(SESSION_A) as { n: number };
+
+    // Same size and then some, but nothing the extractor understands.
+    fs.appendFileSync(
+      harness.transcriptOf(SESSION_A),
+      '{"v":2,"kind":"unknown"}\n'.repeat(40),
+    );
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+
+    const after = harness.ctx.db
+      .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+      .get(SESSION_A) as { n: number };
+    assert.equal(after.n, before.n, 'an empty extraction is not evidence of nothing');
+  });
+});
+
+describe('the catalog copy on Drive', () => {
+  it('is replaced rather than updated in the wastebasket', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const name = catalogFileName(machineId(harness.ctx));
+    const first = harness.drive.fileByName(name);
+    assert.ok(first);
+
+    // Someone tidies Drive. A trashed file still accepts an update, so the
+    // upload kept reporting success while a fresh machine — whose search
+    // excludes trashed files — would have found no catalog at all.
+    harness.drive.trashedIds.add(first.id);
+    harness.clock.advance(25 * 60 * 60_000);
+    await runSweep(harness.ctx, { force: true });
+    harness.clock.advance(25 * 60 * 60_000);
+    await runSweep(harness.ctx, { force: true });
+
+    const live = [...harness.drive.files.values()].filter(
+      (file) => file.name === name && !harness.drive.trashedIds.has(file.id),
+    );
+    assert.equal(live.length, 1, 'a live catalog copy exists again');
+  });
+});

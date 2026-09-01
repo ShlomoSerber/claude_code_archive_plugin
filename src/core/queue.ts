@@ -63,6 +63,14 @@ export type EnqueueArgs = {
    * every parked job on every pass and retry a fault nobody has fixed.
    */
   unblock?: boolean;
+  /**
+   * Also run it now, discarding any wait it is serving.
+   *
+   * Only /archive:now sets this. A hook must not: a session closing again is
+   * an ordinary event, and letting it cancel a server's Retry-After turns the
+   * normal "resume a session, close it" workflow into quota burn.
+   */
+  runNow?: boolean;
   kind: JobKind;
   sessionId?: string | null;
   payload?: unknown;
@@ -90,9 +98,10 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
-         -- max(), so an ordinary hook fire cannot pull a backing-off job
-         -- forward. unblock is the deliberate exception: it is only ever set
-         -- by /archive:now, which is the user saying "try again, now".
+         -- max(), so neither an ordinary hook fire nor a session closing can
+         -- pull a backing-off job forward: a server that answered Retry-After
+         -- gets the wait it asked for. runNow is the one exception, and only
+         -- /archive:now sets it — that is a person saying "try again, now".
          not_before  = CASE WHEN ? THEN excluded.not_before
                             ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
@@ -116,7 +125,7 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
       notBefore,
       now,
       now,
-      args.unblock === true ? 1 : 0,
+      args.runNow === true ? 1 : 0,
       args.unblock === true ? 1 : 0,
       args.unblock === true ? 1 : 0,
     ) as { id: number } | undefined;
@@ -255,10 +264,11 @@ export function countJobs(db: Db, now: number): QueueCounts {
          -- attempts >= 1: a job that has failed once has attempts = 1, and
          -- counting from 2 made every first failure invisible to the status
          -- report — including one parked for hours by a Retry-After.
-         sum(CASE WHEN blocked = 0 AND attempts >= 1 THEN 1 ELSE 0 END) AS failing
+         sum(CASE WHEN blocked = 0 AND attempts >= 1 AND not_before > ?
+                  THEN 1 ELSE 0 END) AS failing
        FROM jobs`,
     )
-    .get(now, now) as
+    .get(now, now, now) as
     | { total: number; runnable: number | null; blocked: number | null; failing: number | null }
     | undefined;
   return {

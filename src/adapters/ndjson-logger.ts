@@ -107,9 +107,17 @@ function rotateIfLarge(state: WriterState): void {
   }
   if (size <= state.maxBytes) return;
   try {
-    fs.rmSync(`${state.file}.1`, { force: true });
+    // rename, without removing the previous backup first. POSIX rename
+    // replaces atomically; the old two-step let a second process delete the
+    // backup another had just written and then fail its own rename, leaving
+    // neither file. Windows needs the remove, so it is the fallback.
     fs.renameSync(state.file, `${state.file}.1`);
   } catch {
-    // Another process may have rotated first; either way, keep appending.
+    try {
+      fs.rmSync(`${state.file}.1`, { force: true });
+      fs.renameSync(state.file, `${state.file}.1`);
+    } catch {
+      // Another process rotated first; either way, keep appending.
+    }
   }
 }

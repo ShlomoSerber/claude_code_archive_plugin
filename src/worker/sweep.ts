@@ -66,6 +66,8 @@ export type SweepOptions = {
    * is not retried every ten minutes for ever.
    */
   unblock?: boolean;
+  /** Also discard any wait a job is serving. Only /archive:now sets it. */
+  runNow?: boolean;
 };
 
 export async function runSweep(
@@ -115,7 +117,10 @@ export async function runSweep(
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info('sweep.removed_partials', { count: removed.length });
 
-  const discovery = await discover(ctx, startedAt, options.unblock === true);
+  const discovery = await discover(ctx, startedAt, {
+    unblock: options.unblock === true,
+    runNow: options.runNow === true,
+  });
   report.discovered = discovery.discovered;
   report.enqueued = discovery.enqueued;
 
@@ -157,7 +162,7 @@ export async function runSweep(
 async function discover(
   ctx: WorkerContext,
   now: number,
-  unblock: boolean,
+  flags: { unblock: boolean; runNow: boolean },
 ): Promise<{ discovered: number; enqueued: number }> {
   let discovered = 0;
   let enqueued = 0;
@@ -200,7 +205,8 @@ async function discover(
           kind: 'backup',
           sessionId: session.sessionId,
           payload: { encodedDir: session.encodedDir },
-          ...(unblock ? { unblock: true } : {}),
+          ...(flags.unblock ? { unblock: true } : {}),
+          ...(flags.runNow ? { runNow: true } : {}),
         },
         now,
       );
@@ -460,6 +466,15 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
       },
       ctx.signal,
     );
+    if (uploaded.trashed) {
+      // Drive accepts an update to a file in the wastebasket, so this kept
+      // reporting success while a replacement machine — whose search excludes
+      // trashed files — would have found no catalog at all.
+      kvSet(ctx.db, KV.catalogFileId, '', ctx.clock.now());
+      ctx.logger.warn('catalog.copy_trashed', { file_id: uploaded.id });
+      return false;
+    }
+
 
     const now = ctx.clock.now();
     kvSet(ctx.db, KV.catalogFileId, uploaded.id, now);

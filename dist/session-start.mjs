@@ -504,9 +504,13 @@ function rotateIfLarge(state) {
   }
   if (size <= state.maxBytes) return;
   try {
-    fs2.rmSync(`${state.file}.1`, { force: true });
     fs2.renameSync(state.file, `${state.file}.1`);
   } catch {
+    try {
+      fs2.rmSync(`${state.file}.1`, { force: true });
+      fs2.renameSync(state.file, `${state.file}.1`);
+    } catch {
+    }
   }
 }
 
@@ -736,6 +740,7 @@ function createHttpClient(options = {}) {
           ...retryAfter === void 0 ? {} : { retryAfterSeconds: retryAfter }
         });
         await response.body?.cancel().catch(() => void 0);
+        if (attempt + 1 >= maxAttempts) throw asThrowable(lastError, url);
         const waited = await waitBeforeRetry({
           attempt,
           clock,
@@ -1461,6 +1466,7 @@ function asBoolean(value) {
 
 // src/core/paths.ts
 import path6 from "node:path";
+import { existsSync } from "node:fs";
 import os from "node:os";
 function resolveClaudeDir(env, homedir = os.homedir) {
   const configured = trimmed(env["CLAUDE_CONFIG_DIR"]);
@@ -1472,9 +1478,15 @@ function resolveDataDir(env, claudeDir) {
   if (override !== void 0) return path6.resolve(override);
   const provided = trimmed(env["CLAUDE_PLUGIN_DATA"]);
   if (provided !== void 0) return path6.resolve(provided);
-  return path6.join(claudeDir, "plugins", "data", DEFAULT_PLUGIN_SLUG);
+  const root = path6.join(claudeDir, "plugins", "data");
+  const canonical = path6.join(root, PLUGIN_DATA_SLUG);
+  if (existsSync(canonical)) return canonical;
+  const legacy = path6.join(root, LEGACY_PLUGIN_SLUG);
+  if (existsSync(legacy)) return legacy;
+  return canonical;
 }
-var DEFAULT_PLUGIN_SLUG = "claude-code-archive-plugin";
+var PLUGIN_DATA_SLUG = "archive-claude-code-archive";
+var LEGACY_PLUGIN_SLUG = "claude-code-archive-plugin";
 function resolvePaths(env, homedir = os.homedir) {
   const claudeDir = resolveClaudeDir(env, homedir);
   const dataDir = resolveDataDir(env, claudeDir);
@@ -1659,7 +1671,11 @@ function workerSpawnSpec(args) {
     args: [args.workerPath, ...args.extraArgs ?? []],
     options: {
       detached: args.attached !== true,
-      stdio: args.attached === true ? "inherit" : "ignore",
+      // Never 'inherit', even attached: the hook's stdout pipe would stay open
+      // for the worker's whole life, so the session waited on it and the
+      // worker's output landed on the hook's JSON channel. The worker logs to
+      // a file; that is where its output belongs.
+      stdio: "ignore",
       windowsHide: true,
       env: args.env,
       cwd: args.cwd

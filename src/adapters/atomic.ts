@@ -153,7 +153,9 @@ export async function removePartials(dir: string, now = Date.now()): Promise<str
   }
   const removed: string[] = [];
   for (const entry of entries) {
-    if (!entry.endsWith('.partial')) continue;
+    // .building.tar.zst is the staged bundle a crashed backup leaves behind;
+    // it is rebuilt from scratch on the next attempt, never resumed.
+    if (!entry.endsWith('.partial') && !entry.endsWith('.building.tar.zst')) continue;
     const full = path.join(dir, entry);
     try {
       // A restore downloads through a temp file with the same suffix, and a

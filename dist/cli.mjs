@@ -517,9 +517,13 @@ function rotateIfLarge(state) {
   }
   if (size <= state.maxBytes) return;
   try {
-    fs2.rmSync(`${state.file}.1`, { force: true });
     fs2.renameSync(state.file, `${state.file}.1`);
   } catch {
+    try {
+      fs2.rmSync(`${state.file}.1`, { force: true });
+      fs2.renameSync(state.file, `${state.file}.1`);
+    } catch {
+    }
   }
 }
 
@@ -600,7 +604,7 @@ async function removePartials(dir, now = Date.now()) {
   }
   const removed = [];
   for (const entry of entries) {
-    if (!entry.endsWith(".partial")) continue;
+    if (!entry.endsWith(".partial") && !entry.endsWith(".building.tar.zst")) continue;
     const full = path3.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
@@ -787,6 +791,7 @@ function createHttpClient(options = {}) {
           ...retryAfter === void 0 ? {} : { retryAfterSeconds: retryAfter }
         });
         await response.body?.cancel().catch(() => void 0);
+        if (attempt + 1 >= maxAttempts) throw asThrowable(lastError, url);
         const waited = await waitBeforeRetry({
           attempt,
           clock,
@@ -1787,6 +1792,7 @@ function reapCutoff(now, retentionDays) {
 
 // src/core/paths.ts
 import path6 from "node:path";
+import { existsSync } from "node:fs";
 import os from "node:os";
 function resolveClaudeDir(env, homedir = os.homedir) {
   const configured = trimmed(env["CLAUDE_CONFIG_DIR"]);
@@ -1798,9 +1804,15 @@ function resolveDataDir(env, claudeDir) {
   if (override !== void 0) return path6.resolve(override);
   const provided = trimmed(env["CLAUDE_PLUGIN_DATA"]);
   if (provided !== void 0) return path6.resolve(provided);
-  return path6.join(claudeDir, "plugins", "data", DEFAULT_PLUGIN_SLUG);
+  const root = path6.join(claudeDir, "plugins", "data");
+  const canonical = path6.join(root, PLUGIN_DATA_SLUG);
+  if (existsSync(canonical)) return canonical;
+  const legacy = path6.join(root, LEGACY_PLUGIN_SLUG);
+  if (existsSync(legacy)) return legacy;
+  return canonical;
 }
-var DEFAULT_PLUGIN_SLUG = "claude-code-archive-plugin";
+var PLUGIN_DATA_SLUG = "archive-claude-code-archive";
+var LEGACY_PLUGIN_SLUG = "claude-code-archive-plugin";
 function resolvePaths(env, homedir = os.homedir) {
   const claudeDir = resolveClaudeDir(env, homedir);
   const dataDir = resolveDataDir(env, claudeDir);
@@ -2353,6 +2365,10 @@ function markBundled(db, sessionId, backup, now) {
     sessionId
   );
 }
+function countPrompts(db, sessionId) {
+  const row = db.prepare("SELECT count(*) AS n FROM prompts WHERE session_id = ?").get(sessionId);
+  return row?.n ?? 0;
+}
 function recordRetainedBundle(db, entry, now) {
   db.prepare(
     `INSERT INTO retained_bundles
@@ -2472,7 +2488,10 @@ function catalogStats(db) {
          -- bundle that was *built*, so a session that never uploaded still
          -- counted towards "On Drive".
          sum(COALESCE(verified_bundle_bytes, 0)) AS archived_bytes,
-         sum(CASE WHEN local_present = 0
+         -- local_deleted_at, not local_present = 0: rows recovered from
+         -- another machine's catalog are also not local here, and counting
+         -- them told the user we had reclaimed space we never held.
+         sum(CASE WHEN local_deleted_at IS NOT NULL
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS reclaimed_bytes,
          min(COALESCE(started_at, ended_at)) AS oldest,
@@ -2548,9 +2567,10 @@ function enqueue(db, args, now) {
        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
-         -- max(), so an ordinary hook fire cannot pull a backing-off job
-         -- forward. unblock is the deliberate exception: it is only ever set
-         -- by /archive:now, which is the user saying "try again, now".
+         -- max(), so neither an ordinary hook fire nor a session closing can
+         -- pull a backing-off job forward: a server that answered Retry-After
+         -- gets the wait it asked for. runNow is the one exception, and only
+         -- /archive:now sets it \u2014 that is a person saying "try again, now".
          not_before  = CASE WHEN ? THEN excluded.not_before
                             ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
@@ -2573,7 +2593,7 @@ function enqueue(db, args, now) {
     notBefore,
     now,
     now,
-    args.unblock === true ? 1 : 0,
+    args.runNow === true ? 1 : 0,
     args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0
   );
@@ -2645,9 +2665,10 @@ function countJobs(db, now) {
          -- attempts >= 1: a job that has failed once has attempts = 1, and
          -- counting from 2 made every first failure invisible to the status
          -- report \u2014 including one parked for hours by a Retry-After.
-         sum(CASE WHEN blocked = 0 AND attempts >= 1 THEN 1 ELSE 0 END) AS failing
+         sum(CASE WHEN blocked = 0 AND attempts >= 1 AND not_before > ?
+                  THEN 1 ELSE 0 END) AS failing
        FROM jobs`
-  ).get(now, now);
+  ).get(now, now, now);
   return {
     total: row?.total ?? 0,
     runnable: row?.runnable ?? 0,
@@ -6368,7 +6389,7 @@ async function backupSession(ctx, job, args) {
   }
   const now = ctx.clock.now();
   const previous = getSession(ctx.db, session.sessionId);
-  const summary = await indexSession(ctx, session, now);
+  const summary = await indexSession(ctx, session, previous, now);
   const bundle = await buildBundle(ctx, session, summary, now);
   try {
     const remote = await publish(ctx, job, session, bundle, summary, previous, now);
@@ -6378,7 +6399,7 @@ async function backupSession(ctx, job, args) {
     await fsp10.rm(bundle.path, { force: true }).catch(() => void 0);
   }
 }
-async function indexSession(ctx, session, now) {
+async function indexSession(ctx, session, previous, now) {
   const log = ctx.logger.child({ session_id: session.sessionId });
   let summary = null;
   try {
@@ -6406,8 +6427,17 @@ async function indexSession(ctx, session, now) {
     },
     now
   );
-  if (summary !== null) {
-    replacePrompts(ctx.db, session.sessionId, summary.prompts);
+  const shrunk = previous?.verifiedTranscriptBytes != null && session.transcriptBytes < previous.verifiedTranscriptBytes;
+  if (shrunk) {
+    log.warn("catalog.index_kept", {
+      transcript_bytes: session.transcriptBytes,
+      archived_bytes: previous.verifiedTranscriptBytes
+    });
+  }
+  if (summary !== null && !shrunk) {
+    if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+      replacePrompts(ctx.db, session.sessionId, summary.prompts);
+    }
     replaceFiles(ctx.db, session.sessionId, summary.files);
     if (summary.malformedLines > 0) {
       log.warn("catalog.malformed_lines", { count: summary.malformedLines });
@@ -6906,7 +6936,10 @@ async function runSweep(ctx, options = {}) {
   }
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
-  const discovery = await discover(ctx, startedAt, options.unblock === true);
+  const discovery = await discover(ctx, startedAt, {
+    unblock: options.unblock === true,
+    runNow: options.runNow === true
+  });
   report.discovered = discovery.discovered;
   report.enqueued = discovery.enqueued;
   const deadline = startedAt + ctx.config.workerBudgetMs;
@@ -6934,7 +6967,7 @@ async function runSweep(ctx, options = {}) {
   });
   return report;
 }
-async function discover(ctx, now, unblock) {
+async function discover(ctx, now, flags) {
   let discovered = 0;
   let enqueued = 0;
   const skipped = [];
@@ -6967,7 +7000,8 @@ async function discover(ctx, now, unblock) {
           kind: "backup",
           sessionId: session.sessionId,
           payload: { encodedDir: session.encodedDir },
-          ...unblock ? { unblock: true } : {}
+          ...flags.unblock ? { unblock: true } : {},
+          ...flags.runNow ? { runNow: true } : {}
         },
         now
       );
@@ -7137,6 +7171,11 @@ async function uploadCatalogCopy(ctx) {
       },
       ctx.signal
     );
+    if (uploaded.trashed) {
+      kvSet(ctx.db, KV.catalogFileId, "", ctx.clock.now());
+      ctx.logger.warn("catalog.copy_trashed", { file_id: uploaded.id });
+      return false;
+    }
     const now = ctx.clock.now();
     kvSet(ctx.db, KV.catalogFileId, uploaded.id, now);
     kvSetNumber(ctx.db, KV.catalogUploadedAt, now, now);
@@ -7446,7 +7485,8 @@ async function runNow(runtime, options = {}) {
     const ctx = commandContext(runtime, { timeoutMs: runtime.config.workerBudgetMs });
     const report = await runSweep(ctx, {
       force: true,
-      unblock: true
+      unblock: true,
+      runNow: true
     });
     await writeStatusFile(ctx, report);
     if (options.json === true) {
@@ -7555,8 +7595,18 @@ function extractTerms(text) {
   const quoted = [...text.matchAll(/"([^"]+)"/g)].map((match) => match[1] ?? "");
   const rest = text.replace(/"[^"]+"/g, " ");
   const words = rest.toLowerCase().split(/[^\p{L}\p{N}_./\\:-]+/u).map((word) => word.replace(/^[-.]+|[-.]+$/g, "")).filter((word) => word.length >= 2 && !STOP_WORDS.has(word));
-  const all = [...quoted.map((term) => term.toLowerCase()), ...words];
+  const all = [...quoted.map((term) => term.toLowerCase()), ...words.flatMap(expandCjk)];
   return [...new Set(all)].slice(0, 12);
+}
+var CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
+function expandCjk(word) {
+  if (!CJK.test(word) || word.length <= 3) return [word];
+  const characters = Array.from(word);
+  const bigrams = [];
+  for (let index = 0; index + 1 < characters.length; index++) {
+    bigrams.push(`${characters[index] ?? ""}${characters[index + 1] ?? ""}`);
+  }
+  return bigrams;
 }
 function prefilter(db, query, now, options = {}) {
   const parsed = parseQuery(query, now);

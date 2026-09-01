@@ -7,7 +7,7 @@ argument-hint: '<session id, or what you remember about it>'
 Restore and resume: **$ARGUMENTS**
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/dist/cli.mjs" resume "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/dist/cli.mjs" resume -- "$ARGUMENTS"
 ```
 
 With a session id, this downloads the bundle, verifies its hash, unpacks it back
