@@ -240,7 +240,12 @@ export function unblockStale(db: Db, now: number, olderThanMs: number): number {
 
 /** Record the resumable-upload session URI: it is the upload's idempotency key. */
 export function setUploadUri(db: Db, job: Job, uri: string | null, now: number): void {
-  db.prepare('UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?').run(uri, now, job.id);
+  // Scoped to the claim, like complete() and heartbeatClaim(). A worker whose
+  // claim has been superseded could otherwise null the new claimant's URI and
+  // make it restart an upload that was nearly done.
+  db.prepare(
+    'UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token IS ?',
+  ).run(uri, now, job.id, job.claimToken);
 }
 
 /**

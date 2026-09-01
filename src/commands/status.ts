@@ -72,6 +72,8 @@ export async function runStatus(
   // Counted from the catalog, not from the last run: the reaper looks at a
   // capped window, so 505 orphans were reported as 500.
   const orphanSidecars = countReapSkipped(db, 'orphan-sidecar');
+  const auditMismatched = kvGetNumber(db, KV.auditMismatched) ?? 0;
+  const statFailed = countReapSkipped(db, 'stat-failed');
   const unreadableSidecars = countReapSkipped(db, 'sidecar-unreadable');
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
   // The reap does not run on a sweep that exhausted its budget or saw a wild
@@ -137,6 +139,8 @@ export async function runStatus(
       reapRanAt,
       orphanSidecars,
       unreadableSidecars,
+      statFailed,
+      auditMismatched,
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
@@ -256,6 +260,14 @@ export async function runStatus(
       `  WARNING:            the catalog copy on Drive is from ${formatRelative(catalogUploadedAt, now)}.`,
     );
     print(`                      Sessions archived since then would not be findable on a new machine.`);
+  }
+  if (auditMismatched > 0) {
+    print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
+    print(`                      on Drive after their local copy was freed. Run /archive:verify --all.`);
+  }
+  if (statFailed > 0) {
+    print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);
+    print(`  neither archived nor reclaimed. See the log.`);
   }
   if (unreadableSidecars > 0) {
     print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);

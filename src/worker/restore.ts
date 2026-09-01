@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { extractBundle } from '../adapters/bundle.ts';
+import { renameWithRetry } from '../adapters/atomic.ts';
 import { sha256File } from '../adapters/hashing.ts';
 import { statSession, type LocalSession } from '../adapters/session-scan.ts';
 import {
@@ -242,7 +243,10 @@ export async function restoreSession(
   }
   if (await isDirectory(path.join(targetDir, sessionId))) {
     const aside = path.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
-    await fsp.rename(path.join(targetDir, sessionId), aside).catch(() => undefined);
+    // Checked, and retried: every other must-succeed rename here uses
+    // renameWithRetry for the Windows EPERM/EBUSY class. Unpacking into a
+    // sidecar that is still there would overwrite the files it holds.
+    await renameWithRetry(path.join(targetDir, sessionId), aside);
     ctx.logger.warn('restore.sidecar_moved_aside', { session_id: sessionId, path: aside });
   }
 
@@ -441,10 +445,15 @@ export type VerifyReport = {
  * bundle does not" — which is precisely why an unnoticed trashing of one is
  * the loss of the only copy of something.
  */
-export async function verifyRetained(
-  ctx: WorkerContext,
-): Promise<{ checked: number; ok: number; problems: { fileId: string; reason: string }[] }> {
+export async function verifyRetained(ctx: WorkerContext): Promise<{
+  checked: number;
+  ok: number;
+  problems: { fileId: string; reason: string }[];
+  /** Bundles Drive would not vouch for. Not a verdict, and not "intact". */
+  unchecked: { fileId: string; reason: string }[];
+}> {
   const problems: { fileId: string; reason: string }[] = [];
+  const unchecked: { fileId: string; reason: string }[] = [];
   let checked = 0;
   let ok = 0;
   for (const entry of listRetainedBundles(ctx.db)) {
@@ -456,22 +465,47 @@ export async function verifyRetained(
         continue;
       }
       if (
-        entry.bundleSha256 !== null &&
-        remote.sha256 !== null &&
-        remote.sha256.toLowerCase() !== entry.bundleSha256.toLowerCase()
+        remote.size !== null &&
+        entry.bundleBytes !== null &&
+        remote.size !== entry.bundleBytes
       ) {
+        problems.push({
+          fileId: entry.fileId,
+          reason: `it is ${String(remote.size)} bytes, not ${String(entry.bundleBytes)}`,
+        });
+        continue;
+      }
+      // Same shape as verifyArchive: a hash that matches is intact, a hash
+      // that disagrees is a problem, and no hash at all is neither. Counting
+      // the third as intact told the user a bundle nothing else holds a copy
+      // of had been checked when it had not.
+      const strong = compareHash(remote.sha256, entry.bundleSha256);
+      const weak = compareHash(remote.md5, entry.bundleMd5);
+      if (strong === 'differs' || weak === 'differs') {
         problems.push({ fileId: entry.fileId, reason: 'its hash no longer matches' });
         continue;
       }
-      ok++;
+      if (strong === 'matches' || weak === 'matches') {
+        ok++;
+        continue;
+      }
+      unchecked.push({ fileId: entry.fileId, reason: 'Drive reported no checksum for it' });
     } catch (err) {
-      problems.push({
+      unchecked.push({
         fileId: entry.fileId,
         reason: err instanceof Error ? err.message : 'Drive could not be asked',
       });
     }
   }
-  return { checked, ok, problems };
+  return { checked, ok, problems, unchecked };
+}
+
+function compareHash(
+  remote: string | null,
+  recorded: string | null,
+): 'matches' | 'differs' | 'unknown' {
+  if (remote === null || recorded === null) return 'unknown';
+  return remote.toLowerCase() === recorded.toLowerCase() ? 'matches' : 'differs';
 }
 
 export async function verifyArchive(

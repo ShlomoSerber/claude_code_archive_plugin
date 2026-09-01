@@ -372,6 +372,20 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN reap_skip_until INTEGER;
 
   UPDATE jobs SET blocked_at = updated_at WHERE blocked = 1 AND blocked_at IS NULL;
+  `,
+  // 10 — the size and weaker hash of a kept bundle.
+  //
+  // verifyRetained could only compare sha256, and counted "Drive did not say"
+  // as intact — for bundles /archive:status describes as holding data nothing
+  // else holds. With these it can do what verifyArchive does: compare the
+  // size, fall back to md5, and report what it could not check as unchecked.
+  `
+  ALTER TABLE retained_bundles ADD COLUMN bundle_bytes INTEGER;
+  ALTER TABLE retained_bundles ADD COLUMN bundle_md5 TEXT;
+  `,
+  // 11 — when a reaped session's bundle was last re-checked on Drive.
+  `
+  ALTER TABLE sessions ADD COLUMN audited_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1719,6 +1733,8 @@ var KV = {
   workerRanAt: "worker.ran_at",
   /** Sidecar directories left on disk by a transcript that vanished. */
   orphanSidecars: "reap.orphan_sidecars",
+  /** Reaped sessions whose Drive copy failed a re-check. */
+  auditMismatched: "audit.mismatched",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */

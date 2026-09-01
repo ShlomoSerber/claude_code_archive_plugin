@@ -2780,3 +2780,102 @@ describe('the bundles the plugin promised nothing deletes', () => {
     assert.match(report.problems[0]?.reason ?? '', /wastebasket/);
   });
 });
+
+/**
+ * Twenty-sixth round. Objective 1 held: ~380 real reaps across 6 000 chaos
+ * ticks with two oracles — every deleted byte present in a reachable bundle,
+ * and every version ever archived still reachable — and a hand-built hostile
+ * tar that escaped nothing. The findings were about what the plugin checks
+ * after the fact, and what it calls "intact".
+ */
+describe('a kept bundle Drive will not vouch for', () => {
+  async function retained() {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+    assert.equal(listRetainedBundles(harness.ctx.db).length, 1);
+    return harness;
+  }
+
+  it('is reported as unchecked, never as intact', async () => {
+    const harness = await retained();
+    harness.drive.options = { ...harness.drive.options, omitSha256: true };
+    harness.ctx.db.prepare('UPDATE retained_bundles SET bundle_bytes = NULL').run();
+
+    const report = await verifyRetained(harness.ctx);
+    assert.equal(report.ok, 0, 'a bundle nothing else holds a copy of is not assumed fine');
+    assert.equal(report.unchecked.length, 1);
+  });
+
+  it('is checked against md5 when that is all Drive reports', async () => {
+    const harness = await retained();
+    harness.drive.options = { ...harness.drive.options, md5Only: true };
+    const report = await verifyRetained(harness.ctx);
+    assert.equal(report.ok, 1);
+    assert.deepEqual(report.problems, []);
+  });
+});
+
+describe('an archived bundle that goes bad after its local copy is freed', () => {
+  it('is noticed by a later sweep, not only by the person who needed it', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false);
+
+    // Someone tidies Drive months later.
+    const record = getSession(harness.ctx.db, SESSION_A);
+    const stored = harness.drive.files.get(record?.remoteFileId ?? '');
+    assert.ok(stored);
+    stored.content = Buffer.concat([stored.content, Buffer.from('rot')]);
+
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.ok(
+      (kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) > 0,
+      'the damage is found without anyone asking',
+    );
+  });
+});
+
+describe('something added to a sidecar that carries no bytes', () => {
+  it('still counts as a difference from the archive', async () => {
+    if (process.platform === 'win32') return;
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+
+    // A symlink and an empty directory are in neither the manifest nor the
+    // byte count, and an mtime-preserving tool hides them from the
+    // fingerprint — so nothing else would notice them.
+    const before = fs.statSync(path.join(harness.projectDir, SESSION_B));
+    fs.symlinkSync('/etc/hostname', path.join(harness.projectDir, SESSION_B, 'link'));
+    fs.utimesSync(path.join(harness.projectDir, SESSION_B), before.atime, before.mtime);
+
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(
+      fs.existsSync(harness.transcriptOf(SESSION_B)),
+      true,
+      'a session that has something the archive does not is not deleted',
+    );
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false, 'the guard is not vacuous');
+  });
+});

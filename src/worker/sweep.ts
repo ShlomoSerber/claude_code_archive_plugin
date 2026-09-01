@@ -6,7 +6,7 @@ import { getSqlite } from '../adapters/sqlite.ts';
 import { removePartials } from '../adapters/atomic.ts';
 import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
 import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
-import { getSession, markLocalPresent, upsertSession } from '../core/catalog.ts';
+import { getSession, markLocalPresent, upsertSession, listReapedForAudit, markAudited } from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
 import {
   FatalError,
@@ -29,6 +29,7 @@ import {
 import { KV } from '../core/state-keys.ts';
 import { backupSession } from './backup.ts';
 import { reapLocalCopies, type ReapReport } from './reap.ts';
+import { verifyArchive } from './restore.ts';
 import type { WorkerContext } from './context.ts';
 
 /**
@@ -54,6 +55,8 @@ export type SweepReport = {
   blocked: number;
   reap: ReapReport;
   catalogUploaded: boolean;
+  /** Reaped sessions re-checked against Drive this run. */
+  audited: number;
   /** True when the circuit breaker was open and the sweep did nothing. */
   cooledDown: boolean;
   /** True when the sweep stopped early because it ran out of time. */
@@ -101,6 +104,7 @@ export async function runSweep(
       blockedReason: null,
     },
     catalogUploaded: false,
+    audited: 0,
     cooledDown: false,
     budgetExhausted: false,
     lastError: null,
@@ -149,6 +153,11 @@ export async function runSweep(
     kvSetNumber(ctx.db, KV.reapRanAt, at, at);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? '', at);
   }
+
+  // A handful of already-reaped sessions per sweep, so a bundle that goes bad
+  // long after its local copy was freed is noticed by the plugin rather than
+  // by the person who needed it.
+  if (!drained.budgetExhausted) report.audited = await auditReaped(ctx);
 
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
     report.catalogUploaded = await uploadCatalogCopy(ctx);
@@ -433,6 +442,29 @@ const DEBOUNCE_WAIT_MS = 60_000;
 const LOCAL_FAILURE_LIMIT = 5;
 
 const CATALOG_REFRESH_MS = 24 * 3_600_000;
+
+/** How many reaped sessions each sweep re-checks against Drive. */
+const AUDIT_BATCH = 10;
+
+async function auditReaped(ctx: WorkerContext): Promise<number> {
+  const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
+  if (records.length === 0) return 0;
+  const report = await verifyArchive(ctx, records);
+  markAudited(
+    ctx.db,
+    records.map((record) => record.sessionId),
+    ctx.clock.now(),
+  );
+  if (report.mismatched.length > 0) {
+    ctx.logger.error('sweep.archive_damaged', {
+      count: report.mismatched.length,
+      first: report.mismatched[0]?.reason ?? '',
+    });
+    const at = ctx.clock.now();
+    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at);
+  }
+  return report.checked;
+}
 
 function catalogCopyIsStale(ctx: WorkerContext): boolean {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;

@@ -158,7 +158,19 @@ async function indexSession(
     // again, while the row still said verified because the throw came before
     // anything withdrew it.
     try {
-      if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+      const existingPrompts = countPrompts(ctx.db, session.sessionId);
+      // A Claude Code format change can leave the extractor recognising a
+      // handful of prompts where it used to find hundreds. Replacing a good
+      // index with a thin one loses the only way to find that session, so a
+      // large drop keeps what we have and says so.
+      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      if (collapsed) {
+        log.warn('catalog.index_collapse_ignored', {
+          found: summary.prompts.length,
+          kept: existingPrompts,
+        });
+      }
+      if (!collapsed && (summary.prompts.length > 0 || existingPrompts === 0)) {
         replacePrompts(ctx.db, session.sessionId, summary.prompts);
       }
     } catch (err) {
@@ -440,6 +452,8 @@ async function publish(
         fileId: supersededId,
         remotePath: previous?.remotePath ?? null,
         bundleSha256: previous?.verifiedBundleSha256 ?? null,
+        bundleBytes: previous?.verifiedBundleBytes ?? null,
+        bundleMd5: previous?.verifiedBundleMd5 ?? null,
         manifest: previous?.verifiedManifest ?? null,
         reason,
       },

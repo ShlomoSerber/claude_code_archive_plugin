@@ -242,8 +242,7 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
     // which left a replacement machine with no way to name or fetch them.
     const selectRetained = tryPrepare(
       source,
-      `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
-         FROM retained_bundles WHERE session_id = ?`,
+      `SELECT * FROM retained_bundles WHERE session_id = ?`,
     );
 
     for (const row of rows) {
@@ -286,6 +285,8 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
         file_id: string;
         remote_path: string | null;
         bundle_sha256: string | null;
+        bundle_bytes?: number | null;
+        bundle_md5?: string | null;
         manifest: string | null;
         reason: string;
         created_at: number;
@@ -297,6 +298,10 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
             fileId: kept.file_id,
             remotePath: kept.remote_path,
             bundleSha256: kept.bundle_sha256,
+            // An older catalog has neither column; null reads as "unknown",
+            // which verifyRetained reports as unchecked rather than intact.
+            bundleBytes: kept.bundle_bytes ?? null,
+            bundleMd5: kept.bundle_md5 ?? null,
             manifest: kept.manifest,
             reason: kept.reason,
           },

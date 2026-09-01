@@ -371,6 +371,20 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN reap_skip_until INTEGER;
 
   UPDATE jobs SET blocked_at = updated_at WHERE blocked = 1 AND blocked_at IS NULL;
+  `,
+  // 10 — the size and weaker hash of a kept bundle.
+  //
+  // verifyRetained could only compare sha256, and counted "Drive did not say"
+  // as intact — for bundles /archive:status describes as holding data nothing
+  // else holds. With these it can do what verifyArchive does: compare the
+  // size, fall back to md5, and report what it could not check as unchecked.
+  `
+  ALTER TABLE retained_bundles ADD COLUMN bundle_bytes INTEGER;
+  ALTER TABLE retained_bundles ADD COLUMN bundle_md5 TEXT;
+  `,
+  // 11 — when a reaped session's bundle was last re-checked on Drive.
+  `
+  ALTER TABLE sessions ADD COLUMN audited_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -2186,10 +2200,10 @@ function writeCache(file, found) {
 }
 
 // src/worker/sweep.ts
-import fsp12 from "node:fs/promises";
+import fsp13 from "node:fs/promises";
 import os4 from "node:os";
 import { createHash as createHash4, randomBytes as randomBytes4 } from "node:crypto";
-import path14 from "node:path";
+import path15 from "node:path";
 
 // src/adapters/session-scan.ts
 import fsp6 from "node:fs/promises";
@@ -2447,14 +2461,17 @@ function countSessionFiles(db, sessionId) {
 function recordRetainedBundle(db, entry, now) {
   db.prepare(
     `INSERT INTO retained_bundles
-       (session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (session_id, file_id, remote_path, bundle_sha256, bundle_bytes, bundle_md5,
+        manifest, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (file_id) DO UPDATE SET reason = excluded.reason`
   ).run(
     entry.sessionId,
     entry.fileId,
     entry.remotePath,
     entry.bundleSha256,
+    entry.bundleBytes,
+    entry.bundleMd5,
     entry.manifest,
     entry.reason,
     now
@@ -2468,6 +2485,8 @@ function listRetainedBundles(db, sessionId) {
     fileId: row.file_id,
     remotePath: row.remote_path,
     bundleSha256: row.bundle_sha256,
+    bundleBytes: row.bundle_bytes,
+    bundleMd5: row.bundle_md5,
     manifest: row.manifest,
     reason: row.reason,
     createdAt: row.created_at
@@ -2555,6 +2574,22 @@ function listReapable(db, idleBefore, now, limit = 500) {
         LIMIT ?`
   ).all(idleBefore, now, limit);
   return rows.map(toRecord);
+}
+function listReapedForAudit(db, limit) {
+  const rows = db.prepare(
+    `SELECT ${SESSION_COLUMNS} FROM sessions
+        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        LIMIT ?`
+  ).all(limit);
+  return rows.map(toRecord);
+}
+function markAudited(db, sessionIds, now) {
+  if (sessionIds.length === 0) return;
+  const statement = db.prepare("UPDATE sessions SET audited_at = ? WHERE session_id = ?");
+  inTransaction(db, () => {
+    for (const sessionId of sessionIds) statement.run(now, sessionId);
+  });
 }
 function listUnverified(db, limit = 500) {
   const rows = db.prepare(
@@ -2756,7 +2791,9 @@ function unblockStale(db, now, olderThanMs) {
   return Number(result.changes);
 }
 function setUploadUri(db, job, uri, now) {
-  db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?").run(uri, now, job.id);
+  db.prepare(
+    "UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token IS ?"
+  ).run(uri, now, job.id, job.claimToken);
 }
 function nextRunnableAt(db, now) {
   const row = db.prepare(
@@ -2843,6 +2880,8 @@ var KV = {
   workerRanAt: "worker.ran_at",
   /** Sidecar directories left on disk by a transcript that vanished. */
   orphanSidecars: "reap.orphan_sidecars",
+  /** Reaped sessions whose Drive copy failed a re-check. */
+  auditMismatched: "audit.mismatched",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -6568,7 +6607,15 @@ async function indexSession(ctx, session, previous, now) {
   }
   if (summary !== null && !shrunk) {
     try {
-      if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+      const existingPrompts = countPrompts(ctx.db, session.sessionId);
+      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      if (collapsed) {
+        log.warn("catalog.index_collapse_ignored", {
+          found: summary.prompts.length,
+          kept: existingPrompts
+        });
+      }
+      if (!collapsed && (summary.prompts.length > 0 || existingPrompts === 0)) {
         replacePrompts(ctx.db, session.sessionId, summary.prompts);
       }
     } catch (err) {
@@ -6746,6 +6793,8 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
         fileId: supersededId,
         remotePath: previous?.remotePath ?? null,
         bundleSha256: previous?.verifiedBundleSha256 ?? null,
+        bundleBytes: previous?.verifiedBundleBytes ?? null,
+        bundleMd5: previous?.verifiedBundleMd5 ?? null,
         manifest: previous?.verifiedManifest ?? null,
         reason
       },
@@ -6984,7 +7033,7 @@ async function reapLocalCopies(ctx, now, limit) {
       report.unverified++;
       continue;
     }
-    if (!await removeLocalCopy(ctx, onDisk, target)) {
+    if (!await removeLocalCopy(ctx, settled, target)) {
       report.skipped++;
       continue;
     }
@@ -7017,7 +7066,39 @@ async function describeDivergence(ctx, record, onDisk) {
   for (const file of current) {
     if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
   }
+  const extra = await findUnarchivedEntry(onDisk.sidecarDir, onDisk.sessionId, archived);
+  if (extra !== null) return `${extra} is on disk and not in the archive`;
   return null;
+}
+async function findUnarchivedEntry(sidecarDir, sessionId, archived) {
+  const directories = /* @__PURE__ */ new Set();
+  for (const entryPath of archived.keys()) {
+    const parts2 = entryPath.split("/");
+    for (let index = 1; index < parts2.length; index++) {
+      directories.add(parts2.slice(0, index).join("/"));
+    }
+  }
+  const walk = async (dir, prefix) => {
+    let entries;
+    try {
+      entries = await fsp11.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      if (err.code === "ENOENT") return null;
+      return prefix === "" ? sessionId : prefix;
+    }
+    for (const entry of entries) {
+      const relative = prefix === "" ? `${sessionId}/${entry.name}` : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!directories.has(relative)) return relative;
+        const deeper = await walk(path13.join(dir, entry.name), relative);
+        if (deeper !== null) return deeper;
+        continue;
+      }
+      if (!archived.has(relative)) return relative;
+    }
+    return null;
+  };
+  return walk(sidecarDir, "");
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
@@ -7123,6 +7204,381 @@ async function removeLocalCopy(ctx, onDisk, target) {
   return false;
 }
 
+// src/worker/restore.ts
+import fsp12 from "node:fs/promises";
+import path14 from "node:path";
+function isIncomplete(record, onDisk) {
+  const smaller = (floor, current) => floor !== null && current < floor;
+  return smaller(record.verifiedTranscriptBytes, onDisk.transcriptBytes) || smaller(record.verifiedSidecarBytes, onDisk.sidecarBytes);
+}
+async function restoreRetainedBundle(ctx, fileId) {
+  const retained = listRetainedBundles(ctx.db).find((entry) => entry.fileId === fileId);
+  if (retained === void 0) {
+    throw new FatalError(
+      `no retained bundle with the id ${fileId}`,
+      "Run /archive:status to see the bundles that were kept, with their ids."
+    );
+  }
+  const record = getSession(ctx.db, retained.sessionId);
+  if (record === null || !isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+    throw new FatalError(
+      `the catalog entry for ${retained.sessionId} cannot be located on disk`,
+      "Run /archive:now to rescan, then try again."
+    );
+  }
+  const targetDir = path14.join(ctx.paths.projectsDir, record.encodedDir);
+  const destination = path14.join(
+    targetDir,
+    `${record.sessionId}.retained-${String(ctx.clock.now())}`
+  );
+  const staged = path14.join(ctx.paths.restoreDir, `${record.sessionId}.retained.tar.zst`);
+  let entries = [];
+  try {
+    await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
+    const actual = await sha256File(staged, ctx.signal);
+    const expected = retained.bundleSha256 ?? await stampedSha256(ctx, fileId);
+    if (expected === null) {
+      throw new FatalError(
+        `no recorded hash for the retained bundle ${fileId}`,
+        "Download it from Drive by hand: it is a plain .tar.zst that tar and zstd can read."
+      );
+    }
+    if (actual !== expected) {
+      throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
+    }
+    await fsp12.mkdir(destination, { recursive: true });
+    const result = await extractBundle({
+      bundlePath: staged,
+      targetDir: destination,
+      onlySession: record.sessionId,
+      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+    });
+    entries = result.entries;
+  } finally {
+    await fsp12.rm(staged, { force: true }).catch(() => void 0);
+  }
+  if (entries.length === 0) {
+    await fsp12.rm(destination, { recursive: true, force: true }).catch(() => void 0);
+    throw new RetryableError(`nothing could be unpacked from ${fileId}`);
+  }
+  ctx.logger.info("restore.retained", { session_id: record.sessionId, path: destination });
+  return {
+    sessionId: record.sessionId,
+    encodedDir: record.encodedDir,
+    projectCwd: record.projectCwd,
+    transcriptPath: path14.join(destination, `${record.sessionId}.jsonl`),
+    entries,
+    alreadyLocal: false,
+    recoveredTo: destination,
+    resumeCommand: resumeCommand(record.sessionId)
+  };
+}
+async function stampedSha256(ctx, fileId) {
+  try {
+    const remote = await ctx.drive.getFile(fileId, ctx.signal);
+    const stamped = remote.appProperties?.["sha256"];
+    return typeof stamped === "string" && /^[0-9a-f]{64}$/.test(stamped) ? stamped : null;
+  } catch {
+    return null;
+  }
+}
+async function restoreSession(ctx, sessionId) {
+  const record = getSession(ctx.db, sessionId);
+  if (record === null) {
+    throw new FatalError(
+      `session ${sessionId} is not in the catalog`,
+      "Run /archive:search to find the session id, or /archive:now to rescan."
+    );
+  }
+  if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
+    throw new FatalError(
+      `the catalog entry for ${sessionId} has an unusable project or session id`,
+      "Run /archive:now to rebuild the catalog from the sessions on disk."
+    );
+  }
+  const targetDir = path14.join(ctx.paths.projectsDir, record.encodedDir);
+  assertInside(ctx.paths.projectsDir, targetDir, "restore target");
+  const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
+  if (existing !== null && isIncomplete(record, existing)) {
+    const recovery = path14.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
+    const staged2 = path14.join(ctx.paths.restoreDir, `${sessionId}.recover.tar.zst`);
+    let recovered = [];
+    try {
+      await ctx.drive.downloadToFile(
+        { fileId: requireRemote(record), destination: staged2 },
+        ctx.signal
+      );
+      const actual = await sha256File(staged2, ctx.signal);
+      if (actual !== record.verifiedBundleSha256) {
+        throw new RetryableError(
+          `the downloaded bundle does not match the catalog hash for ${sessionId}`
+        );
+      }
+      await fsp12.mkdir(recovery, { recursive: true });
+      const result = await extractBundle({
+        bundlePath: staged2,
+        targetDir: recovery,
+        onlySession: sessionId
+      });
+      recovered = result.entries;
+    } finally {
+      await fsp12.rm(staged2, { force: true }).catch(() => void 0);
+    }
+    if (recovered.length === 0) {
+      await fsp12.rm(recovery, { recursive: true, force: true }).catch(() => void 0);
+      throw new RetryableError(`nothing could be recovered for ${sessionId}`);
+    }
+    ctx.logger.warn("restore.recovered_beside", {
+      session_id: sessionId,
+      path: recovery,
+      entries: recovered.length
+    });
+    return {
+      sessionId,
+      encodedDir: record.encodedDir,
+      projectCwd: record.projectCwd,
+      transcriptPath: existing.transcriptPath,
+      entries: recovered,
+      alreadyLocal: true,
+      recoveredTo: recovery,
+      resumeCommand: resumeCommand(sessionId)
+    };
+  }
+  if (existing !== null) {
+    markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
+    return {
+      sessionId,
+      encodedDir: record.encodedDir,
+      projectCwd: record.projectCwd,
+      transcriptPath: existing.transcriptPath,
+      entries: [],
+      alreadyLocal: true,
+      resumeCommand: resumeCommand(sessionId)
+    };
+  }
+  if (await isDirectory2(path14.join(targetDir, sessionId))) {
+    const aside = path14.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
+    await renameWithRetry(path14.join(targetDir, sessionId), aside);
+    ctx.logger.warn("restore.sidecar_moved_aside", { session_id: sessionId, path: aside });
+  }
+  const remoteFileId = requireRemote(record);
+  const staged = path14.join(ctx.paths.restoreDir, `${sessionId}.restore.tar.zst`);
+  try {
+    await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
+    const actual = await sha256File(staged, ctx.signal);
+    if (actual !== record.verifiedBundleSha256) {
+      throw new RetryableError(
+        `the downloaded bundle does not match the catalog hash for ${sessionId}`
+      );
+    }
+    const { entries, rejected } = await extractBundle({
+      bundlePath: staged,
+      targetDir,
+      // The project directory is shared with every other session of that
+      // project. Without this, a bundle containing another session's
+      // transcript would overwrite it — and that bundle can arrive from a
+      // catalog downloaded off Drive.
+      onlySession: sessionId,
+      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+    });
+    if (rejected.length > 0) {
+      ctx.logger.warn("restore.rejected_entries", {
+        session_id: sessionId,
+        count: rejected.length,
+        first: rejected[0] ?? ""
+      });
+    }
+    const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
+    if (problem !== null) {
+      const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
+      ctx.logger.error("restore.quarantined", { session_id: sessionId, path: quarantine });
+      throw new RetryableError(
+        `the restored session is incomplete: ${problem}. What was unpacked has been moved to ${quarantine} rather than deleted.`
+      );
+    }
+    const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
+    const now = ctx.clock.now();
+    if (restored !== null) {
+      markLocalPresent(ctx.db, sessionId, Math.trunc(restored.mtimeMs), now);
+      markVerified(
+        ctx.db,
+        sessionId,
+        {
+          fileId: remoteFileId,
+          path: record.remotePath ?? "",
+          localMtime: Math.trunc(restored.mtimeMs),
+          localBytes: restored.transcriptBytes + restored.sidecarBytes,
+          transcriptBytes: restored.transcriptBytes,
+          sidecarBytes: restored.sidecarBytes,
+          bundleBytes: record.verifiedBundleBytes,
+          manifest: record.verifiedManifest,
+          bundleMd5: record.verifiedBundleMd5,
+          bundleSha256: record.verifiedBundleSha256,
+          transcriptSha256: record.verifiedTranscriptSha256
+        },
+        now
+      );
+    }
+    ctx.logger.info("restore.done", { session_id: sessionId, entries: entries.length });
+    return {
+      sessionId,
+      encodedDir: record.encodedDir,
+      projectCwd: record.projectCwd,
+      transcriptPath: path14.join(targetDir, `${sessionId}.jsonl`),
+      entries,
+      alreadyLocal: false,
+      resumeCommand: resumeCommand(sessionId)
+    };
+  } finally {
+    await fsp12.rm(staged, { force: true }).catch(() => void 0);
+  }
+}
+async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
+  const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
+  if (restored === null) return "the transcript is not there";
+  const expected = record.verifiedTranscriptSha256;
+  if (expected !== null) {
+    const hash = await sha256File(path14.join(targetDir, `${sessionId}.jsonl`)).catch(() => null);
+    if (hash === null) return "the transcript could not be read back";
+    if (hash !== expected) return "the transcript does not match the hash of the archived copy";
+  }
+  const bytes = restored.transcriptBytes + restored.sidecarBytes;
+  if (record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes) {
+    return `${String(bytes)} bytes on disk, ${String(record.verifiedLocalBytes)} expected`;
+  }
+  return null;
+}
+async function removePartialRestore(targetDir, sessionId, stamp) {
+  const quarantine = path14.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
+  await fsp12.mkdir(quarantine, { recursive: true });
+  for (const name of [`${sessionId}.jsonl`, sessionId]) {
+    await fsp12.rename(path14.join(targetDir, name), path14.join(quarantine, name)).catch(() => void 0);
+  }
+  return quarantine;
+}
+async function isDirectory2(candidate) {
+  try {
+    return (await fsp12.stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function requireRemote(record) {
+  if (record.remoteFileId === null) {
+    throw new FatalError(
+      `session ${record.sessionId} has no copy on Drive`,
+      "Run /archive:now to finish backing it up, then try again."
+    );
+  }
+  if (record.verifiedBundleSha256 === null) {
+    throw new FatalError(
+      `session ${record.sessionId} has no verified hash, so a download cannot be checked`,
+      "Run /archive:now to archive it again, which records the hash."
+    );
+  }
+  return record.remoteFileId;
+}
+function resumeCommand(sessionId) {
+  return `claude --resume ${sessionId}`;
+}
+async function verifyRetained(ctx) {
+  const problems = [];
+  const unchecked = [];
+  let checked = 0;
+  let ok = 0;
+  for (const entry of listRetainedBundles(ctx.db)) {
+    checked++;
+    try {
+      const remote = await ctx.drive.getFile(entry.fileId, ctx.signal);
+      if (remote.trashed === true) {
+        problems.push({ fileId: entry.fileId, reason: "it is in the Drive wastebasket" });
+        continue;
+      }
+      if (remote.size !== null && entry.bundleBytes !== null && remote.size !== entry.bundleBytes) {
+        problems.push({
+          fileId: entry.fileId,
+          reason: `it is ${String(remote.size)} bytes, not ${String(entry.bundleBytes)}`
+        });
+        continue;
+      }
+      const strong = compareHash(remote.sha256, entry.bundleSha256);
+      const weak = compareHash(remote.md5, entry.bundleMd5);
+      if (strong === "differs" || weak === "differs") {
+        problems.push({ fileId: entry.fileId, reason: "its hash no longer matches" });
+        continue;
+      }
+      if (strong === "matches" || weak === "matches") {
+        ok++;
+        continue;
+      }
+      unchecked.push({ fileId: entry.fileId, reason: "Drive reported no checksum for it" });
+    } catch (err) {
+      unchecked.push({
+        fileId: entry.fileId,
+        reason: err instanceof Error ? err.message : "Drive could not be asked"
+      });
+    }
+  }
+  return { checked, ok, problems, unchecked };
+}
+function compareHash(remote, recorded) {
+  if (remote === null || recorded === null) return "unknown";
+  return remote.toLowerCase() === recorded.toLowerCase() ? "matches" : "differs";
+}
+async function verifyArchive(ctx, records) {
+  const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
+  for (const record of records) {
+    ctx.signal?.throwIfAborted();
+    if (record.remoteFileId === null) {
+      report.missing.push(record.sessionId);
+      continue;
+    }
+    report.checked++;
+    try {
+      const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
+      if (remote.trashed !== true && remote.sha256 === null) {
+        report.checked--;
+        report.unchecked.push({
+          sessionId: record.sessionId,
+          reason: "Drive returned no checksum"
+        });
+        continue;
+      }
+      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
+      if (reason === null) {
+        report.ok++;
+      } else {
+        clearVerification(ctx.db, record.sessionId, ctx.clock.now());
+        report.mismatched.push({
+          sessionId: record.sessionId,
+          reason,
+          // No local copy means "run /archive:now" cannot be the advice: there
+          // is nothing left on this machine to upload.
+          localDeleted: !record.localPresent
+        });
+      }
+    } catch (err) {
+      report.checked--;
+      report.unchecked.push({
+        sessionId: record.sessionId,
+        reason: err instanceof Error ? err.message : "unreadable"
+      });
+    }
+  }
+  return report;
+}
+function describeMismatch(record, remoteSize, remoteSha256) {
+  const expectedBytes = record.verifiedBundleBytes;
+  if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
+    return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
+  }
+  if (record.verifiedBundleSha256 === null) {
+    return "the catalog has no verified hash for this bundle";
+  }
+  if (remoteSha256 === null) return "Drive returned no checksum";
+  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase() ? null : "sha256 mismatch";
+}
+
 // src/worker/sweep.ts
 async function runSweep(ctx, options = {}) {
   const startedAt = ctx.clock.now();
@@ -7146,6 +7602,7 @@ async function runSweep(ctx, options = {}) {
       blockedReason: null
     },
     catalogUploaded: false,
+    audited: 0,
     cooledDown: false,
     budgetExhausted: false,
     lastError: null
@@ -7184,6 +7641,7 @@ async function runSweep(ctx, options = {}) {
     kvSetNumber(ctx.db, KV.reapRanAt, at2, at2);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
+  if (!drained.budgetExhausted) report.audited = await auditReaped(ctx);
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
     report.catalogUploaded = await uploadCatalogCopy(ctx);
   }
@@ -7384,6 +7842,26 @@ var BLOCK_RETRY_MS = 24 * 60 * 6e4;
 var DEBOUNCE_WAIT_MS = 6e4;
 var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
+var AUDIT_BATCH = 10;
+async function auditReaped(ctx) {
+  const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
+  if (records.length === 0) return 0;
+  const report = await verifyArchive(ctx, records);
+  markAudited(
+    ctx.db,
+    records.map((record) => record.sessionId),
+    ctx.clock.now()
+  );
+  if (report.mismatched.length > 0) {
+    ctx.logger.error("sweep.archive_damaged", {
+      count: report.mismatched.length,
+      first: report.mismatched[0]?.reason ?? ""
+    });
+    const at2 = ctx.clock.now();
+    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
+  }
+  return report.checked;
+}
 function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;
@@ -7399,10 +7877,10 @@ function machineId(ctx) {
   return minted;
 }
 async function uploadCatalogCopy(ctx) {
-  const destination = path14.join(ctx.paths.stagingDir, "catalog.sqlite");
+  const destination = path15.join(ctx.paths.stagingDir, "catalog.sqlite");
   try {
-    await fsp12.mkdir(ctx.paths.stagingDir, { recursive: true });
-    await fsp12.rm(destination, { force: true });
+    await fsp13.mkdir(ctx.paths.stagingDir, { recursive: true });
+    await fsp13.rm(destination, { force: true });
     await getSqlite().backup(ctx.db, destination);
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
     const cached2 = kvGet(ctx.db, KV.catalogFileId);
@@ -7413,7 +7891,7 @@ async function uploadCatalogCopy(ctx) {
         name: catalogFileName(machineId(ctx)),
         parentId,
         mimeType: "application/vnd.sqlite3",
-        body: await fsp12.readFile(destination),
+        body: await fsp13.readFile(destination),
         ...existing === void 0 ? {} : { replaceFileId: existing }
       },
       ctx.signal
@@ -7427,7 +7905,7 @@ async function uploadCatalogCopy(ctx) {
           name: catalogFileName(machineId(ctx)),
           parentId,
           mimeType: "application/vnd.sqlite3",
-          body: await fsp12.readFile(destination)
+          body: await fsp13.readFile(destination)
         },
         ctx.signal
       );
@@ -7443,7 +7921,7 @@ async function uploadCatalogCopy(ctx) {
     ctx.logger.warn("catalog.upload_failed", {}, err);
     return false;
   } finally {
-    await fsp12.rm(destination, { force: true }).catch(() => void 0);
+    await fsp13.rm(destination, { force: true }).catch(() => void 0);
   }
 }
 function describe(err) {
@@ -7452,7 +7930,7 @@ function describe(err) {
 }
 
 // src/worker/status.ts
-import fsp13 from "node:fs/promises";
+import fsp14 from "node:fs/promises";
 function buildStatus(ctx, report) {
   const now = ctx.clock.now();
   return {
@@ -7485,7 +7963,7 @@ async function writeStatusFile(ctx, report) {
 }
 async function readStatusFile(file) {
   try {
-    const parsed = JSON.parse(await fsp13.readFile(file, "utf8"));
+    const parsed = JSON.parse(await fsp14.readFile(file, "utf8"));
     return typeof parsed === "object" && parsed !== null ? parsed : null;
   } catch {
     return null;
@@ -7495,7 +7973,7 @@ async function readStatusFile(file) {
 // src/adapters/lock.ts
 import fs8 from "node:fs";
 import os5 from "node:os";
-import path15 from "node:path";
+import path16 from "node:path";
 var META_FILE = "owner.json";
 var DEFAULT_HEARTBEAT_MS = 5e3;
 var MIN_STALE_MS = 1e4;
@@ -7516,7 +7994,7 @@ function acquireLock(dir, options = {}) {
     if (!tryMkdir(dir)) return null;
   }
   try {
-    fs8.writeFileSync(path15.join(dir, META_FILE), JSON.stringify(owner), { mode: 384 });
+    fs8.writeFileSync(path16.join(dir, META_FILE), JSON.stringify(owner), { mode: 384 });
   } catch {
   }
   const timer = setInterval(() => {
@@ -7542,7 +8020,7 @@ function tryMkdir(dir) {
   } catch (err) {
     if (err.code === "EEXIST") return false;
     if (err.code === "ENOENT") {
-      fs8.mkdirSync(path15.dirname(dir), { recursive: true });
+      fs8.mkdirSync(path16.dirname(dir), { recursive: true });
       return tryMkdir(dir);
     }
     throw err;
@@ -7557,7 +8035,7 @@ function heartbeat(dir, clock) {
 }
 function readOwner(dir) {
   try {
-    const raw = fs8.readFileSync(path15.join(dir, META_FILE), "utf8");
+    const raw = fs8.readFileSync(path16.join(dir, META_FILE), "utf8");
     const parsed = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
     const { pid, hostname, startedAt } = parsed;
@@ -8012,363 +8490,6 @@ function addMonths(epochMs, months) {
   return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1);
 }
 
-// src/worker/restore.ts
-import fsp14 from "node:fs/promises";
-import path16 from "node:path";
-function isIncomplete(record, onDisk) {
-  const smaller = (floor, current) => floor !== null && current < floor;
-  return smaller(record.verifiedTranscriptBytes, onDisk.transcriptBytes) || smaller(record.verifiedSidecarBytes, onDisk.sidecarBytes);
-}
-async function restoreRetainedBundle(ctx, fileId) {
-  const retained = listRetainedBundles(ctx.db).find((entry) => entry.fileId === fileId);
-  if (retained === void 0) {
-    throw new FatalError(
-      `no retained bundle with the id ${fileId}`,
-      "Run /archive:status to see the bundles that were kept, with their ids."
-    );
-  }
-  const record = getSession(ctx.db, retained.sessionId);
-  if (record === null || !isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
-    throw new FatalError(
-      `the catalog entry for ${retained.sessionId} cannot be located on disk`,
-      "Run /archive:now to rescan, then try again."
-    );
-  }
-  const targetDir = path16.join(ctx.paths.projectsDir, record.encodedDir);
-  const destination = path16.join(
-    targetDir,
-    `${record.sessionId}.retained-${String(ctx.clock.now())}`
-  );
-  const staged = path16.join(ctx.paths.restoreDir, `${record.sessionId}.retained.tar.zst`);
-  let entries = [];
-  try {
-    await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
-    const actual = await sha256File(staged, ctx.signal);
-    const expected = retained.bundleSha256 ?? await stampedSha256(ctx, fileId);
-    if (expected === null) {
-      throw new FatalError(
-        `no recorded hash for the retained bundle ${fileId}`,
-        "Download it from Drive by hand: it is a plain .tar.zst that tar and zstd can read."
-      );
-    }
-    if (actual !== expected) {
-      throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
-    }
-    await fsp14.mkdir(destination, { recursive: true });
-    const result = await extractBundle({
-      bundlePath: staged,
-      targetDir: destination,
-      onlySession: record.sessionId,
-      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
-    });
-    entries = result.entries;
-  } finally {
-    await fsp14.rm(staged, { force: true }).catch(() => void 0);
-  }
-  if (entries.length === 0) {
-    await fsp14.rm(destination, { recursive: true, force: true }).catch(() => void 0);
-    throw new RetryableError(`nothing could be unpacked from ${fileId}`);
-  }
-  ctx.logger.info("restore.retained", { session_id: record.sessionId, path: destination });
-  return {
-    sessionId: record.sessionId,
-    encodedDir: record.encodedDir,
-    projectCwd: record.projectCwd,
-    transcriptPath: path16.join(destination, `${record.sessionId}.jsonl`),
-    entries,
-    alreadyLocal: false,
-    recoveredTo: destination,
-    resumeCommand: resumeCommand(record.sessionId)
-  };
-}
-async function stampedSha256(ctx, fileId) {
-  try {
-    const remote = await ctx.drive.getFile(fileId, ctx.signal);
-    const stamped = remote.appProperties?.["sha256"];
-    return typeof stamped === "string" && /^[0-9a-f]{64}$/.test(stamped) ? stamped : null;
-  } catch {
-    return null;
-  }
-}
-async function restoreSession(ctx, sessionId) {
-  const record = getSession(ctx.db, sessionId);
-  if (record === null) {
-    throw new FatalError(
-      `session ${sessionId} is not in the catalog`,
-      "Run /archive:search to find the session id, or /archive:now to rescan."
-    );
-  }
-  if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
-    throw new FatalError(
-      `the catalog entry for ${sessionId} has an unusable project or session id`,
-      "Run /archive:now to rebuild the catalog from the sessions on disk."
-    );
-  }
-  const targetDir = path16.join(ctx.paths.projectsDir, record.encodedDir);
-  assertInside(ctx.paths.projectsDir, targetDir, "restore target");
-  const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
-  if (existing !== null && isIncomplete(record, existing)) {
-    const recovery = path16.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
-    const staged2 = path16.join(ctx.paths.restoreDir, `${sessionId}.recover.tar.zst`);
-    let recovered = [];
-    try {
-      await ctx.drive.downloadToFile(
-        { fileId: requireRemote(record), destination: staged2 },
-        ctx.signal
-      );
-      const actual = await sha256File(staged2, ctx.signal);
-      if (actual !== record.verifiedBundleSha256) {
-        throw new RetryableError(
-          `the downloaded bundle does not match the catalog hash for ${sessionId}`
-        );
-      }
-      await fsp14.mkdir(recovery, { recursive: true });
-      const result = await extractBundle({
-        bundlePath: staged2,
-        targetDir: recovery,
-        onlySession: sessionId
-      });
-      recovered = result.entries;
-    } finally {
-      await fsp14.rm(staged2, { force: true }).catch(() => void 0);
-    }
-    if (recovered.length === 0) {
-      await fsp14.rm(recovery, { recursive: true, force: true }).catch(() => void 0);
-      throw new RetryableError(`nothing could be recovered for ${sessionId}`);
-    }
-    ctx.logger.warn("restore.recovered_beside", {
-      session_id: sessionId,
-      path: recovery,
-      entries: recovered.length
-    });
-    return {
-      sessionId,
-      encodedDir: record.encodedDir,
-      projectCwd: record.projectCwd,
-      transcriptPath: existing.transcriptPath,
-      entries: recovered,
-      alreadyLocal: true,
-      recoveredTo: recovery,
-      resumeCommand: resumeCommand(sessionId)
-    };
-  }
-  if (existing !== null) {
-    markLocalPresent(ctx.db, sessionId, Math.trunc(existing.mtimeMs), ctx.clock.now());
-    return {
-      sessionId,
-      encodedDir: record.encodedDir,
-      projectCwd: record.projectCwd,
-      transcriptPath: existing.transcriptPath,
-      entries: [],
-      alreadyLocal: true,
-      resumeCommand: resumeCommand(sessionId)
-    };
-  }
-  if (await isDirectory2(path16.join(targetDir, sessionId))) {
-    const aside = path16.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
-    await fsp14.rename(path16.join(targetDir, sessionId), aside).catch(() => void 0);
-    ctx.logger.warn("restore.sidecar_moved_aside", { session_id: sessionId, path: aside });
-  }
-  const remoteFileId = requireRemote(record);
-  const staged = path16.join(ctx.paths.restoreDir, `${sessionId}.restore.tar.zst`);
-  try {
-    await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
-    const actual = await sha256File(staged, ctx.signal);
-    if (actual !== record.verifiedBundleSha256) {
-      throw new RetryableError(
-        `the downloaded bundle does not match the catalog hash for ${sessionId}`
-      );
-    }
-    const { entries, rejected } = await extractBundle({
-      bundlePath: staged,
-      targetDir,
-      // The project directory is shared with every other session of that
-      // project. Without this, a bundle containing another session's
-      // transcript would overwrite it — and that bundle can arrive from a
-      // catalog downloaded off Drive.
-      onlySession: sessionId,
-      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
-    });
-    if (rejected.length > 0) {
-      ctx.logger.warn("restore.rejected_entries", {
-        session_id: sessionId,
-        count: rejected.length,
-        first: rejected[0] ?? ""
-      });
-    }
-    const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
-    if (problem !== null) {
-      const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
-      ctx.logger.error("restore.quarantined", { session_id: sessionId, path: quarantine });
-      throw new RetryableError(
-        `the restored session is incomplete: ${problem}. What was unpacked has been moved to ${quarantine} rather than deleted.`
-      );
-    }
-    const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
-    const now = ctx.clock.now();
-    if (restored !== null) {
-      markLocalPresent(ctx.db, sessionId, Math.trunc(restored.mtimeMs), now);
-      markVerified(
-        ctx.db,
-        sessionId,
-        {
-          fileId: remoteFileId,
-          path: record.remotePath ?? "",
-          localMtime: Math.trunc(restored.mtimeMs),
-          localBytes: restored.transcriptBytes + restored.sidecarBytes,
-          transcriptBytes: restored.transcriptBytes,
-          sidecarBytes: restored.sidecarBytes,
-          bundleBytes: record.verifiedBundleBytes,
-          manifest: record.verifiedManifest,
-          bundleMd5: record.verifiedBundleMd5,
-          bundleSha256: record.verifiedBundleSha256,
-          transcriptSha256: record.verifiedTranscriptSha256
-        },
-        now
-      );
-    }
-    ctx.logger.info("restore.done", { session_id: sessionId, entries: entries.length });
-    return {
-      sessionId,
-      encodedDir: record.encodedDir,
-      projectCwd: record.projectCwd,
-      transcriptPath: path16.join(targetDir, `${sessionId}.jsonl`),
-      entries,
-      alreadyLocal: false,
-      resumeCommand: resumeCommand(sessionId)
-    };
-  } finally {
-    await fsp14.rm(staged, { force: true }).catch(() => void 0);
-  }
-}
-async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
-  const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
-  if (restored === null) return "the transcript is not there";
-  const expected = record.verifiedTranscriptSha256;
-  if (expected !== null) {
-    const hash = await sha256File(path16.join(targetDir, `${sessionId}.jsonl`)).catch(() => null);
-    if (hash === null) return "the transcript could not be read back";
-    if (hash !== expected) return "the transcript does not match the hash of the archived copy";
-  }
-  const bytes = restored.transcriptBytes + restored.sidecarBytes;
-  if (record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes) {
-    return `${String(bytes)} bytes on disk, ${String(record.verifiedLocalBytes)} expected`;
-  }
-  return null;
-}
-async function removePartialRestore(targetDir, sessionId, stamp) {
-  const quarantine = path16.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
-  await fsp14.mkdir(quarantine, { recursive: true });
-  for (const name of [`${sessionId}.jsonl`, sessionId]) {
-    await fsp14.rename(path16.join(targetDir, name), path16.join(quarantine, name)).catch(() => void 0);
-  }
-  return quarantine;
-}
-async function isDirectory2(candidate) {
-  try {
-    return (await fsp14.stat(candidate)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-function requireRemote(record) {
-  if (record.remoteFileId === null) {
-    throw new FatalError(
-      `session ${record.sessionId} has no copy on Drive`,
-      "Run /archive:now to finish backing it up, then try again."
-    );
-  }
-  if (record.verifiedBundleSha256 === null) {
-    throw new FatalError(
-      `session ${record.sessionId} has no verified hash, so a download cannot be checked`,
-      "Run /archive:now to archive it again, which records the hash."
-    );
-  }
-  return record.remoteFileId;
-}
-function resumeCommand(sessionId) {
-  return `claude --resume ${sessionId}`;
-}
-async function verifyRetained(ctx) {
-  const problems = [];
-  let checked = 0;
-  let ok = 0;
-  for (const entry of listRetainedBundles(ctx.db)) {
-    checked++;
-    try {
-      const remote = await ctx.drive.getFile(entry.fileId, ctx.signal);
-      if (remote.trashed === true) {
-        problems.push({ fileId: entry.fileId, reason: "it is in the Drive wastebasket" });
-        continue;
-      }
-      if (entry.bundleSha256 !== null && remote.sha256 !== null && remote.sha256.toLowerCase() !== entry.bundleSha256.toLowerCase()) {
-        problems.push({ fileId: entry.fileId, reason: "its hash no longer matches" });
-        continue;
-      }
-      ok++;
-    } catch (err) {
-      problems.push({
-        fileId: entry.fileId,
-        reason: err instanceof Error ? err.message : "Drive could not be asked"
-      });
-    }
-  }
-  return { checked, ok, problems };
-}
-async function verifyArchive(ctx, records) {
-  const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
-  for (const record of records) {
-    ctx.signal?.throwIfAborted();
-    if (record.remoteFileId === null) {
-      report.missing.push(record.sessionId);
-      continue;
-    }
-    report.checked++;
-    try {
-      const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
-      if (remote.trashed !== true && remote.sha256 === null) {
-        report.checked--;
-        report.unchecked.push({
-          sessionId: record.sessionId,
-          reason: "Drive returned no checksum"
-        });
-        continue;
-      }
-      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
-      if (reason === null) {
-        report.ok++;
-      } else {
-        clearVerification(ctx.db, record.sessionId, ctx.clock.now());
-        report.mismatched.push({
-          sessionId: record.sessionId,
-          reason,
-          // No local copy means "run /archive:now" cannot be the advice: there
-          // is nothing left on this machine to upload.
-          localDeleted: !record.localPresent
-        });
-      }
-    } catch (err) {
-      report.checked--;
-      report.unchecked.push({
-        sessionId: record.sessionId,
-        reason: err instanceof Error ? err.message : "unreadable"
-      });
-    }
-  }
-  return report;
-}
-function describeMismatch(record, remoteSize, remoteSha256) {
-  const expectedBytes = record.verifiedBundleBytes;
-  if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
-    return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
-  }
-  if (record.verifiedBundleSha256 === null) {
-    return "the catalog has no verified hash for this bundle";
-  }
-  if (remoteSha256 === null) return "Drive returned no checksum";
-  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase() ? null : "sha256 mismatch";
-}
-
 // src/commands/search.ts
 function runSearch(runtime, options) {
   const db = runtime.db();
@@ -8738,8 +8859,7 @@ function importCatalogFile(runtime, file) {
     const selectFiles = source.prepare("SELECT path FROM session_files WHERE session_id = ?");
     const selectRetained = tryPrepare(
       source,
-      `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
-         FROM retained_bundles WHERE session_id = ?`
+      `SELECT * FROM retained_bundles WHERE session_id = ?`
     );
     for (const row of rows) {
       const record = toRecord(row);
@@ -8771,6 +8891,10 @@ function importCatalogFile(runtime, file) {
             fileId: kept.file_id,
             remotePath: kept.remote_path,
             bundleSha256: kept.bundle_sha256,
+            // An older catalog has neither column; null reads as "unknown",
+            // which verifyRetained reports as unchecked rather than intact.
+            bundleBytes: kept.bundle_bytes ?? null,
+            bundleMd5: kept.bundle_md5 ?? null,
             manifest: kept.manifest,
             reason: kept.reason
           },
@@ -8835,6 +8959,8 @@ async function runStatus(runtime, options) {
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
   const orphanSidecars = countReapSkipped(db, "orphan-sidecar");
+  const auditMismatched = kvGetNumber(db, KV.auditMismatched) ?? 0;
+  const statFailed = countReapSkipped(db, "stat-failed");
   const unreadableSidecars = countReapSkipped(db, "sidecar-unreadable");
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? "";
   const reapRanAt = kvGetNumber(db, KV.reapRanAt) ?? null;
@@ -8875,6 +9001,8 @@ async function runStatus(runtime, options) {
       reapRanAt,
       orphanSidecars,
       unreadableSidecars,
+      statFailed,
+      auditMismatched,
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
@@ -8984,6 +9112,14 @@ async function runStatus(runtime, options) {
     );
     print(`                      Sessions archived since then would not be findable on a new machine.`);
   }
+  if (auditMismatched > 0) {
+    print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
+    print(`                      on Drive after their local copy was freed. Run /archive:verify --all.`);
+  }
+  if (statFailed > 0) {
+    print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);
+    print(`  neither archived nor reclaimed. See the log.`);
+  }
   if (unreadableSidecars > 0) {
     print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);
     print(`                      plugin cannot read, so they are not being archived.`);
@@ -9052,6 +9188,9 @@ async function runVerify(runtime, options = {}) {
     print(`Checked ${String(retained.checked)} kept bundle(s): ${String(retained.ok)} intact.`);
     for (const problem of retained.problems.slice(0, 5)) {
       print(`  ${problem.fileId}: ${problem.reason}`);
+    }
+    if (retained.unchecked.length > 0) {
+      print(`  ${String(retained.unchecked.length)} could not be checked right now.`);
     }
   }
   if (report.missing.length > 0) {

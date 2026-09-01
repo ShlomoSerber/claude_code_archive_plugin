@@ -42,6 +42,9 @@ export async function runVerify(
     for (const problem of retained.problems.slice(0, 5)) {
       print(`  ${problem.fileId}: ${problem.reason}`);
     }
+    if (retained.unchecked.length > 0) {
+      print(`  ${String(retained.unchecked.length)} could not be checked right now.`);
+    }
   }
   if (report.missing.length > 0) {
     print(`${String(report.missing.length)} have no remote copy recorded.`);

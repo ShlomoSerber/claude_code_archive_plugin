@@ -521,6 +521,20 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN reap_skip_until INTEGER;
 
   UPDATE jobs SET blocked_at = updated_at WHERE blocked = 1 AND blocked_at IS NULL;
+  `,
+  // 10 — the size and weaker hash of a kept bundle.
+  //
+  // verifyRetained could only compare sha256, and counted "Drive did not say"
+  // as intact — for bundles /archive:status describes as holding data nothing
+  // else holds. With these it can do what verifyArchive does: compare the
+  // size, fall back to md5, and report what it could not check as unchecked.
+  `
+  ALTER TABLE retained_bundles ADD COLUMN bundle_bytes INTEGER;
+  ALTER TABLE retained_bundles ADD COLUMN bundle_md5 TEXT;
+  `,
+  // 11 — when a reaped session's bundle was last re-checked on Drive.
+  `
+  ALTER TABLE sessions ADD COLUMN audited_at INTEGER;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -645,6 +659,8 @@ var KV = {
   workerRanAt: "worker.ran_at",
   /** Sidecar directories left on disk by a transcript that vanished. */
   orphanSidecars: "reap.orphan_sidecars",
+  /** Reaped sessions whose Drive copy failed a re-check. */
+  auditMismatched: "audit.mismatched",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -2343,14 +2359,17 @@ function countSessionFiles(db, sessionId) {
 function recordRetainedBundle(db, entry, now) {
   db.prepare(
     `INSERT INTO retained_bundles
-       (session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (session_id, file_id, remote_path, bundle_sha256, bundle_bytes, bundle_md5,
+        manifest, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (file_id) DO UPDATE SET reason = excluded.reason`
   ).run(
     entry.sessionId,
     entry.fileId,
     entry.remotePath,
     entry.bundleSha256,
+    entry.bundleBytes,
+    entry.bundleMd5,
     entry.manifest,
     entry.reason,
     now
@@ -2430,6 +2449,22 @@ function listReapable(db, idleBefore, now, limit = 500) {
         LIMIT ?`
   ).all(idleBefore, now, limit);
   return rows.map(toRecord);
+}
+function listReapedForAudit(db, limit) {
+  const rows = db.prepare(
+    `SELECT ${SESSION_COLUMNS} FROM sessions
+        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        LIMIT ?`
+  ).all(limit);
+  return rows.map(toRecord);
+}
+function markAudited(db, sessionIds, now) {
+  if (sessionIds.length === 0) return;
+  const statement = db.prepare("UPDATE sessions SET audited_at = ? WHERE session_id = ?");
+  inTransaction(db, () => {
+    for (const sessionId of sessionIds) statement.run(now, sessionId);
+  });
 }
 function catalogStats(db) {
   const row = db.prepare(
@@ -2622,7 +2657,9 @@ function unblockStale(db, now, olderThanMs) {
   return Number(result.changes);
 }
 function setUploadUri(db, job, uri, now) {
-  db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?").run(uri, now, job.id);
+  db.prepare(
+    "UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token IS ?"
+  ).run(uri, now, job.id, job.claimToken);
 }
 function nextRunnableAt(db, now) {
   const row = db.prepare(
@@ -6367,7 +6404,15 @@ async function indexSession(ctx, session, previous, now) {
   }
   if (summary !== null && !shrunk) {
     try {
-      if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+      const existingPrompts = countPrompts(ctx.db, session.sessionId);
+      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      if (collapsed) {
+        log.warn("catalog.index_collapse_ignored", {
+          found: summary.prompts.length,
+          kept: existingPrompts
+        });
+      }
+      if (!collapsed && (summary.prompts.length > 0 || existingPrompts === 0)) {
         replacePrompts(ctx.db, session.sessionId, summary.prompts);
       }
     } catch (err) {
@@ -6545,6 +6590,8 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
         fileId: supersededId,
         remotePath: previous?.remotePath ?? null,
         bundleSha256: previous?.verifiedBundleSha256 ?? null,
+        bundleBytes: previous?.verifiedBundleBytes ?? null,
+        bundleMd5: previous?.verifiedBundleMd5 ?? null,
         manifest: previous?.verifiedManifest ?? null,
         reason
       },
@@ -6783,7 +6830,7 @@ async function reapLocalCopies(ctx, now, limit) {
       report.unverified++;
       continue;
     }
-    if (!await removeLocalCopy(ctx, onDisk, target)) {
+    if (!await removeLocalCopy(ctx, settled, target)) {
       report.skipped++;
       continue;
     }
@@ -6816,7 +6863,39 @@ async function describeDivergence(ctx, record, onDisk) {
   for (const file of current) {
     if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
   }
+  const extra = await findUnarchivedEntry(onDisk.sidecarDir, onDisk.sessionId, archived);
+  if (extra !== null) return `${extra} is on disk and not in the archive`;
   return null;
+}
+async function findUnarchivedEntry(sidecarDir, sessionId, archived) {
+  const directories = /* @__PURE__ */ new Set();
+  for (const entryPath of archived.keys()) {
+    const parts2 = entryPath.split("/");
+    for (let index = 1; index < parts2.length; index++) {
+      directories.add(parts2.slice(0, index).join("/"));
+    }
+  }
+  const walk = async (dir, prefix) => {
+    let entries;
+    try {
+      entries = await fsp11.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      if (err.code === "ENOENT") return null;
+      return prefix === "" ? sessionId : prefix;
+    }
+    for (const entry of entries) {
+      const relative = prefix === "" ? `${sessionId}/${entry.name}` : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!directories.has(relative)) return relative;
+        const deeper = await walk(path14.join(dir, entry.name), relative);
+        if (deeper !== null) return deeper;
+        continue;
+      }
+      if (!archived.has(relative)) return relative;
+    }
+    return null;
+  };
+  return walk(sidecarDir, "");
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
@@ -6922,6 +7001,61 @@ async function removeLocalCopy(ctx, onDisk, target) {
   return false;
 }
 
+// src/worker/restore.ts
+async function verifyArchive(ctx, records) {
+  const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
+  for (const record of records) {
+    ctx.signal?.throwIfAborted();
+    if (record.remoteFileId === null) {
+      report.missing.push(record.sessionId);
+      continue;
+    }
+    report.checked++;
+    try {
+      const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
+      if (remote.trashed !== true && remote.sha256 === null) {
+        report.checked--;
+        report.unchecked.push({
+          sessionId: record.sessionId,
+          reason: "Drive returned no checksum"
+        });
+        continue;
+      }
+      const reason = remote.trashed === true ? "the bundle is in the Drive wastebasket and will be purged" : describeMismatch(record, remote.size, remote.sha256);
+      if (reason === null) {
+        report.ok++;
+      } else {
+        clearVerification(ctx.db, record.sessionId, ctx.clock.now());
+        report.mismatched.push({
+          sessionId: record.sessionId,
+          reason,
+          // No local copy means "run /archive:now" cannot be the advice: there
+          // is nothing left on this machine to upload.
+          localDeleted: !record.localPresent
+        });
+      }
+    } catch (err) {
+      report.checked--;
+      report.unchecked.push({
+        sessionId: record.sessionId,
+        reason: err instanceof Error ? err.message : "unreadable"
+      });
+    }
+  }
+  return report;
+}
+function describeMismatch(record, remoteSize, remoteSha256) {
+  const expectedBytes = record.verifiedBundleBytes;
+  if (expectedBytes !== null && remoteSize !== null && remoteSize !== expectedBytes) {
+    return `size ${String(remoteSize)} != ${String(expectedBytes)}`;
+  }
+  if (record.verifiedBundleSha256 === null) {
+    return "the catalog has no verified hash for this bundle";
+  }
+  if (remoteSha256 === null) return "Drive returned no checksum";
+  return remoteSha256.toLowerCase() === record.verifiedBundleSha256.toLowerCase() ? null : "sha256 mismatch";
+}
+
 // src/worker/sweep.ts
 async function runSweep(ctx, options = {}) {
   const startedAt = ctx.clock.now();
@@ -6945,6 +7079,7 @@ async function runSweep(ctx, options = {}) {
       blockedReason: null
     },
     catalogUploaded: false,
+    audited: 0,
     cooledDown: false,
     budgetExhausted: false,
     lastError: null
@@ -6983,6 +7118,7 @@ async function runSweep(ctx, options = {}) {
     kvSetNumber(ctx.db, KV.reapRanAt, at2, at2);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
+  if (!drained.budgetExhausted) report.audited = await auditReaped(ctx);
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
     report.catalogUploaded = await uploadCatalogCopy(ctx);
   }
@@ -7183,6 +7319,26 @@ var BLOCK_RETRY_MS = 24 * 60 * 6e4;
 var DEBOUNCE_WAIT_MS = 6e4;
 var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
+var AUDIT_BATCH = 10;
+async function auditReaped(ctx) {
+  const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
+  if (records.length === 0) return 0;
+  const report = await verifyArchive(ctx, records);
+  markAudited(
+    ctx.db,
+    records.map((record) => record.sessionId),
+    ctx.clock.now()
+  );
+  if (report.mismatched.length > 0) {
+    ctx.logger.error("sweep.archive_damaged", {
+      count: report.mismatched.length,
+      first: report.mismatched[0]?.reason ?? ""
+    });
+    const at2 = ctx.clock.now();
+    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
+  }
+  return report.checked;
+}
 function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;

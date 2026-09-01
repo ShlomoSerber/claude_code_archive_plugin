@@ -29,6 +29,8 @@ export const KV = {
   workerRanAt: 'worker.ran_at',
   /** Sidecar directories left on disk by a transcript that vanished. */
   orphanSidecars: 'reap.orphan_sidecars',
+  /** Reaped sessions whose Drive copy failed a re-check. */
+  auditMismatched: 'audit.mismatched',
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: 'reap.ran_at',
   /** Why the last reap stopped asking Drive, if it did. */

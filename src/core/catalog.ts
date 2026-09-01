@@ -246,6 +246,8 @@ export type RetainedBundle = {
   fileId: string;
   remotePath: string | null;
   bundleSha256: string | null;
+  bundleBytes: number | null;
+  bundleMd5: string | null;
   manifest: string | null;
   reason: string;
   createdAt: number;
@@ -282,6 +284,8 @@ export function recordRetainedBundle(
     fileId: string;
     remotePath: string | null;
     bundleSha256: string | null;
+    bundleBytes: number | null;
+    bundleMd5: string | null;
     manifest: string | null;
     reason: string;
   },
@@ -289,14 +293,17 @@ export function recordRetainedBundle(
 ): void {
   db.prepare(
     `INSERT INTO retained_bundles
-       (session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (session_id, file_id, remote_path, bundle_sha256, bundle_bytes, bundle_md5,
+        manifest, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (file_id) DO UPDATE SET reason = excluded.reason`,
   ).run(
     entry.sessionId,
     entry.fileId,
     entry.remotePath,
     entry.bundleSha256,
+    entry.bundleBytes,
+    entry.bundleMd5,
     entry.manifest,
     entry.reason,
     now,
@@ -314,6 +321,8 @@ export function listRetainedBundles(db: Db, sessionId?: string): RetainedBundle[
     file_id: string;
     remote_path: string | null;
     bundle_sha256: string | null;
+    bundle_bytes: number | null;
+    bundle_md5: string | null;
     manifest: string | null;
     reason: string;
     created_at: number;
@@ -324,6 +333,8 @@ export function listRetainedBundles(db: Db, sessionId?: string): RetainedBundle[
     fileId: row.file_id,
     remotePath: row.remote_path,
     bundleSha256: row.bundle_sha256,
+    bundleBytes: row.bundle_bytes,
+    bundleMd5: row.bundle_md5,
     manifest: row.manifest,
     reason: row.reason,
     createdAt: row.created_at,
@@ -501,6 +512,34 @@ export function listReapable(
     )
     .all(idleBefore, now, limit) as SessionRow[];
   return rows.map(toRecord);
+}
+
+/**
+ * Archived sessions with no local copy, oldest check first.
+ *
+ * Once a session is reaped nothing looks at its bundle again: listReapable
+ * only selects rows that are still local, and /archive:verify is manual. A
+ * bundle trashed on Drive months later — a tidy-up, a wastebasket purge —
+ * would leave /archive:status reporting it as verified for ever.
+ */
+export function listReapedForAudit(db: Db, limit: number): SessionRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT ${SESSION_COLUMNS} FROM sessions
+        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        LIMIT ?`,
+    )
+    .all(limit) as SessionRow[];
+  return rows.map(toRecord);
+}
+
+export function markAudited(db: Db, sessionIds: readonly string[], now: number): void {
+  if (sessionIds.length === 0) return;
+  const statement = db.prepare('UPDATE sessions SET audited_at = ? WHERE session_id = ?');
+  inTransaction(db, () => {
+    for (const sessionId of sessionIds) statement.run(now, sessionId);
+  });
 }
 
 /** Sessions that still need a verified copy on Drive. */
