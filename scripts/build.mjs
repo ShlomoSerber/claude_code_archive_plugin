@@ -36,6 +36,19 @@ async function checkVersion() {
       `src/version.ts says ${match?.[1] ?? 'nothing'} but package.json says ${pkg.version}`,
     );
   }
+  // The one users actually see. `claude plugin update` compares this number
+  // with the installed one and does nothing when they match — so a fix shipped
+  // without bumping it reaches nobody, and the cached build stays stale for
+  // ever with no sign that anything is wrong.
+  const manifest = JSON.parse(
+    await readFile(path.join(root, '.claude-plugin/plugin.json'), 'utf8'),
+  );
+  if (manifest.version !== pkg.version) {
+    throw new Error(
+      `.claude-plugin/plugin.json says ${manifest.version} but package.json says ${pkg.version}` +
+        ' — an installed plugin only updates when this number changes',
+    );
+  }
   return pkg.version;
 }
 

@@ -20,6 +20,17 @@ Needs [Node.js 22.16 or newer](#requirements). The last step opens your browser
 to sign in to Google, takes over transcript cleanup, and starts archiving the
 sessions you already have.
 
+## Updating
+
+```bash
+claude plugin marketplace update claude-code-archive && claude plugin update archive@claude-code-archive
+```
+
+Then restart Claude Code. `plugin update` compares version numbers, so a release
+that does not bump `version` in `.claude-plugin/plugin.json` leaves the installed
+copy untouched — the build refuses to run if that number disagrees with
+`package.json`.
+
 ## How it works
 
 - **On session close**, a hook queues the session and starts a short-lived

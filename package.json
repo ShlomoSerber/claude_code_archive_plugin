@@ -1,6 +1,6 @@
 {
   "name": "claude-code-archive-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Archive every Claude Code session to Google Drive; keep the local disk as a cache of recent sessions.",
   "license": "MIT",
