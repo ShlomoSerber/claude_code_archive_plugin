@@ -9,6 +9,7 @@ import { spawnWorker } from '../src/adapters/spawn-worker.ts';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import {
+  countDamagedArchives,
   SESSION_COLUMNS,
   toRecord,
   type SessionRow,
@@ -1174,9 +1175,10 @@ describe('deletion safety, sixth pass', () => {
 
   it('never resumes an upload URI opened for a different bundle', async () => {
     const contents = await import('../src/worker/upload.ts');
-    const tagged = contents.tagUploadUri('https://upload.test/1', 'aaaa');
+    const tagged = contents.tagUploadUri('https://upload.test/1', 'aaaa', 'folder-1');
     assert.deepEqual(contents.parseUploadUri(tagged), {
       sha256: 'aaaa',
+      parentId: 'folder-1',
       uri: 'https://upload.test/1',
     });
     // An untagged value predates the format and must not be trusted to a bundle.
@@ -2982,5 +2984,42 @@ describe('a Drive that reports only md5', () => {
     stored.content = Buffer.concat([stored.content.subarray(0, 4), Buffer.from('rot!')]);
     const dirty = await verifyArchive(harness.ctx, [getSession(harness.ctx.db, SESSION_A)!]);
     assert.equal(dirty.mismatched.length, 1, 'and it catches rot the sha256 path never saw');
+  });
+});
+
+/**
+ * Twenty-ninth round. Objective 1 held again, negative-controlled: the auditor
+ * broke each guard on purpose first and confirmed the harness sees the loss.
+ * The finding was that the plugin's only alarm for a bundle that went bad
+ * after its local copy was freed cleared itself ten minutes later.
+ */
+describe('the warning about a damaged archive', () => {
+  it('stays up until the damage is dealt with', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    const record = getSession(harness.ctx.db, SESSION_A);
+    harness.drive.trashedIds.add(record?.remoteFileId ?? '');
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.equal(countDamagedArchives(harness.ctx.db), 1, 'the damage is counted');
+
+    // The audit looks at ten sessions a sweep, so a per-run counter reported
+    // this once and then overwrote it with the next batch's zero — about one
+    // sweep in sixty on a real archive.
+    for (let sweep = 0; sweep < 3; sweep++) {
+      harness.clock.advance(60_000);
+      await runSweep(harness.ctx, { force: true });
+      assert.equal(
+        countDamagedArchives(harness.ctx.db),
+        1,
+        `the warning survives sweep ${String(sweep)}`,
+      );
+    }
   });
 });

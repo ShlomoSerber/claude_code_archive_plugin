@@ -12,7 +12,7 @@ import type { Db } from '../adapters/db.ts';
  * are one row, because the tenth backup subsumes the first nine.
  */
 
-export const JOB_KINDS = ['backup', 'catalog_upload'] as const;
+export const JOB_KINDS = ['backup'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 export type Job = {

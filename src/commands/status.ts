@@ -1,4 +1,9 @@
-import { catalogStats, countReapSkipped, listRetainedBundles } from '../core/catalog.ts';
+import {
+  catalogStats,
+  countDamagedArchives,
+  countReapSkipped,
+  listRetainedBundles,
+} from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGet, kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
@@ -72,7 +77,7 @@ export async function runStatus(
   // Counted from the catalog, not from the last run: the reaper looks at a
   // capped window, so 505 orphans were reported as 500.
   const orphanSidecars = countReapSkipped(db, 'orphan-sidecar');
-  const auditMismatched = kvGetNumber(db, KV.auditMismatched) ?? 0;
+  const auditMismatched = countDamagedArchives(db);
   const statFailed = countReapSkipped(db, 'stat-failed');
   const unreadableSidecars = countReapSkipped(db, 'sidecar-unreadable');
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
@@ -264,10 +269,9 @@ export async function runStatus(
     );
   }
   if (auditMismatched > 0) {
-    print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
-    print(
-      `                      on Drive after their local copy was freed. Run /archive:verify --all.`,
-    );
+    print(`  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`);
+    print(`                      and a Drive copy that failed its last check.`);
+    print(`                      Run /archive:verify --all, and check the Drive wastebasket.`);
   }
   if (statFailed > 0) {
     print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);

@@ -638,6 +638,13 @@ async function writeFileAtomic(finalPath, data, options = {}) {
   }
 }
 var PARTIAL_GRACE_MS = 5 * 6e4;
+var DISPOSABLE = [
+  ".partial",
+  ".building.tar.zst",
+  ".restore.tar.zst",
+  ".recover.tar.zst",
+  ".retained.tar.zst"
+];
 async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
@@ -647,7 +654,7 @@ async function removePartials(dir, now = Date.now()) {
   }
   const removed = [];
   for (const entry of entries) {
-    if (!entry.endsWith(".partial") && !entry.endsWith(".building.tar.zst")) continue;
+    if (!DISPOSABLE.some((suffix) => entry.endsWith(suffix))) continue;
     const full = path3.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
@@ -2530,6 +2537,16 @@ function markReapSkipped(db, sessionId, reason, until, now) {
     `UPDATE sessions SET reap_skip_reason = ?, reap_skip_until = ?, updated_at = ?
       WHERE session_id = ?`
   ).run(reason, until, now, sessionId);
+}
+function countDamagedArchives(db) {
+  const row = db.prepare(
+    `SELECT count(*) AS n FROM sessions
+        WHERE local_present = 0
+          AND verified_at IS NULL
+          AND remote_file_id IS NOT NULL
+          AND verified_bundle_sha256 IS NOT NULL`
+  ).get();
+  return row?.n ?? 0;
 }
 function countReapSkipped(db, reason) {
   const row = db.prepare("SELECT count(*) AS n FROM sessions WHERE reap_skip_reason = ?").get(reason);
@@ -6425,7 +6442,7 @@ async function uploadWithResume(ctx, args) {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? "", name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
   const stored = parseUploadUri(args.job.uploadUri);
-  let uploadUri = stored !== null && stored.sha256 === args.sha256 ? stored.uri : null;
+  let uploadUri = stored !== null && stored.sha256 === args.sha256 && stored.parentId === args.parentId ? stored.uri : null;
   if (stored !== null && uploadUri === null) {
     log.info("upload.uri_belongs_to_another_bundle");
     setUploadUri(ctx.db, args.job, null, ctx.clock.now());
@@ -6490,7 +6507,12 @@ async function uploadWithResume(ctx, args) {
       },
       ctx.signal
     );
-    setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
+    setUploadUri(
+      ctx.db,
+      args.job,
+      tagUploadUri(uploadUri, args.sha256, args.parentId),
+      ctx.clock.now()
+    );
     confirmed = 0;
   }
   const handle = await fsp9.open(args.filePath, "r");
@@ -6536,23 +6558,29 @@ async function uploadWithResume(ctx, args) {
   }
   throw new RetryableError("the upload finished without Drive returning the file");
 }
-function tagUploadUri(uri, sha256) {
-  return `${sha256}|${uri}`;
+function tagUploadUri(uri, sha256, parentId = "") {
+  return `${sha256}:${parentId}|${uri}`;
 }
 function parseUploadUri(stored) {
   if (stored === null) return null;
   const separator = stored.indexOf("|");
   if (separator <= 0) return null;
-  return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
+  const tag = stored.slice(0, separator);
+  const colon = tag.indexOf(":");
+  return colon < 0 ? { sha256: tag, parentId: "", uri: stored.slice(separator + 1) } : {
+    sha256: tag.slice(0, colon),
+    parentId: tag.slice(colon + 1),
+    uri: stored.slice(separator + 1)
+  };
 }
 function matchesLocal(remote, args) {
-  if (remote.size !== null && remote.size !== args.totalBytes) return "mismatch";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === args.sha256.toLowerCase() ? "match" : "mismatch";
   }
   if (remote.md5 !== null && args.md5 !== void 0) {
     return remote.md5.toLowerCase() === args.md5.toLowerCase() ? "match" : "mismatch";
   }
+  if (remote.size !== null && remote.size !== args.totalBytes) return "mismatch";
   return "unknown";
 }
 
@@ -7777,10 +7805,6 @@ async function drain(ctx, deadline, report) {
   }
 }
 async function runJob(ctx, job, report) {
-  if (job.kind === "catalog_upload") {
-    await uploadCatalogCopy(ctx);
-    return;
-  }
   const sessionId = job.sessionId;
   if (sessionId === null) return;
   const payload = parsePayload(job);
@@ -8990,7 +9014,7 @@ async function runStatus(runtime, options) {
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
   const orphanSidecars = countReapSkipped(db, "orphan-sidecar");
-  const auditMismatched = kvGetNumber(db, KV.auditMismatched) ?? 0;
+  const auditMismatched = countDamagedArchives(db);
   const statFailed = countReapSkipped(db, "stat-failed");
   const unreadableSidecars = countReapSkipped(db, "sidecar-unreadable");
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? "";
@@ -9146,10 +9170,9 @@ async function runStatus(runtime, options) {
     );
   }
   if (auditMismatched > 0) {
-    print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
-    print(
-      `                      on Drive after their local copy was freed. Run /archive:verify --all.`
-    );
+    print(`  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`);
+    print(`                      and a Drive copy that failed its last check.`);
+    print(`                      Run /archive:verify --all, and check the Drive wastebasket.`);
   }
   if (statFailed > 0) {
     print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);

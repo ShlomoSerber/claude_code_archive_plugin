@@ -38,7 +38,10 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
   // The URI is stored tagged with the hash of the bundle it was opened for.
   // Resuming one against different bytes produces a file that is neither.
   const stored = parseUploadUri(args.job.uploadUri);
-  let uploadUri = stored !== null && stored.sha256 === args.sha256 ? stored.uri : null;
+  let uploadUri =
+    stored !== null && stored.sha256 === args.sha256 && stored.parentId === args.parentId
+      ? stored.uri
+      : null;
   if (stored !== null && uploadUri === null) {
     log.info('upload.uri_belongs_to_another_bundle');
     setUploadUri(ctx.db, args.job, null, ctx.clock.now());
@@ -129,7 +132,12 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       ctx.signal,
     );
     // Persisted before a single byte is sent: this URI is the idempotency key.
-    setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
+    setUploadUri(
+      ctx.db,
+      args.job,
+      tagUploadUri(uploadUri, args.sha256, args.parentId),
+      ctx.clock.now(),
+    );
     confirmed = 0;
   }
 
@@ -194,16 +202,29 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
  * remote as unknown and replace it.
  */
 /** `<bundle sha256>|<uri>`, so a stored URI can never outlive its bundle. */
-export function tagUploadUri(uri: string, sha256: string): string {
-  return `${sha256}|${uri}`;
+export function tagUploadUri(uri: string, sha256: string, parentId = ''): string {
+  return `${sha256}:${parentId}|${uri}`;
 }
 
-export function parseUploadUri(stored: string | null): { sha256: string; uri: string } | null {
+export function parseUploadUri(
+  stored: string | null,
+): { sha256: string; parentId: string; uri: string } | null {
   if (stored === null) return null;
   const separator = stored.indexOf('|');
   // An untagged value predates this format and cannot be trusted to a bundle.
   if (separator <= 0) return null;
-  return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
+  const tag = stored.slice(0, separator);
+  const colon = tag.indexOf(':');
+  // The folder as well as the bytes: a bundle is byte-identical after a
+  // project directory is renamed, so the hash alone let a resumed upload file
+  // it under the old project's folder while the catalog named the new one.
+  return colon < 0
+    ? { sha256: tag, parentId: '', uri: stored.slice(separator + 1) }
+    : {
+        sha256: tag.slice(0, colon),
+        parentId: tag.slice(colon + 1),
+        uri: stored.slice(separator + 1),
+      };
 }
 
 /**
@@ -219,12 +240,15 @@ export function matchesLocal(
   remote: RemoteFile,
   args: { totalBytes: number; sha256: string; md5?: string },
 ): 'match' | 'mismatch' | 'unknown' {
-  if (remote.size !== null && remote.size !== args.totalBytes) return 'mismatch';
+  // The hash first, as compareChecksums does. A size that disagrees with a
+  // matching hash is Drive contradicting itself, and the caller's answer to a
+  // mismatch is to move the file to the wastebasket.
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === args.sha256.toLowerCase() ? 'match' : 'mismatch';
   }
   if (remote.md5 !== null && args.md5 !== undefined) {
     return remote.md5.toLowerCase() === args.md5.toLowerCase() ? 'match' : 'mismatch';
   }
+  if (remote.size !== null && remote.size !== args.totalBytes) return 'mismatch';
   return 'unknown';
 }

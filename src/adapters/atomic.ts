@@ -144,6 +144,14 @@ export function writeFileAtomicSync(
 /** Younger than this and it may still belong to a running operation. */
 const PARTIAL_GRACE_MS = 5 * 60_000;
 
+const DISPOSABLE = [
+  '.partial',
+  '.building.tar.zst',
+  '.restore.tar.zst',
+  '.recover.tar.zst',
+  '.retained.tar.zst',
+];
+
 export async function removePartials(dir: string, now = Date.now()): Promise<string[]> {
   let entries: string[];
   try {
@@ -153,9 +161,11 @@ export async function removePartials(dir: string, now = Date.now()): Promise<str
   }
   const removed: string[] = [];
   for (const entry of entries) {
-    // .building.tar.zst is the staged bundle a crashed backup leaves behind;
-    // it is rebuilt from scratch on the next attempt, never resumed.
-    if (!entry.endsWith('.partial') && !entry.endsWith('.building.tar.zst')) continue;
+    // .building.tar.zst is the staged bundle a crashed backup leaves behind,
+    // and .restore/.recover/.retained.tar.zst are what a killed restore leaves
+    // once its download has been renamed into place. All are rebuilt or
+    // re-downloaded from scratch, never resumed.
+    if (!DISPOSABLE.some((suffix) => entry.endsWith(suffix))) continue;
     const full = path.join(dir, entry);
     try {
       // A restore downloads through a temp file with the same suffix, and a

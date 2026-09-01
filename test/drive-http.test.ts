@@ -111,13 +111,25 @@ describe('matchesLocal', () => {
     );
   });
 
-  it('rejects a different size', () => {
+  it('rejects a different size when Drive offers no hash', () => {
+    assert.equal(
+      matchesLocal(
+        { id: 'x', name: 'n', size: 99, sha256: null, md5: null, trashed: false },
+        bundle,
+      ),
+      'mismatch',
+    );
+  });
+
+  it('trusts a matching hash over a size that disagrees with it', () => {
+    // The caller's answer to a mismatch is the wastebasket, and a size that
+    // contradicts a matching hash is Drive contradicting itself.
     assert.equal(
       matchesLocal(
         { id: 'x', name: 'n', size: 99, sha256: 'abc', md5: null, trashed: false },
         bundle,
       ),
-      'mismatch',
+      'match',
     );
   });
 

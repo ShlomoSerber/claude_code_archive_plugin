@@ -322,10 +322,6 @@ async function drain(
 }
 
 async function runJob(ctx: WorkerContext, job: Job, report: SweepReport): Promise<void> {
-  if (job.kind === 'catalog_upload') {
-    await uploadCatalogCopy(ctx);
-    return;
-  }
   const sessionId = job.sessionId;
   if (sessionId === null) return;
   const payload = parsePayload(job) as { encodedDir?: unknown } | null;

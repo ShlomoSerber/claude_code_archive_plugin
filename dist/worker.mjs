@@ -842,6 +842,13 @@ async function writeFileAtomic(finalPath, data, options = {}) {
   }
 }
 var PARTIAL_GRACE_MS = 5 * 6e4;
+var DISPOSABLE = [
+  ".partial",
+  ".building.tar.zst",
+  ".restore.tar.zst",
+  ".recover.tar.zst",
+  ".retained.tar.zst"
+];
 async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
@@ -851,7 +858,7 @@ async function removePartials(dir, now = Date.now()) {
   }
   const removed = [];
   for (const entry of entries) {
-    if (!entry.endsWith(".partial") && !entry.endsWith(".building.tar.zst")) continue;
+    if (!DISPOSABLE.some((suffix) => entry.endsWith(suffix))) continue;
     const full = path4.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
@@ -6230,7 +6237,7 @@ async function uploadWithResume(ctx, args) {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? "", name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
   const stored = parseUploadUri(args.job.uploadUri);
-  let uploadUri = stored !== null && stored.sha256 === args.sha256 ? stored.uri : null;
+  let uploadUri = stored !== null && stored.sha256 === args.sha256 && stored.parentId === args.parentId ? stored.uri : null;
   if (stored !== null && uploadUri === null) {
     log.info("upload.uri_belongs_to_another_bundle");
     setUploadUri(ctx.db, args.job, null, ctx.clock.now());
@@ -6295,7 +6302,12 @@ async function uploadWithResume(ctx, args) {
       },
       ctx.signal
     );
-    setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
+    setUploadUri(
+      ctx.db,
+      args.job,
+      tagUploadUri(uploadUri, args.sha256, args.parentId),
+      ctx.clock.now()
+    );
     confirmed = 0;
   }
   const handle = await fsp9.open(args.filePath, "r");
@@ -6341,23 +6353,29 @@ async function uploadWithResume(ctx, args) {
   }
   throw new RetryableError("the upload finished without Drive returning the file");
 }
-function tagUploadUri(uri, sha256) {
-  return `${sha256}|${uri}`;
+function tagUploadUri(uri, sha256, parentId = "") {
+  return `${sha256}:${parentId}|${uri}`;
 }
 function parseUploadUri(stored) {
   if (stored === null) return null;
   const separator = stored.indexOf("|");
   if (separator <= 0) return null;
-  return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
+  const tag = stored.slice(0, separator);
+  const colon = tag.indexOf(":");
+  return colon < 0 ? { sha256: tag, parentId: "", uri: stored.slice(separator + 1) } : {
+    sha256: tag.slice(0, colon),
+    parentId: tag.slice(colon + 1),
+    uri: stored.slice(separator + 1)
+  };
 }
 function matchesLocal(remote, args) {
-  if (remote.size !== null && remote.size !== args.totalBytes) return "mismatch";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === args.sha256.toLowerCase() ? "match" : "mismatch";
   }
   if (remote.md5 !== null && args.md5 !== void 0) {
     return remote.md5.toLowerCase() === args.md5.toLowerCase() ? "match" : "mismatch";
   }
+  if (remote.size !== null && remote.size !== args.totalBytes) return "mismatch";
   return "unknown";
 }
 
@@ -7239,10 +7257,6 @@ async function drain(ctx, deadline, report) {
   }
 }
 async function runJob(ctx, job, report) {
-  if (job.kind === "catalog_upload") {
-    await uploadCatalogCopy(ctx);
-    return;
-  }
   const sessionId = job.sessionId;
   if (sessionId === null) return;
   const payload = parsePayload(job);

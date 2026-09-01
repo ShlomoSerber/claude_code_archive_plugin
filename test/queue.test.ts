@@ -65,11 +65,11 @@ describe('enqueue', () => {
     assert.equal(listJobs(db).length, 1);
   });
 
-  it('keeps different sessions and kinds apart', () => {
+  it('keeps different sessions apart', () => {
     const db = freshDb();
     enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
     enqueue(db, { kind: 'backup', sessionId: 's2' }, 1000);
-    enqueue(db, { kind: 'catalog_upload' }, 1000);
+    enqueue(db, { kind: 'backup', sessionId: null }, 1000);
     assert.equal(listJobs(db).length, 3);
   });
 
@@ -238,7 +238,7 @@ describe('countJobs', () => {
 describe('dedupeKey', () => {
   it('distinguishes a session job from the global one', () => {
     assert.equal(dedupeKey('backup', 's1'), 'backup:s1');
-    assert.equal(dedupeKey('catalog_upload', null), 'catalog_upload:');
+    assert.equal(dedupeKey('backup', null), 'backup:');
   });
 });
 

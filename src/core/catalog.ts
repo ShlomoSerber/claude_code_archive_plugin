@@ -439,6 +439,28 @@ export function markReapSkipped(
   ).run(reason, until, now, sessionId);
 }
 
+/**
+ * Sessions with no local copy whose Drive bundle failed its last check.
+ *
+ * Counted from the catalog, because the condition is persistent and the audit
+ * that finds it is not: it looks at ten sessions a sweep, so a per-run counter
+ * reported the damage once and then overwrote it with the next batch's zero —
+ * about one sweep in sixty on a real archive, and the last warning before
+ * Drive's wastebasket purge makes the loss permanent.
+ */
+export function countDamagedArchives(db: Db): number {
+  const row = db
+    .prepare(
+      `SELECT count(*) AS n FROM sessions
+        WHERE local_present = 0
+          AND verified_at IS NULL
+          AND remote_file_id IS NOT NULL
+          AND verified_bundle_sha256 IS NOT NULL`,
+    )
+    .get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 /** How many rows the reaper is currently passing over for this reason. */
 export function countReapSkipped(db: Db, reason: string): number {
   const row = db
