@@ -8716,14 +8716,9 @@ async function setCleanupPeriodDays(file, days = CLEANUP_PERIOD_DAYS) {
   });
   return { changed: true, previous, current: days };
 }
-function competingSettingsPaths(claudeDir, cwd = process.cwd()) {
+function competingSettingsPaths(claudeDir) {
   const managed = process.platform === "darwin" ? "/Library/Application Support/ClaudeCode/managed-settings.json" : process.platform === "win32" ? "C:\\Program Files\\ClaudeCode\\managed-settings.json" : "/etc/claude-code/managed-settings.json";
-  return [
-    path17.join(claudeDir, "settings.local.json"),
-    path17.join(cwd, ".claude", "settings.json"),
-    path17.join(cwd, ".claude", "settings.local.json"),
-    managed
-  ];
+  return [path17.join(claudeDir, "settings.local.json"), managed];
 }
 async function projectCleanupSettings(projectDirs) {
   const found = [];
@@ -8743,9 +8738,9 @@ async function projectCleanupSettings(projectDirs) {
   }
   return found;
 }
-async function competingCleanupSettings(claudeDir, cwd = process.cwd()) {
+async function competingCleanupSettings(claudeDir) {
   const found = [];
-  for (const file of competingSettingsPaths(claudeDir, cwd)) {
+  for (const file of competingSettingsPaths(claudeDir)) {
     let read;
     try {
       read = await readSettings(file);

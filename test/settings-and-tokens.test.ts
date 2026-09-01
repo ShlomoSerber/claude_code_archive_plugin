@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  competingCleanupSettings,
   projectCleanupSettings,
   readCleanupPeriodDays,
   readSettings,
@@ -292,5 +293,39 @@ describe('cleanupPeriodDays in another project', () => {
     assert.equal(found.length, 1);
     assert.equal(found[0]?.value, 30);
     assert.match(found[0]?.file ?? '', /settings\.json$/);
+  });
+});
+
+describe('the file the plugin itself writes', () => {
+  it('is never treated as a competitor', async () => {
+    void 0;
+    // Run Claude Code from your home directory and "the project's
+    // .claude/settings.json" is the user settings file. Setup refused to run,
+    // naming the file it was about to write — and after a successful run it
+    // refused on the value it had written itself, taking --reauth and the
+    // fresh-machine recovery with it.
+    const home = tempDir();
+    const claudeDir = path.join(home, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeDir, 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: CLEANUP_PERIOD_DAYS }),
+    );
+
+    assert.deepEqual(await competingCleanupSettings(claudeDir), []);
+  });
+
+  it('still reports a genuinely competing file', async () => {
+    const home = tempDir();
+    const claudeDir = path.join(home, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeDir, 'settings.local.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+
+    const found = await competingCleanupSettings(claudeDir);
+    assert.equal(found.length, 1);
+    assert.match(found[0]?.file ?? '', /settings\.local\.json$/);
   });
 });

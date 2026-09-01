@@ -51,7 +51,10 @@ import {
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
-import { competingCleanupSettings } from '../src/adapters/claude-settings.ts';
+import {
+  competingCleanupSettings,
+  projectCleanupSettings,
+} from '../src/adapters/claude-settings.ts';
 import { createExtractor } from '../src/core/transcript.ts';
 import { kvGetNumber, kvSetNumber } from '../src/adapters/db.ts';
 import { ACTIVE_SESSION_TTL_MS, KV, activeSessionKey } from '../src/core/state-keys.ts';
@@ -2155,16 +2158,46 @@ describe('recovering a catalog written by another version', () => {
 });
 
 describe('settings that outrank the one the plugin writes', () => {
-  it('looks in the project directory, not only the user one', async () => {
+  it('does not depend on which directory Claude Code started in', async () => {
+    // The plugin is global: it archives every session from every project, so
+    // whether it owns deletion cannot depend on where Claude Code started.
+    // Checking the current project also meant that, run from a home directory,
+    // "the project's .claude/settings.json" is the user settings file the
+    // plugin writes — so setup refused, naming the file it was about to write.
     const cwd = tempDir();
     fs.mkdirSync(path.join(cwd, '.claude'), { recursive: true });
     fs.writeFileSync(
       path.join(cwd, '.claude', 'settings.json'),
       JSON.stringify({ cleanupPeriodDays: 30 }),
     );
-    const competing = await competingCleanupSettings(tempDir(), cwd);
-    assert.equal(competing.length, 1, 'a project setting outranks the user file we write');
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      assert.deepEqual(await competingCleanupSettings(tempDir()), []);
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  it('still refuses a user-level file that outranks it', async () => {
+    const claudeDir = tempDir();
+    fs.writeFileSync(
+      path.join(claudeDir, 'settings.local.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+    const competing = await competingCleanupSettings(claudeDir);
+    assert.equal(competing.length, 1);
     assert.equal(competing[0]?.value, 30);
+  });
+
+  it('reports a project that sets it, from the catalog rather than the cwd', async () => {
+    const project = tempDir();
+    fs.mkdirSync(path.join(project, '.claude'), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, '.claude', 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+    assert.equal((await projectCleanupSettings([project])).length, 1);
   });
 });
 
