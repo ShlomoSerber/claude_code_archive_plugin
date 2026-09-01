@@ -1,6 +1,6 @@
 import { catalogStats, listRetainedBundles } from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
-import { kvGetNumber } from '../adapters/db.ts';
+import { kvGet, kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
 import { competingCleanupSettings, readCleanupPeriodDays } from '../adapters/claude-settings.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
@@ -30,6 +30,8 @@ export async function runStatus(
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
+  const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
+  const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore
     .read()
@@ -58,6 +60,8 @@ export async function runStatus(
       unarchivable: skipped,
       unreadable,
       unconfirmable,
+      reapUnverified,
+      reapBlocked: reapBlocked === '' ? null : reapBlocked,
       retainedBundles: retained.map((entry) => ({
         sessionId: entry.sessionId,
         fileId: entry.fileId,
@@ -126,6 +130,19 @@ export async function runStatus(
     print(
       `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`,
     );
+  }
+  if (reapBlocked !== '') {
+    // The remediation Drive's refusal came with. It used to be swallowed here,
+    // so a revoked token showed up only as an archive that had stopped being
+    // verified, with nothing saying why.
+    print(`  WARNING:            Drive would not answer the last check:`);
+    print(`                      ${reapBlocked}`);
+  }
+  if (reapUnverified > 0) {
+    print(
+      `  WARNING:            ${String(reapUnverified)} archived session(s) were missing or changed`,
+    );
+    print(`                      on Drive and have been queued to upload again.`);
   }
   if (unconfirmable > 0) {
     // Everything says verified and nothing is ever reclaimed: without this line

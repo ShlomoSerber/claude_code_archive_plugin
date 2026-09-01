@@ -19,7 +19,10 @@ export const NODE_REMEDIATION =
 
 /** A human-readable problem, or null when this runtime is supported. */
 export function nodeVersionProblem(version: string = process.versions.node): string | null {
-  if (compareVersions(version, MIN_NODE_VERSION) >= 0) return null;
+  const comparison = compareVersions(version, MIN_NODE_VERSION);
+  // 22.16.0-pre is 22.16.0 minus whatever landed last, and what landed in
+  // 22.16.0 is sqlite.backup(), which this plugin needs.
+  if (comparison > 0 || (comparison === 0 && !version.includes('-'))) return null;
   return `the archive plugin needs Node ${MIN_NODE_VERSION} or newer, but this is Node ${version}`;
 }
 

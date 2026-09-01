@@ -23,6 +23,10 @@ export const KV = {
   unreadableCount: 'scan.unreadable_count',
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: 'machine.id',
+  /** Why the last reap stopped asking Drive, if it did. */
+  reapBlockedReason: 'reap.blocked_reason',
+  /** Archived sessions the last reap found missing or changed on Drive. */
+  reapUnverified: 'reap.unverified_count',
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
   unconfirmableCount: 'reap.unconfirmable_count',
 } as const;

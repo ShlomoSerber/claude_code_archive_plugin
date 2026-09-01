@@ -147,6 +147,7 @@ function envSource(env: Readonly<Record<string, string | undefined>>): Source {
     debounceMs: env['ARCHIVE_DEBOUNCE_MS'],
     sweepMinIntervalMs: env['ARCHIVE_SWEEP_INTERVAL_MS'],
     workerBudgetMs: env['ARCHIVE_WORKER_BUDGET_MS'],
+    jobVisibilityMs: env['ARCHIVE_JOB_VISIBILITY_MS'],
     archiveGraceDays: env['ARCHIVE_ARCHIVE_GRACE_DAYS'],
     enabled: env['ARCHIVE_ENABLED'],
     keepLocalForever: env['ARCHIVE_KEEP_LOCAL_FOREVER'],

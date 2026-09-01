@@ -62,7 +62,9 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
     const second = await send();
     if (second.status === 401) {
       await second.body?.cancel().catch(() => undefined);
-      throw new FatalError('Google rejected the access token', REAUTH_REMEDIATION);
+      throw new FatalError('Google rejected the access token', REAUTH_REMEDIATION, {
+        status: 401,
+      });
     }
     return second;
   };
@@ -72,7 +74,9 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
     if (response.ok) return body;
     const message = `${what}: ${describeApiError(response.status, body)}`;
     if (response.status === 403 && isQuotaExhausted(body)) {
-      throw new FatalError(message, 'Free space in Google Drive, then run /archive:now.');
+      throw new FatalError(message, 'Free space in Google Drive, then run /archive:now.', {
+        status: response.status,
+      });
     }
     // 403 is how Drive signals a rate limit as well as a refusal. Classing the
     // former as fatal made the reaper read "slow down" as "the archive is gone".
@@ -86,7 +90,9 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
       });
     }
     if (response.status >= 400 && response.status < 500) {
-      throw new FatalError(message, 'Run /archive:status for details.');
+      throw new FatalError(message, 'Run /archive:status for details.', {
+        status: response.status,
+      });
     }
     throw new RetryableError(message, { status: response.status });
   };

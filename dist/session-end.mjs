@@ -66,9 +66,20 @@ var RetryableError = class extends ArchiveError {
 var FatalError = class extends ArchiveError {
   /** Shown verbatim to the user by `/archive:status`. Always actionable. */
   remediation;
+  /**
+   * The HTTP status that produced it, when there was one.
+   *
+   * The reaper needs to tell "Drive says that file is not there" (404) from
+   * "Drive would not talk to us" (401, 403, a full quota). It used to read
+   * every FatalError as the first, and so withdrew the verification of a
+   * perfectly good archive on every session, every sweep, whenever a token
+   * expired.
+   */
+  status;
   constructor(message, remediation, options) {
     super(message, options);
     this.remediation = remediation;
+    this.status = options?.status;
   }
 };
 var BugError = class extends ArchiveError {
@@ -134,7 +145,8 @@ var UploadSessionExpired = class extends ArchiveError {
 var MIN_NODE_VERSION = "22.16.0";
 var NODE_REMEDIATION = `Install Node ${MIN_NODE_VERSION} or newer (24 LTS recommended) and make sure the \`node\` on your PATH is that version \u2014 Claude Code runs plugin hooks with whatever \`node\` resolves to, not with the newest version installed.`;
 function nodeVersionProblem(version = process.versions.node) {
-  if (compareVersions(version, MIN_NODE_VERSION) >= 0) return null;
+  const comparison = compareVersions(version, MIN_NODE_VERSION);
+  if (comparison > 0 || comparison === 0 && !version.includes("-")) return null;
   return `the archive plugin needs Node ${MIN_NODE_VERSION} or newer, but this is Node ${version}`;
 }
 function compareVersions(a, b) {
@@ -629,6 +641,7 @@ function fullJitterDelay(attempt, random, options = {}) {
   const ceiling = Math.min(cap, base * 2 ** exponent);
   return Math.floor(random() * ceiling);
 }
+var MAX_RETRY_AFTER_MS = 60 * 60 * 1e3;
 function parseRetryAfter(header, now) {
   if (header === null) return void 0;
   const trimmed2 = header.trim();
@@ -962,7 +975,9 @@ function createDriveTransport(deps) {
     const second = await send();
     if (second.status === 401) {
       await second.body?.cancel().catch(() => void 0);
-      throw new FatalError("Google rejected the access token", REAUTH_REMEDIATION);
+      throw new FatalError("Google rejected the access token", REAUTH_REMEDIATION, {
+        status: 401
+      });
     }
     return second;
   };
@@ -971,7 +986,9 @@ function createDriveTransport(deps) {
     if (response.ok) return body;
     const message = `${what}: ${describeApiError(response.status, body)}`;
     if (response.status === 403 && isQuotaExhausted(body)) {
-      throw new FatalError(message, "Free space in Google Drive, then run /archive:now.");
+      throw new FatalError(message, "Free space in Google Drive, then run /archive:now.", {
+        status: response.status
+      });
     }
     if (response.status === 403 && isRateLimited(body)) {
       throw new RetryableError(message, { status: response.status });
@@ -983,7 +1000,9 @@ function createDriveTransport(deps) {
       });
     }
     if (response.status >= 400 && response.status < 500) {
-      throw new FatalError(message, "Run /archive:status for details.");
+      throw new FatalError(message, "Run /archive:status for details.", {
+        status: response.status
+      });
     }
     throw new RetryableError(message, { status: response.status });
   };
@@ -1360,6 +1379,7 @@ function envSource(env) {
     debounceMs: env["ARCHIVE_DEBOUNCE_MS"],
     sweepMinIntervalMs: env["ARCHIVE_SWEEP_INTERVAL_MS"],
     workerBudgetMs: env["ARCHIVE_WORKER_BUDGET_MS"],
+    jobVisibilityMs: env["ARCHIVE_JOB_VISIBILITY_MS"],
     archiveGraceDays: env["ARCHIVE_ARCHIVE_GRACE_DAYS"],
     enabled: env["ARCHIVE_ENABLED"],
     keepLocalForever: env["ARCHIVE_KEEP_LOCAL_FOREVER"]
@@ -1592,7 +1612,11 @@ function enqueue(db, args, now) {
        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
-         not_before  = max(jobs.not_before, excluded.not_before),
+         -- max(), so an ordinary hook fire cannot pull a backing-off job
+         -- forward. unblock is the deliberate exception: it is only ever set
+         -- by /archive:now, which is the user saying "try again, now".
+         not_before  = CASE WHEN ? THEN excluded.not_before
+                            ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
          -- A block leaves the claim's visibility timeout in place, so without this
          -- an unblocked job stayed invisible for up to fifteen minutes and
@@ -1613,6 +1637,7 @@ function enqueue(db, args, now) {
     notBefore,
     now,
     now,
+    args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0
   );
@@ -1645,8 +1670,8 @@ function workerSpawnSpec(args) {
     command: args.execPath,
     args: [args.workerPath, ...args.extraArgs ?? []],
     options: {
-      detached: true,
-      stdio: "ignore",
+      detached: args.attached !== true,
+      stdio: args.attached === true ? "inherit" : "ignore",
       windowsHide: true,
       env: args.env,
       cwd: args.cwd
@@ -1661,16 +1686,14 @@ function detachDisabled(env) {
 // src/adapters/spawn-worker.ts
 function spawnWorker(args) {
   const logger = args.logger ?? nullLogger;
-  if (detachDisabled(args.env)) {
-    logger.debug("worker.spawn_skipped", { reason: "ARCHIVE_NO_DETACH" });
-    return false;
-  }
+  const attached = detachDisabled(args.env);
   const spec = workerSpawnSpec({
     execPath: process.execPath,
     workerPath: args.workerPath,
     env: args.env,
     cwd: args.cwd,
-    ...args.extraArgs === void 0 ? {} : { extraArgs: args.extraArgs }
+    ...args.extraArgs === void 0 ? {} : { extraArgs: args.extraArgs },
+    ...attached ? { attached: true } : {}
   });
   try {
     const child = spawn(spec.command, spec.args, spec.options);
@@ -1783,10 +1806,12 @@ function findCompatibleNode(options = {}) {
   const homedir = (options.homedir ?? os2.homedir)();
   const verify = options.verify ?? probeVersion;
   const minVersion = options.minVersion ?? MIN_NODE_VERSION;
+  const now = (options.now ?? Date.now)();
   const cached2 = readCache(options.cacheFile);
   if (cached2 !== null && fs5.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
     return cached2;
   }
+  if (recentMiss(options.cacheFile, now)) return null;
   for (const candidate of rankCandidates(collectCandidates(env, homedir), minVersion)) {
     const version = verify(candidate.path);
     if (version === null || !satisfiesFloor(version, minVersion)) continue;
@@ -1794,6 +1819,7 @@ function findCompatibleNode(options = {}) {
     writeCache(options.cacheFile, found);
     return found;
   }
+  writeMiss(options.cacheFile, (options.now ?? Date.now)());
   return null;
 }
 function collectCandidates(env, homedir) {
@@ -1869,6 +1895,26 @@ function readCache(file) {
     return { path: cachedPath, version };
   } catch {
     return null;
+  }
+}
+var MISS_TTL_MS = 10 * 6e4;
+function recentMiss(file, now) {
+  if (file === void 0) return false;
+  try {
+    const parsed = JSON.parse(fs5.readFileSync(file, "utf8"));
+    const missedAt = parsed?.missedAt;
+    return typeof missedAt === "number" && now - missedAt < MISS_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+function writeMiss(file, now) {
+  if (file === void 0) return;
+  try {
+    fs5.mkdirSync(path8.dirname(file), { recursive: true });
+    fs5.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
+`, { mode: 384 });
+  } catch {
   }
 }
 function writeCache(file, found) {

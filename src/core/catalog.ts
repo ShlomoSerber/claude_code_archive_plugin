@@ -481,7 +481,10 @@ export function catalogStats(db: Db): CatalogStats {
          sum(CASE WHEN local_present = 1
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS local_bytes,
-         sum(COALESCE(bundle_bytes, 0)) AS archived_bytes,
+         -- verified_bundle_bytes, not bundle_bytes: the latter describes a
+         -- bundle that was *built*, so a session that never uploaded still
+         -- counted towards "On Drive".
+         sum(COALESCE(verified_bundle_bytes, 0)) AS archived_bytes,
          sum(CASE WHEN local_present = 0
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS reclaimed_bytes,

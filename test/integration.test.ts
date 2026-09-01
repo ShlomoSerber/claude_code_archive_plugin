@@ -19,7 +19,7 @@ import {
   type ArchiveConfig,
   DAY_MS,
 } from '../src/core/config.ts';
-import { RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
+import { FatalError, RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import {
   block,
@@ -2147,7 +2147,7 @@ describe('a rate limit is not a refusal', () => {
     let first = true;
     const drive = harness.drive;
     const original = drive.uploadChunk.bind(drive);
-    drive.uploadChunk = ((args: Parameters<typeof original>[0]) => {
+    drive.uploadChunk = (args: Parameters<typeof original>[0]) => {
       if (first) {
         first = false;
         // What Drive answers when the initial backfill uploads too fast. The
@@ -2156,7 +2156,7 @@ describe('a rate limit is not a refusal', () => {
         return Promise.reject(new RetryableError('rate limited', { status: 429 }));
       }
       return original(args);
-    });
+    };
 
     const first_run = await runSweep(harness.ctx);
     assert.equal(first_run.blocked, 0, 'a rate limit does not park the job for a person');
@@ -2164,5 +2164,72 @@ describe('a rate limit is not a refusal', () => {
     harness.clock.advance(60 * 60_000);
     await runSweep(harness.ctx, { force: true });
     assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, 'the next sweep archives it');
+  });
+});
+
+/**
+ * Seventeenth round. Objective 1 held under ~2 700 randomized reaps with an
+ * oracle checking every deleted byte against the bundle the catalog points at.
+ * Every break was availability: the plugin still holding the data, and quietly
+ * no longer doing its job.
+ */
+describe('a Drive that will not talk to us', () => {
+  it('does not withdraw the verification of a healthy archive', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const before = getSession(harness.ctx.db, SESSION_A)?.verifiedAt;
+    assert.ok(before);
+
+    // A revoked token, not a missing file.
+    harness.drive.getFile = () => {
+      throw new FatalError('Google rejected the access token', 'Run /archive:setup.', {
+        status: 401,
+      });
+    };
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 0);
+    assert.equal(report.unverified, 0, 'a refused check is not a missing archive');
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, before, 'trust is kept');
+    assert.match(report.blockedReason ?? '', /Run \/archive:setup/, 'the remediation survives');
+  });
+
+  it('asks once, not once per session', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    let calls = 0;
+    harness.drive.getFile = () => {
+      calls++;
+      throw new FatalError('Drive is full', 'Free space in Google Drive.', { status: 403 });
+    };
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(calls, 1, 'burning quota against a Drive that is refusing us helps nobody');
+  });
+});
+
+describe('a projects directory the plugin cannot read', () => {
+  it('says so instead of reporting an empty archive', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return;
+    const harness = makeHarness();
+    fs.chmodSync(harness.ctx.paths.projectsDir, 0o000);
+    try {
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.discovered, 0);
+      assert.ok(
+        (kvGetNumber(harness.ctx.db, KV.unreadableCount) ?? 0) > 0,
+        'the sweep does not report success on a scan it could not do',
+      );
+    } finally {
+      fs.chmodSync(harness.ctx.paths.projectsDir, 0o755);
+    }
   });
 });

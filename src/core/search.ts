@@ -126,7 +126,11 @@ export function extractTerms(text: string): string[] {
   const rest = text.replace(/"[^"]+"/g, ' ');
   const words = rest
     .toLowerCase()
-    .split(/[^a-z0-9_./\\:-]+/)
+    // Unicode letters and digits, not just ASCII. "認証リダイレクト" and
+    // "поиск счетов" tokenized to nothing at all, and a query with no terms
+    // silently degrades to "the thirty most recent sessions" — which looks
+    // like an answer.
+    .split(/[^\p{L}\p{N}_./\\:-]+/u)
     .map((word) => word.replace(/^[-.]+|[-.]+$/g, ''))
     .filter((word) => word.length >= 2 && !STOP_WORDS.has(word));
   const all = [...quoted.map((term) => term.toLowerCase()), ...words];

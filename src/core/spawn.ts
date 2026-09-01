@@ -14,7 +14,7 @@ export type SpawnSpec = {
   args: string[];
   options: {
     detached: boolean;
-    stdio: 'ignore';
+    stdio: 'ignore' | 'inherit';
     windowsHide: boolean;
     env: Record<string, string | undefined>;
     cwd: string;
@@ -28,13 +28,15 @@ export function workerSpawnSpec(args: {
   env: Record<string, string | undefined>;
   cwd: string;
   extraArgs?: string[];
+  /** Debugging: keep the child attached and let its output through. */
+  attached?: boolean;
 }): SpawnSpec {
   return {
     command: args.execPath,
     args: [args.workerPath, ...(args.extraArgs ?? [])],
     options: {
-      detached: true,
-      stdio: 'ignore',
+      detached: args.attached !== true,
+      stdio: args.attached === true ? 'inherit' : 'ignore',
       windowsHide: true,
       env: args.env,
       cwd: args.cwd,
@@ -42,7 +44,14 @@ export function workerSpawnSpec(args: {
   };
 }
 
-/** `ARCHIVE_NO_DETACH=1` runs the worker inline, for debugging and tests. */
+/**
+ * `ARCHIVE_NO_DETACH=1` keeps the worker attached to its parent, with its
+ * output inherited, for debugging.
+ *
+ * It used to mean "do not start the worker at all", which quietly turned the
+ * whole plugin off: hooks kept queueing sessions and nothing ever uploaded one.
+ * A debugging switch must not be a way to lose data.
+ */
 export function detachDisabled(env: Readonly<Record<string, string | undefined>>): boolean {
   const value = env['ARCHIVE_NO_DETACH'];
   return value !== undefined && value !== '' && value !== '0';

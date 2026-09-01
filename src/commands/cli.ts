@@ -3,6 +3,8 @@ import '../core/quiet.ts';
 import { parseArgs } from 'node:util';
 import { createRuntime } from '../composition.ts';
 import { FatalError, toErrorInfo } from '../core/errors.ts';
+import { DAY_MS } from '../core/config.ts';
+
 import { NODE_REMEDIATION, nodeVersionProblem } from '../core/runtime-check.ts';
 import { alreadyReexeced, findCompatibleNode, reexec } from '../adapters/node-locator.ts';
 import { resolvePaths } from '../core/paths.ts';
@@ -50,27 +52,7 @@ status  --quota           Also ask Drive how much space is used`;
 async function main(): Promise<number> {
   ignoreClosedPipe();
 
-  const { values, positionals } = parseArgs({
-    args: process.argv.slice(2),
-    allowPositionals: true,
-    strict: false,
-    options: {
-      json: { type: 'boolean' },
-      text: { type: 'boolean' },
-      device: { type: 'boolean' },
-      reauth: { type: 'boolean' },
-      'skip-backfill': { type: 'boolean' },
-      all: { type: 'boolean' },
-      files: { type: 'boolean' },
-      quota: { type: 'boolean' },
-      limit: { type: 'string' },
-      since: { type: 'string' },
-      until: { type: 'string' },
-      project: { type: 'string' },
-      help: { type: 'boolean', short: 'h' },
-      version: { type: 'boolean' },
-    },
-  });
+  const { values, positionals } = parseCommandLine(process.argv.slice(2));
 
   const command = positionals[0];
   if (values.version === true) {
@@ -114,8 +96,8 @@ async function main(): Promise<number> {
         return runSearch(runtime, {
           query,
           limit: parseLimit(values.limit, 30),
-          since: parseDate(values.since),
-          until: parseDate(values.until),
+          since: parseDate(values.since, '--since'),
+          until: parseDate(values.until, '--until'),
           project: typeof values.project === 'string' ? values.project : null,
           files: values.files === true,
           // Search feeds the model, so JSON is the default here.
@@ -143,16 +125,89 @@ async function main(): Promise<number> {
   }
 }
 
+/**
+ * Parse the command line, refusing anything it does not recognise.
+ *
+ * `strict: false` used to absorb a typo: an unknown option became a boolean and
+ * *its argument became part of the search query*, so `--sinse 2026-01-01 auth`
+ * searched for "2026-01-01 auth", which parseQuery then read as a date and
+ * silently narrowed the search to that one day.
+ */
+type CommandFlags = {
+  json?: boolean;
+  text?: boolean;
+  device?: boolean;
+  reauth?: boolean;
+  'skip-backfill'?: boolean;
+  all?: boolean;
+  files?: boolean;
+  quota?: boolean;
+  limit?: string;
+  since?: string;
+  until?: string;
+  project?: string;
+  help?: boolean;
+  version?: boolean;
+};
+
+function parseCommandLine(args: string[]): { values: CommandFlags; positionals: string[] } {
+  try {
+    const parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      strict: true,
+      options: {
+        json: { type: 'boolean' },
+        text: { type: 'boolean' },
+        device: { type: 'boolean' },
+        reauth: { type: 'boolean' },
+        'skip-backfill': { type: 'boolean' },
+        all: { type: 'boolean' },
+        files: { type: 'boolean' },
+        quota: { type: 'boolean' },
+        limit: { type: 'string' },
+        since: { type: 'string' },
+        until: { type: 'string' },
+        project: { type: 'string' },
+        help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean' },
+      },
+    });
+    return { values: parsed.values, positionals: parsed.positionals };
+  } catch (err) {
+    throw new FatalError(
+      err instanceof Error ? err.message : 'the command line could not be parsed',
+      'Run `archive help` for the options each command takes.',
+    );
+  }
+}
+
 function parseLimit(value: unknown, fallback: number): number {
   if (typeof value !== 'string') return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(500, Math.trunc(parsed)) : fallback;
 }
 
-function parseDate(value: unknown): number | null {
+/**
+ * A date the user typed, or an error.
+ *
+ * Returning null for "last Tuesday" or "31/08/2026" silently dropped the
+ * filter and returned results from the whole archive, which reads as "there is
+ * nothing else" — the wrong answer to give someone looking for a lost session.
+ */
+function parseDate(value: unknown, flag: string): number | null {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
-  const parsed = Date.parse(value.length === 10 ? `${value}T00:00:00Z` : value);
-  return Number.isNaN(parsed) ? null : parsed;
+  const text = value.trim();
+  const parsed = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T00:00:00Z` : text);
+  if (Number.isNaN(parsed)) {
+    throw new FatalError(
+      `${flag} is not a date I can read: ${text}`,
+      'Use YYYY-MM-DD, for example --since 2026-08-01.',
+    );
+  }
+  // A day means the whole day. `--until 2026-08-31` meaning midnight at its
+  // start excluded everything that happened on the 31st.
+  return flag === '--until' && /^\d{4}-\d{2}-\d{2}$/.test(text) ? parsed + DAY_MS - 1 : parsed;
 }
 
 try {

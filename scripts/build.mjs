@@ -49,6 +49,10 @@ async function main() {
     await build({
       entryPoints: [path.join(root, entry.in)],
       outfile: path.join(outdir, `${entry.out}.mjs`),
+      // Paths esbuild writes into comments are relative to this, so without it
+      // the committed bundles differ by where `npm run build` was run from and
+      // the CI drift gate fails for no reason.
+      absWorkingDir: root,
       bundle: true,
       platform: 'node',
       format: 'esm',

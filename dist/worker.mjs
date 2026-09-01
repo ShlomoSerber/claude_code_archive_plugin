@@ -219,9 +219,20 @@ var RetryableError = class extends ArchiveError {
 var FatalError = class extends ArchiveError {
   /** Shown verbatim to the user by `/archive:status`. Always actionable. */
   remediation;
+  /**
+   * The HTTP status that produced it, when there was one.
+   *
+   * The reaper needs to tell "Drive says that file is not there" (404) from
+   * "Drive would not talk to us" (401, 403, a full quota). It used to read
+   * every FatalError as the first, and so withdrew the verification of a
+   * perfectly good archive on every session, every sweep, whenever a token
+   * expired.
+   */
+  status;
   constructor(message, remediation, options) {
     super(message, options);
     this.remediation = remediation;
+    this.status = options?.status;
   }
 };
 var BugError = class extends ArchiveError {
@@ -287,7 +298,8 @@ var UploadSessionExpired = class extends ArchiveError {
 var MIN_NODE_VERSION = "22.16.0";
 var NODE_REMEDIATION = `Install Node ${MIN_NODE_VERSION} or newer (24 LTS recommended) and make sure the \`node\` on your PATH is that version \u2014 Claude Code runs plugin hooks with whatever \`node\` resolves to, not with the newest version installed.`;
 function nodeVersionProblem(version = process.versions.node) {
-  if (compareVersions(version, MIN_NODE_VERSION) >= 0) return null;
+  const comparison = compareVersions(version, MIN_NODE_VERSION);
+  if (comparison > 0 || comparison === 0 && !version.includes("-")) return null;
   return `the archive plugin needs Node ${MIN_NODE_VERSION} or newer, but this is Node ${version}`;
 }
 function compareVersions(a, b2) {
@@ -827,9 +839,11 @@ function fullJitterDelay(attempt, random, options = {}) {
   const ceiling = Math.min(cap, base * 2 ** exponent);
   return Math.floor(random() * ceiling);
 }
+var MAX_RETRY_AFTER_MS = 60 * 60 * 1e3;
 function nextAttemptAt(args) {
   if (args.retryAfterSeconds !== void 0 && args.retryAfterSeconds >= 0) {
-    return args.now + Math.ceil(args.retryAfterSeconds * 1e3);
+    const wait = Math.min(Math.ceil(args.retryAfterSeconds * 1e3), MAX_RETRY_AFTER_MS);
+    return args.now + wait;
   }
   return args.now + fullJitterDelay(args.attempt, args.random, args.options ?? {});
 }
@@ -1151,7 +1165,9 @@ function createDriveTransport(deps) {
     const second = await send();
     if (second.status === 401) {
       await second.body?.cancel().catch(() => void 0);
-      throw new FatalError("Google rejected the access token", REAUTH_REMEDIATION);
+      throw new FatalError("Google rejected the access token", REAUTH_REMEDIATION, {
+        status: 401
+      });
     }
     return second;
   };
@@ -1160,7 +1176,9 @@ function createDriveTransport(deps) {
     if (response.ok) return body;
     const message = `${what}: ${describeApiError(response.status, body)}`;
     if (response.status === 403 && isQuotaExhausted(body)) {
-      throw new FatalError(message, "Free space in Google Drive, then run /archive:now.");
+      throw new FatalError(message, "Free space in Google Drive, then run /archive:now.", {
+        status: response.status
+      });
     }
     if (response.status === 403 && isRateLimited(body)) {
       throw new RetryableError(message, { status: response.status });
@@ -1172,7 +1190,9 @@ function createDriveTransport(deps) {
       });
     }
     if (response.status >= 400 && response.status < 500) {
-      throw new FatalError(message, "Run /archive:status for details.");
+      throw new FatalError(message, "Run /archive:status for details.", {
+        status: response.status
+      });
     }
     throw new RetryableError(message, { status: response.status });
   };
@@ -1554,6 +1574,7 @@ function envSource(env) {
     debounceMs: env["ARCHIVE_DEBOUNCE_MS"],
     sweepMinIntervalMs: env["ARCHIVE_SWEEP_INTERVAL_MS"],
     workerBudgetMs: env["ARCHIVE_WORKER_BUDGET_MS"],
+    jobVisibilityMs: env["ARCHIVE_JOB_VISIBILITY_MS"],
     archiveGraceDays: env["ARCHIVE_ARCHIVE_GRACE_DAYS"],
     enabled: env["ARCHIVE_ENABLED"],
     keepLocalForever: env["ARCHIVE_KEEP_LOCAL_FOREVER"]
@@ -1823,10 +1844,12 @@ function findCompatibleNode(options = {}) {
   const homedir = (options.homedir ?? os3.homedir)();
   const verify = options.verify ?? probeVersion;
   const minVersion = options.minVersion ?? MIN_NODE_VERSION;
+  const now = (options.now ?? Date.now)();
   const cached2 = readCache(options.cacheFile);
   if (cached2 !== null && fs6.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
     return cached2;
   }
+  if (recentMiss(options.cacheFile, now)) return null;
   for (const candidate of rankCandidates(collectCandidates(env, homedir), minVersion)) {
     const version = verify(candidate.path);
     if (version === null || !satisfiesFloor(version, minVersion)) continue;
@@ -1834,6 +1857,7 @@ function findCompatibleNode(options = {}) {
     writeCache(options.cacheFile, found);
     return found;
   }
+  writeMiss(options.cacheFile, (options.now ?? Date.now)());
   return null;
 }
 function collectCandidates(env, homedir) {
@@ -1911,6 +1935,26 @@ function readCache(file) {
     return null;
   }
 }
+var MISS_TTL_MS = 10 * 6e4;
+function recentMiss(file, now) {
+  if (file === void 0) return false;
+  try {
+    const parsed = JSON.parse(fs6.readFileSync(file, "utf8"));
+    const missedAt = parsed?.missedAt;
+    return typeof missedAt === "number" && now - missedAt < MISS_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+function writeMiss(file, now) {
+  if (file === void 0) return;
+  try {
+    fs6.mkdirSync(path9.dirname(file), { recursive: true });
+    fs6.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
+`, { mode: 384 });
+  } catch {
+  }
+}
 function writeCache(file, found) {
   if (file === void 0) return;
   try {
@@ -1983,7 +2027,10 @@ async function* scanSessions(paths, skipped) {
   let projectDirs;
   try {
     projectDirs = await fsp6.readdir(paths.projectsDir);
-  } catch {
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      skipped?.push({ kind: "project", name: paths.projectsDir, reason: "unreadable" });
+    }
     return;
   }
   for (const encodedDir of projectDirs) {
@@ -2251,7 +2298,10 @@ function catalogStats(db) {
          sum(CASE WHEN local_present = 1
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS local_bytes,
-         sum(COALESCE(bundle_bytes, 0)) AS archived_bytes,
+         -- verified_bundle_bytes, not bundle_bytes: the latter describes a
+         -- bundle that was *built*, so a session that never uploaded still
+         -- counted towards "On Drive".
+         sum(COALESCE(verified_bundle_bytes, 0)) AS archived_bytes,
          sum(CASE WHEN local_present = 0
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS reclaimed_bytes,
@@ -2328,7 +2378,11 @@ function enqueue(db, args, now) {
        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
-         not_before  = max(jobs.not_before, excluded.not_before),
+         -- max(), so an ordinary hook fire cannot pull a backing-off job
+         -- forward. unblock is the deliberate exception: it is only ever set
+         -- by /archive:now, which is the user saying "try again, now".
+         not_before  = CASE WHEN ? THEN excluded.not_before
+                            ELSE max(jobs.not_before, excluded.not_before) END,
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
          -- A block leaves the claim's visibility timeout in place, so without this
          -- an unblocked job stayed invisible for up to fifteen minutes and
@@ -2349,6 +2403,7 @@ function enqueue(db, args, now) {
     notBefore,
     now,
     now,
+    args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0,
     args.unblock === true ? 1 : 0
   );
@@ -2417,7 +2472,10 @@ function countJobs(db, now) {
          sum(CASE WHEN blocked = 0 AND not_before <= ? AND visible_at <= ? THEN 1 ELSE 0 END)
            AS runnable,
          sum(CASE WHEN blocked = 1 THEN 1 ELSE 0 END) AS blocked,
-         sum(CASE WHEN attempts > 1 THEN 1 ELSE 0 END) AS failing
+         -- attempts >= 1: a job that has failed once has attempts = 1, and
+         -- counting from 2 made every first failure invisible to the status
+         -- report \u2014 including one parked for hours by a Retry-After.
+         sum(CASE WHEN blocked = 0 AND attempts >= 1 THEN 1 ELSE 0 END) AS failing
        FROM jobs`
   ).get(now, now);
   return {
@@ -2474,6 +2532,10 @@ var KV = {
   unreadableCount: "scan.unreadable_count",
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
+  /** Why the last reap stopped asking Drive, if it did. */
+  reapBlockedReason: "reap.blocked_reason",
+  /** Archived sessions the last reap found missing or changed on Drive. */
+  reapUnverified: "reap.unverified_count",
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
   unconfirmableCount: "reap.unconfirmable_count"
 };
@@ -6425,7 +6487,8 @@ async function reapLocalCopies(ctx, now) {
     requeued: 0,
     skipped: 0,
     unverified: 0,
-    unconfirmable: 0
+    unconfirmable: 0,
+    blockedReason: null
   };
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
   const cutoff = reapCutoff(now, ctx.config.retentionDays);
@@ -6485,7 +6548,7 @@ async function reapLocalCopies(ctx, now) {
       report.skipped++;
       continue;
     }
-    const remote = await confirmRemote(ctx, record);
+    const remote = await confirmRemote(ctx, record, report);
     if (remote === "gone") {
       log.warn("reap.remote_no_longer_valid");
       clearVerification(ctx.db, record.sessionId, now);
@@ -6496,6 +6559,11 @@ async function reapLocalCopies(ctx, now) {
       );
       report.unverified++;
       continue;
+    }
+    if (remote === "blocked") {
+      report.skipped++;
+      report.unconfirmable++;
+      break;
     }
     if (remote === "unavailable") {
       report.skipped++;
@@ -6548,7 +6616,7 @@ function changedSinceVerification(record, onDisk) {
   const bytes = onDisk.transcriptBytes + onDisk.sidecarBytes;
   return record.verifiedLocalBytes !== null && bytes !== record.verifiedLocalBytes;
 }
-async function confirmRemote(ctx, record) {
+async function confirmRemote(ctx, record, report) {
   if (record.remoteFileId === null) return "gone";
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
@@ -6565,7 +6633,12 @@ async function confirmRemote(ctx, record) {
     }
     return "unavailable";
   } catch (err) {
-    if (err instanceof FatalError) return "gone";
+    if (err instanceof FatalError) {
+      if (err.status === 404) return "gone";
+      ctx.logger.error("reap.remote_check_blocked", { session_id: record.sessionId }, err);
+      report.blockedReason = `${err.message} \u2014 ${err.remediation}`;
+      return "blocked";
+    }
     ctx.logger.warn("reap.remote_check_failed", { session_id: record.sessionId }, err);
     return "unavailable";
   }
@@ -6608,7 +6681,15 @@ async function runSweep(ctx, options = {}) {
     verified: 0,
     failed: 0,
     blocked: 0,
-    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0, unconfirmable: 0 },
+    reap: {
+      deleted: 0,
+      bytesFreed: 0,
+      requeued: 0,
+      skipped: 0,
+      unverified: 0,
+      unconfirmable: 0,
+      blockedReason: null
+    },
     catalogUploaded: false,
     cooledDown: false,
     budgetExhausted: false,
@@ -6638,6 +6719,8 @@ async function runSweep(ctx, options = {}) {
     report.reap = await reapLocalCopies(ctx, ctx.clock.now());
     const at2 = ctx.clock.now();
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at2);
+    kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at2);
+    kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
     report.catalogUploaded = await uploadCatalogCopy(ctx);

@@ -25,6 +25,7 @@ import {
   setUploadUri,
 } from '../src/core/queue.ts';
 import { SCHEMA_VERSION } from '../src/core/migrations.ts';
+import { MAX_RETRY_AFTER_MS, nextAttemptAt } from '../src/core/backoff.ts';
 import { tempDir } from './helpers.ts';
 
 function freshDb(): Db {
@@ -251,5 +252,40 @@ describe('kv', () => {
 
   it('returns undefined for an unknown key', () => {
     assert.equal(kvGet(freshDb(), 'nope'), undefined);
+  });
+});
+
+describe('a server that asks for an unreasonable wait', () => {
+  it('caps how far a Retry-After can push a job out', () => {
+    // Nothing in the queue can lower a not_before once written, and the
+    // HTTP-date form is parsed against this machine's clock — so a slow clock
+    // or a misconfigured proxy could park a session's backup for a year.
+    const at = nextAttemptAt({ now: 1_000, attempt: 1, random: () => 0.5, retryAfterSeconds: 4e7 });
+    assert.equal(at, 1_000 + MAX_RETRY_AFTER_MS);
+  });
+
+  it('still honours a reasonable one exactly', () => {
+    const at = nextAttemptAt({ now: 1_000, attempt: 1, random: () => 0.5, retryAfterSeconds: 120 });
+    assert.equal(at, 121_000);
+  });
+
+  it('lets /archive:now pull a backing-off job forward', () => {
+    const db = openDatabase(':memory:');
+    const id = enqueue(db, { kind: 'backup', sessionId: 's1' }, 1_000);
+    const job = claim(db, 1_000, 60_000)!;
+    retryLater(db, job, { at: 1_000 + 6 * 60 * 60_000, error: 'rate limited' });
+    assert.equal(claim(db, 2_000, 60_000), null, 'it is waiting');
+
+    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 2_000);
+    assert.ok(claim(db, 2_000, 60_000), 'the user asking for it now means now');
+    assert.ok(getJob(db, id));
+  });
+
+  it('counts a job that has failed once as failing', () => {
+    const db = openDatabase(':memory:');
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, 1_000);
+    const job = claim(db, 1_000, 60_000)!;
+    retryLater(db, job, { at: 500_000, error: 'rate limited' });
+    assert.equal(countJobs(db, 2_000).failing, 1, 'the first failure was invisible');
   });
 });

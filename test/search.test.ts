@@ -192,3 +192,18 @@ describe('likeTerm', () => {
     assert.equal(likeTerm('100%_done'), '%100\\%\\_done%');
   });
 });
+
+describe('queries that are not in English', () => {
+  it('finds terms in any script', () => {
+    // ASCII-only tokenizing returned nothing at all for these, and a query
+    // with no terms silently degrades to "the most recent sessions", which
+    // looks like an answer.
+    assert.deepEqual(extractTerms('認証リダイレクト'), ['認証リダイレクト']);
+    assert.deepEqual(extractTerms('поиск счетов'), ['поиск', 'счетов']);
+    assert.deepEqual(extractTerms('búsqueda facturación'), ['búsqueda', 'facturación']);
+  });
+
+  it('still tokenizes ordinary English the same way', () => {
+    assert.deepEqual(extractTerms('fix the auth redirect'), ['fix', 'auth', 'redirect']);
+  });
+});

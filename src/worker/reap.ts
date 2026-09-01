@@ -45,6 +45,8 @@ export type ReapReport = {
   skipped: number;
   /** Rows whose Drive copy has gone missing or changed since it was verified. */
   unverified: number;
+  /** Why the run stopped asking Drive at all, when it did. */
+  blockedReason: string | null;
   /**
    * Rows Drive would not answer for, so nothing could be reclaimed.
    *
@@ -63,6 +65,7 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
     skipped: 0,
     unverified: 0,
     unconfirmable: 0,
+    blockedReason: null,
   };
   // `enabled: false` has to stop deletion, not merely stop the hooks, or
   // "turn it off" is a promise the plugin does not keep.
@@ -146,7 +149,7 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
 
-    const remote = await confirmRemote(ctx, record);
+    const remote = await confirmRemote(ctx, record, report);
     if (remote === 'gone') {
       log.warn('reap.remote_no_longer_valid');
       clearVerification(ctx.db, record.sessionId, now);
@@ -157,6 +160,14 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       );
       report.unverified++;
       continue;
+    }
+    if (remote === 'blocked') {
+      // Whatever is wrong is wrong for every session, so asking again for each
+      // of the other two hundred just burns quota against a Drive that is
+      // already refusing us.
+      report.skipped++;
+      report.unconfirmable++;
+      break;
     }
     if (remote === 'unavailable') {
       report.skipped++;
@@ -261,7 +272,8 @@ export function changedSinceVerification(record: SessionRecord, onDisk: LocalSes
 async function confirmRemote(
   ctx: WorkerContext,
   record: SessionRecord,
-): Promise<'ok' | 'gone' | 'unavailable'> {
+  report: ReapReport,
+): Promise<'ok' | 'gone' | 'unavailable' | 'blocked'> {
   if (record.remoteFileId === null) return 'gone';
   try {
     const remote = await ctx.drive.getFile(record.remoteFileId, ctx.signal);
@@ -300,9 +312,17 @@ async function confirmRemote(
     // good verification and scheduling a re-archive.
     return 'unavailable';
   } catch (err) {
-    // A 4xx is Drive saying the file is not there. Anything else is this run's
-    // problem, not the archive's, so leave the row alone and try next time.
-    if (err instanceof FatalError) return 'gone';
+    // Only 404 is Drive saying the file is not there. Every other FatalError —
+    // a rejected token, a full Drive, a 403 — is Drive refusing to talk to us,
+    // and reading that as "the archive is gone" withdrew the verification of
+    // every session and queued a re-upload of the lot, while the remediation
+    // that would have fixed it was swallowed here.
+    if (err instanceof FatalError) {
+      if (err.status === 404) return 'gone';
+      ctx.logger.error('reap.remote_check_blocked', { session_id: record.sessionId }, err);
+      report.blockedReason = `${err.message} — ${err.remediation}`;
+      return 'blocked';
+    }
     ctx.logger.warn('reap.remote_check_failed', { session_id: record.sessionId }, err);
     return 'unavailable';
   }

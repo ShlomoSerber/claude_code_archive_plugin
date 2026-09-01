@@ -374,6 +374,8 @@ describe('catalogStats', () => {
     assert.equal(stats.localPresent, 1);
     assert.equal(stats.localBytes, 600);
     assert.equal(stats.reclaimedBytes, 600);
-    assert.equal(stats.archivedBytes, 200);
+    // The verified size, not the built one: a bundle that was compressed and
+    // never uploaded used to count towards "On Drive".
+    assert.equal(stats.archivedBytes, 120);
   });
 });

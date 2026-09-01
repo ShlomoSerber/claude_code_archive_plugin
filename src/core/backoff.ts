@@ -27,6 +27,9 @@ export function fullJitterDelay(
   return Math.floor(random() * ceiling);
 }
 
+/** The longest a server may push a job out. Beyond this, we come back anyway. */
+export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+
 /**
  * A server's `Retry-After` always wins over our own guess: it is the only
  * number that reflects when the quota actually resets.
@@ -39,7 +42,14 @@ export function nextAttemptAt(args: {
   options?: BackoffOptions;
 }): number {
   if (args.retryAfterSeconds !== undefined && args.retryAfterSeconds >= 0) {
-    return args.now + Math.ceil(args.retryAfterSeconds * 1000);
+    // Capped. Nothing in the queue can ever lower a not_before once it is
+    // written, so an over-long value — a misconfigured proxy, or the HTTP-date
+    // form measured against a machine clock that is wrong by a year — parked
+    // the session's backup past any horizon the user could reach, with
+    // /archive:now unable to bring it back. The cap costs one wasted retry
+    // against a server that really did want six hours of quiet.
+    const wait = Math.min(Math.ceil(args.retryAfterSeconds * 1000), MAX_RETRY_AFTER_MS);
+    return args.now + wait;
   }
   return args.now + fullJitterDelay(args.attempt, args.random, args.options ?? {});
 }

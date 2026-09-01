@@ -28,6 +28,8 @@ export type LocateOptions = {
   verify?: (candidatePath: string) => string | null;
   cacheFile?: string;
   minVersion?: string;
+  /** Injectable clock, so the negative cache is testable. */
+  now?: () => number;
 };
 
 /** Ask an interpreter its own version. The one expense worth paying. */
@@ -52,10 +54,12 @@ export function findCompatibleNode(options: LocateOptions = {}): FoundNode | nul
   const verify = options.verify ?? probeVersion;
   const minVersion = options.minVersion ?? MIN_NODE_VERSION;
 
+  const now = (options.now ?? Date.now)();
   const cached = readCache(options.cacheFile);
   if (cached !== null && fs.existsSync(cached.path) && satisfiesFloor(cached.version, minVersion)) {
     return cached;
   }
+  if (recentMiss(options.cacheFile, now)) return null;
 
   for (const candidate of rankCandidates(collectCandidates(env, homedir), minVersion)) {
     const version = verify(candidate.path);
@@ -64,6 +68,10 @@ export function findCompatibleNode(options: LocateOptions = {}): FoundNode | nul
     writeCache(options.cacheFile, found);
     return found;
   }
+  // Remember the failure too, briefly. Without this a machine with no
+  // compatible Node repeated the whole scan — every candidate path, every
+  // spawnSync probe — on every SessionStart and every SessionEnd.
+  writeMiss(options.cacheFile, (options.now ?? Date.now)());
   return null;
 }
 
@@ -160,6 +168,30 @@ function readCache(file: string | undefined): FoundNode | null {
     return { path: cachedPath, version };
   } catch {
     return null;
+  }
+}
+
+/** How long a fruitless scan is remembered before it is worth repeating. */
+const MISS_TTL_MS = 10 * 60_000;
+
+function recentMiss(file: string | undefined, now: number): boolean {
+  if (file === undefined) return false;
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const missedAt = (parsed as { missedAt?: unknown } | null)?.missedAt;
+    return typeof missedAt === 'number' && now - missedAt < MISS_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+function writeMiss(file: string | undefined, now: number): void {
+  if (file === undefined) return;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ missedAt: now })}\n`, { mode: 0o600 });
+  } catch {
+    // Same as the positive cache: an optimisation, never a requirement.
   }
 }
 

@@ -210,7 +210,9 @@ export class FakeDrive implements DriveTransport {
     // A fake that throws something else lets code pass tests it would fail
     // against Google.
     if (file === undefined) {
-      throw new FatalError(`no such file ${fileId}`, 'Run /archive:now to re-upload it.');
+      throw new FatalError(`no such file ${fileId}`, 'Run /archive:now to re-upload it.', {
+        status: 404,
+      });
     }
     return Promise.resolve(this.describe(file));
   }

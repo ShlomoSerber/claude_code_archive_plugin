@@ -17,22 +17,21 @@ export function spawnWorker(args: {
   logger?: Logger;
 }): boolean {
   const logger = args.logger ?? nullLogger;
-  if (detachDisabled(args.env)) {
-    logger.debug('worker.spawn_skipped', { reason: 'ARCHIVE_NO_DETACH' });
-    return false;
-  }
+  const attached = detachDisabled(args.env);
   const spec = workerSpawnSpec({
     execPath: process.execPath,
     workerPath: args.workerPath,
     env: args.env,
     cwd: args.cwd,
     ...(args.extraArgs === undefined ? {} : { extraArgs: args.extraArgs }),
+    ...(attached ? { attached: true } : {}),
   });
   try {
     const child = spawn(spec.command, spec.args, spec.options);
     child.on('error', (err) => {
       logger.warn('worker.spawn_failed', {}, err);
     });
+    // An attached child is still unref'd: the hook must never wait on it.
     child.unref();
     logger.debug('worker.spawned', { pid: child.pid ?? null });
     return true;

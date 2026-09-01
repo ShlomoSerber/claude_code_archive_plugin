@@ -87,7 +87,14 @@ export async function* scanSessions(
   let projectDirs: string[];
   try {
     projectDirs = await fsp.readdir(paths.projectsDir);
-  } catch {
+  } catch (err) {
+    // A directory we are not allowed to read is not a directory with nothing
+    // in it. Swallowing this made the whole sweep a no-op that reported
+    // success — no sessions found, no warning, and the previous run's warning
+    // counters reset to zero on the way out.
+    if ((err as { code?: string }).code !== 'ENOENT') {
+      skipped?.push({ kind: 'project', name: paths.projectsDir, reason: 'unreadable' });
+    }
     return;
   }
   for (const encodedDir of projectDirs) {

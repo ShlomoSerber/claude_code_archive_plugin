@@ -45,10 +45,25 @@ export class RetryableError extends ArchiveError {
 export class FatalError extends ArchiveError {
   /** Shown verbatim to the user by `/archive:status`. Always actionable. */
   readonly remediation: string;
+  /**
+   * The HTTP status that produced it, when there was one.
+   *
+   * The reaper needs to tell "Drive says that file is not there" (404) from
+   * "Drive would not talk to us" (401, 403, a full quota). It used to read
+   * every FatalError as the first, and so withdrew the verification of a
+   * perfectly good archive on every session, every sweep, whenever a token
+   * expired.
+   */
+  readonly status: number | undefined;
 
-  constructor(message: string, remediation: string, options?: { cause?: unknown }) {
+  constructor(
+    message: string,
+    remediation: string,
+    options?: { cause?: unknown; status?: number },
+  ) {
     super(message, options);
     this.remediation = remediation;
+    this.status = options?.status;
   }
 }
 
