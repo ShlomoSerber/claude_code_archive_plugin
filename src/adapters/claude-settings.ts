@@ -90,21 +90,30 @@ export async function setCleanupPeriodDays(
  * Looking in the wrong place is worse than not looking: it produces a clean
  * report that means nothing.
  */
-export function competingSettingsPaths(claudeDir: string): string[] {
+export function competingSettingsPaths(claudeDir: string, cwd = process.cwd()): string[] {
   const managed =
     process.platform === 'darwin'
       ? '/Library/Application Support/ClaudeCode/managed-settings.json'
       : process.platform === 'win32'
         ? 'C:\\Program Files\\ClaudeCode\\managed-settings.json'
         : '/etc/claude-code/managed-settings.json';
-  return [path.join(claudeDir, 'settings.local.json'), managed];
+  // Project settings outrank the user file this plugin writes, so a project
+  // that sets cleanupPeriodDays leaves Claude Code's own reaper deleting
+  // transcripts while /archive:setup reports that the plugin owns deletion.
+  return [
+    path.join(claudeDir, 'settings.local.json'),
+    path.join(cwd, '.claude', 'settings.json'),
+    path.join(cwd, '.claude', 'settings.local.json'),
+    managed,
+  ];
 }
 
 export async function competingCleanupSettings(
   claudeDir: string,
+  cwd = process.cwd(),
 ): Promise<{ file: string; value: number }[]> {
   const found: { file: string; value: number }[] = [];
-  for (const file of competingSettingsPaths(claudeDir)) {
+  for (const file of competingSettingsPaths(claudeDir, cwd)) {
     let read: SettingsRead;
     try {
       read = await readSettings(file);

@@ -1601,9 +1601,7 @@ var KV = {
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
-  unconfirmableCount: "reap.unconfirmable_count",
-  /** Set once the initial backfill has enqueued every existing session. */
-  backfillDoneAt: "backfill.done_at"
+  unconfirmableCount: "reap.unconfirmable_count"
 };
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;

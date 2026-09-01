@@ -584,8 +584,11 @@ describe('deletion safety, second pass', () => {
   it('refuses to delete against a bundle sitting in the Drive wastebasket', async () => {
     // Drive answers a metadata request for a trashed file with a normal 200
     // and a valid checksum, then purges it after thirty days.
-    const harness = makeHarness({ retentionDays: 30 }, new FakeDrive({ trashed: true }));
+    const harness = makeHarness({ retentionDays: 30 });
     await runSweep(harness.ctx);
+    // Trashed after it was archived, which is how this actually happens: a
+    // person tidying Drive, or a shared-drive retention rule.
+    harness.drive.options = { ...harness.drive.options, trashed: true };
     harness.clock.advance(400 * DAY);
 
     const report = await reapLocalCopies(harness.ctx, harness.clock.now());
@@ -1678,6 +1681,11 @@ describe('the fingerprint describes the bytes that were hashed', () => {
     await runSweep(fresh.ctx);
     assert.ok(catalogStats(fresh.ctx.db).sessions > 0, 'it has rows before recovery runs');
 
+    // The replacement machine has never seen the archived sessions themselves.
+    fresh.ctx.db
+      .prepare('DELETE FROM sessions WHERE session_id IN (?, ?)')
+      .run(SESSION_A, SESSION_B);
+
     const imported = importCatalogFile(
       { db: () => fresh.ctx.db } as never,
       writeCatalogTo(exported.content),
@@ -2022,5 +2030,107 @@ describe('a session that cannot be indexed is still archived', () => {
     const report = await runSweep(harness.ctx);
     assert.equal(report.failed, 0);
     assert.ok(getSession(harness.ctx.db, SESSION_B)?.verifiedAt, 'the session is archived');
+  });
+});
+
+/**
+ * Fifteenth round. Objective 1 held under 1 800 sweeps of randomized mutation
+ * and Drive weather, with every disappearing byte required to be present in a
+ * live bundle and every restore checked file by file. The break was on the
+ * disaster-recovery path, which is the one that runs exactly once, on a
+ * machine that no longer has the data.
+ */
+describe('recovering a catalog written by another version', () => {
+  function catalogWithMissingColumns(source: Buffer, drop: string[]): string {
+    // A catalog written before those columns existed. The download is opened
+    // read-only with no migrations, so it never gains them.
+    const file = path.join(tempDir(), 'old-catalog.sqlite');
+    fs.writeFileSync(file, source);
+    const db = openDatabase(file, { skipMigrations: true });
+    for (const column of drop) db.exec(`ALTER TABLE sessions DROP COLUMN ${column}`);
+    db.close();
+    return file;
+  }
+
+  it('imports a catalog that lacks the columns this version added', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const exported = harness.drive.fileByName(catalogFileName(machineId(harness.ctx)));
+    assert.ok(exported);
+
+    const older = catalogWithMissingColumns(exported.content, [
+      'verified_bundle_md5',
+      'verified_manifest',
+    ]);
+    const fresh = makeHarness();
+    fresh.ctx.db.prepare('DELETE FROM sessions').run();
+
+    const imported = importCatalogFile({ db: () => fresh.ctx.db } as never, older);
+    assert.ok(imported > 0, 'the history of a dead laptop is not lost to a schema change');
+    const recovered = getSession(fresh.ctx.db, SESSION_A);
+    assert.ok(recovered?.remoteFileId, 'and it can still be restored');
+    assert.equal(recovered.verifiedBundleMd5, null);
+  });
+
+  it('does not mark sessions that are on this disk as gone', async () => {
+    // The import downloads this machine's own catalog copy too, and runs on
+    // every /archive:setup.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const exported = harness.drive.fileByName(catalogFileName(machineId(harness.ctx)));
+    assert.ok(exported);
+    const before = getSession(harness.ctx.db, SESSION_A);
+    assert.equal(before?.localPresent, true);
+
+    const file = path.join(tempDir(), 'own-catalog.sqlite');
+    fs.writeFileSync(file, exported.content);
+    importCatalogFile({ db: () => harness.ctx.db } as never, file);
+
+    const after = getSession(harness.ctx.db, SESSION_A);
+    assert.equal(after?.localPresent, true, 'a file on this disk is still on this disk');
+    assert.equal(after.verifiedLocalMtime, before?.verifiedLocalMtime);
+    assert.equal(catalogStats(harness.ctx.db).reclaimedBytes, 0);
+  });
+});
+
+describe('settings that outrank the one the plugin writes', () => {
+  it('looks in the project directory, not only the user one', async () => {
+    const cwd = tempDir();
+    fs.mkdirSync(path.join(cwd, '.claude'), { recursive: true });
+    fs.writeFileSync(
+      path.join(cwd, '.claude', 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+    const competing = await competingCleanupSettings(tempDir(), cwd);
+    assert.equal(competing.length, 1, 'a project setting outranks the user file we write');
+    assert.equal(competing[0]?.value, 30);
+  });
+});
+
+describe('a server that says when to come back', () => {
+  it('honours Retry-After instead of its own jitter', async () => {
+    const harness = makeHarness();
+    const drive = harness.drive;
+    const original = drive.startResumableUpload.bind(drive);
+    let thrown = false;
+    drive.startResumableUpload = ((args: Parameters<typeof original>[0]) => {
+      if (!thrown) {
+        thrown = true;
+        return Promise.reject(
+          new RetryableError('slow down', { status: 429, retryAfterSeconds: 900 }),
+        );
+      }
+      return original(args);
+    });
+
+    const now = harness.clock.now();
+    await runSweep(harness.ctx);
+    const jobs = listJobs(harness.ctx.db).filter((job) => job.attempts > 0);
+    const waiting = jobs.find((job) => job.notBefore > now);
+    assert.ok(waiting, 'the failed job waits');
+    assert.ok(
+      waiting.notBefore - now >= 900_000,
+      `Retry-After must win: waited ${String(waiting.notBefore - now)}ms`,
+    );
   });
 });

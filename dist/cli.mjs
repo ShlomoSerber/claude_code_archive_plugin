@@ -2628,9 +2628,7 @@ var KV = {
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
-  unconfirmableCount: "reap.unconfirmable_count",
-  /** Set once the initial backfill has enqueued every existing session. */
-  backfillDoneAt: "backfill.done_at"
+  unconfirmableCount: "reap.unconfirmable_count"
 };
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
@@ -5660,11 +5658,18 @@ async function sha256Prefix(file, bytes, signal) {
   if (bytes <= 0) return null;
   const handle = await fsp7.open(file, "r");
   try {
-    const buffer = Buffer.allocUnsafe(bytes);
-    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
-    signal?.throwIfAborted();
-    if (bytesRead < bytes) return null;
-    return createHash2("sha256").update(buffer).digest("hex");
+    const hash = createHash2("sha256");
+    const buffer = Buffer.allocUnsafe(Math.min(bytes, 1024 * 1024));
+    let read = 0;
+    while (read < bytes) {
+      signal?.throwIfAborted();
+      const want = Math.min(buffer.length, bytes - read);
+      const { bytesRead } = await handle.read(buffer, 0, want, read);
+      if (bytesRead === 0) return null;
+      hash.update(buffer.subarray(0, bytesRead));
+      read += bytesRead;
+    }
+    return hash.digest("hex");
   } finally {
     await handle.close();
   }
@@ -6403,8 +6408,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       "Archiving now would replace the fuller copy with the smaller one. Run /archive:resume to recover the archived copy beside the local files, then remove whichever you do not want. Nothing has been changed."
     );
   }
-  {
-  }
+  const contains = await describeContainment(ctx, session, previous, files);
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -6470,7 +6474,6 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  const contains = await describeContainment(ctx, session, previous, files);
   if (contains !== null && supersededId !== null && supersededId !== remote.id) {
     ctx.logger.warn("backup.superseded_kept", {
       session_id: session.sessionId,
@@ -6576,6 +6579,7 @@ function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
     return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
   }
+  if (remote.trashed) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6953,7 +6957,10 @@ function handleJobFailure(ctx, job, err, report) {
   const at2 = nextAttemptAt({
     now,
     attempt: job.attempts,
-    random: () => ctx.clock.random()
+    random: () => ctx.clock.random(),
+    // The server told us when to come back. ARCHITECTURE §6: Retry-After always
+    // wins. Only the HTTP client's own retries were honouring it.
+    ...err instanceof RetryableError && err.retryAfterSeconds !== void 0 ? { retryAfterSeconds: err.retryAfterSeconds } : {}
   });
   ctx.logger.warn("sweep.job_retry", { session_id: job.sessionId, attempt: job.attempts, at: at2 }, err);
   retryLater(ctx.db, job, { at: at2, error: message });
@@ -7333,8 +7340,7 @@ async function runNow(runtime, options = {}) {
     const ctx = commandContext(runtime, { timeoutMs: runtime.config.workerBudgetMs });
     const report = await runSweep(ctx, {
       force: true,
-      unblock: true,
-      backfill: options.backfill === true
+      unblock: true
     });
     await writeStatusFile(ctx, report);
     if (options.json === true) {
@@ -7948,13 +7954,18 @@ async function setCleanupPeriodDays(file, days = CLEANUP_PERIOD_DAYS) {
   });
   return { changed: true, previous, current: days };
 }
-function competingSettingsPaths(claudeDir) {
+function competingSettingsPaths(claudeDir, cwd = process.cwd()) {
   const managed = process.platform === "darwin" ? "/Library/Application Support/ClaudeCode/managed-settings.json" : process.platform === "win32" ? "C:\\Program Files\\ClaudeCode\\managed-settings.json" : "/etc/claude-code/managed-settings.json";
-  return [path17.join(claudeDir, "settings.local.json"), managed];
+  return [
+    path17.join(claudeDir, "settings.local.json"),
+    path17.join(cwd, ".claude", "settings.json"),
+    path17.join(cwd, ".claude", "settings.local.json"),
+    managed
+  ];
 }
-async function competingCleanupSettings(claudeDir) {
+async function competingCleanupSettings(claudeDir, cwd = process.cwd()) {
   const found = [];
-  for (const file of competingSettingsPaths(claudeDir)) {
+  for (const file of competingSettingsPaths(claudeDir, cwd)) {
     let read;
     try {
       read = await readSettings(file);
@@ -8054,9 +8065,7 @@ async function runSetup(runtime, options = {}) {
   }
   if (options.skipBackfill !== true) {
     print("Backing up existing sessions. This continues in the background if it takes a while.");
-    await runNow(runtime, { backfill: true });
-    const now = runtime.clock.now();
-    kvSetNumber(runtime.db(), KV.backfillDoneAt, now, now);
+    await runNow(runtime, {});
   }
   const stats = catalogStats(runtime.db());
   steps["catalog"] = stats;
@@ -8087,9 +8096,16 @@ async function importCatalogIfEmpty(runtime) {
     );
     let imported = 0;
     for (const remote of wanted) {
-      await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
-      imported += importCatalogFile(runtime, staged);
-      await fsp16.rm(staged, { force: true }).catch(() => void 0);
+      try {
+        await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
+        imported += importCatalogFile(runtime, staged);
+      } catch (err) {
+        warn(
+          `Could not read ${remote.name}: ${err instanceof Error ? err.message : "unknown error"}`
+        );
+      } finally {
+        await fsp16.rm(staged, { force: true }).catch(() => void 0);
+      }
     }
     return imported;
   } catch (err) {
@@ -8106,8 +8122,16 @@ function importCatalogFile(runtime, file) {
   const db = runtime.db();
   let imported = 0;
   try {
-    const rows = source.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions`).all();
-    const columnNames = SESSION_COLUMNS.split(",").map((name) => name.trim());
+    const available = new Set(
+      source.prepare("PRAGMA table_info(sessions)").all().map(
+        (column) => column.name
+      )
+    );
+    const columnNames = SESSION_COLUMNS.split(",").map((name) => name.trim()).filter((name) => available.has(name));
+    if (!columnNames.includes("session_id") || !columnNames.includes("encoded_dir")) {
+      throw new Error("it has no sessions table this version can read");
+    }
+    const rows = source.prepare(`SELECT ${columnNames.join(", ")} FROM sessions`).all();
     const insertSession = db.prepare(
       `INSERT OR IGNORE INTO sessions (${columnNames.join(", ")})
        VALUES (${columnNames.map(() => "?").join(", ")})`
@@ -8127,18 +8151,19 @@ function importCatalogFile(runtime, file) {
         continue;
       }
       const values = row;
-      insertSession.run(...columnNames.map((name) => values[name] ?? null));
-      db.prepare(
-        `UPDATE sessions
-            SET local_present = 0, verified_local_mtime = NULL
-          WHERE session_id = ?`
-      ).run(record.sessionId);
+      const inserted = insertSession.run(...columnNames.map((name) => values[name] ?? null));
       for (const prompt of selectPrompts.all(record.sessionId)) {
         insertPrompt.run(record.sessionId, prompt.seq, prompt.ts, prompt.text);
       }
       for (const item of selectFiles.all(record.sessionId)) {
         insertFile.run(record.sessionId, item.path);
       }
+      if (Number(inserted.changes) === 0) continue;
+      db.prepare(
+        `UPDATE sessions
+            SET local_present = 0, verified_local_mtime = NULL
+          WHERE session_id = ?`
+      ).run(record.sessionId);
       imported++;
     }
   } catch (err) {
@@ -8362,7 +8387,6 @@ async function main() {
       device: { type: "boolean" },
       reauth: { type: "boolean" },
       "skip-backfill": { type: "boolean" },
-      backfill: { type: "boolean" },
       all: { type: "boolean" },
       files: { type: "boolean" },
       quota: { type: "boolean" },
@@ -8408,7 +8432,7 @@ async function main() {
       case "status":
         return await runStatus(runtime, { json, quota: values.quota === true });
       case "now":
-        return await runNow(runtime, { json, backfill: values.backfill === true });
+        return await runNow(runtime, { json });
       case "search":
         return runSearch(runtime, {
           query,

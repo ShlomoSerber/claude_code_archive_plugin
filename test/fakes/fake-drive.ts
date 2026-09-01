@@ -105,8 +105,11 @@ export class FakeDrive implements DriveTransport {
 
   findFile(args: { name: string; parentId: string }): Promise<RemoteFile | null> {
     this.calls.push(`findFile:${args.name}`);
+    // The real adapter's query ends `and trashed = false`. A fake that is more
+    // permissive than Drive lets a bug pass its own tests.
     const found = [...this.files.values()].find(
-      (file) => file.name === args.name && file.parentId === args.parentId,
+      (file) =>
+        file.name === args.name && file.parentId === args.parentId && !this.trashedIds.has(file.id),
     );
     return Promise.resolve(found === undefined ? null : this.describe(found));
   }

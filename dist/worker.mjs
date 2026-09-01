@@ -2458,9 +2458,7 @@ var KV = {
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
-  unconfirmableCount: "reap.unconfirmable_count",
-  /** Set once the initial backfill has enqueued every existing session. */
-  backfillDoneAt: "backfill.done_at"
+  unconfirmableCount: "reap.unconfirmable_count"
 };
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
@@ -5490,11 +5488,18 @@ async function sha256Prefix(file, bytes, signal) {
   if (bytes <= 0) return null;
   const handle = await fsp7.open(file, "r");
   try {
-    const buffer = Buffer.allocUnsafe(bytes);
-    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
-    signal?.throwIfAborted();
-    if (bytesRead < bytes) return null;
-    return createHash("sha256").update(buffer).digest("hex");
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(Math.min(bytes, 1024 * 1024));
+    let read = 0;
+    while (read < bytes) {
+      signal?.throwIfAborted();
+      const want = Math.min(buffer.length, bytes - read);
+      const { bytesRead } = await handle.read(buffer, 0, want, read);
+      if (bytesRead === 0) return null;
+      hash.update(buffer.subarray(0, bytesRead));
+      read += bytesRead;
+    }
+    return hash.digest("hex");
   } finally {
     await handle.close();
   }
@@ -6206,8 +6211,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       "Archiving now would replace the fuller copy with the smaller one. Run /archive:resume to recover the archived copy beside the local files, then remove whichever you do not want. Nothing has been changed."
     );
   }
-  {
-  }
+  const contains = await describeContainment(ctx, session, previous, files);
   const remote = await uploadWithResume(ctx, {
     job,
     filePath: bundle.path,
@@ -6273,7 +6277,6 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  const contains = await describeContainment(ctx, session, previous, files);
   if (contains !== null && supersededId !== null && supersededId !== remote.id) {
     ctx.logger.warn("backup.superseded_kept", {
       session_id: session.sessionId,
@@ -6379,6 +6382,7 @@ function compareChecksums(remote, bundle) {
   if (remote.size !== null && remote.size !== bundle.bytes) {
     return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
   }
+  if (remote.trashed) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6756,7 +6760,10 @@ function handleJobFailure(ctx, job, err, report) {
   const at2 = nextAttemptAt({
     now,
     attempt: job.attempts,
-    random: () => ctx.clock.random()
+    random: () => ctx.clock.random(),
+    // The server told us when to come back. ARCHITECTURE §6: Retry-After always
+    // wins. Only the HTTP client's own retries were honouring it.
+    ...err instanceof RetryableError && err.retryAfterSeconds !== void 0 ? { retryAfterSeconds: err.retryAfterSeconds } : {}
   });
   ctx.logger.warn("sweep.job_retry", { session_id: job.sessionId, attempt: job.attempts, at: at2 }, err);
   retryLater(ctx.db, job, { at: at2, error: message });
@@ -6880,8 +6887,7 @@ async function writeStatusFile(ctx, report) {
 // src/worker/main.ts
 function parseArgs(argv) {
   return {
-    force: argv.includes("--force"),
-    backfill: argv.includes("--backfill")
+    force: argv.includes("--force")
   };
 }
 async function main() {
@@ -6922,7 +6928,7 @@ async function main() {
       version: runtime.version,
       signal: controller
     };
-    report = await runSweep(ctx, { force: args.force, backfill: args.backfill });
+    report = await runSweep(ctx, { force: args.force });
   } catch (err) {
     const info = toErrorInfo(err);
     if (err instanceof FatalError) {

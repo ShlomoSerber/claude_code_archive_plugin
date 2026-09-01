@@ -13,7 +13,7 @@ import { formatBytes, print, printJson, warn } from './output.ts';
  */
 export async function runNow(
   runtime: Runtime,
-  options: { json?: boolean; backfill?: boolean } = {},
+  options: { json?: boolean } = {},
 ): Promise<number> {
   const lock = acquireLock(runtime.paths.lockDir, { logger: runtime.logger, clock: runtime.clock });
   if (lock === null) {
@@ -31,7 +31,6 @@ export async function runNow(
     const report = await runSweep(ctx, {
       force: true,
       unblock: true,
-      backfill: options.backfill === true,
     });
     await writeStatusFile(ctx, report);
 

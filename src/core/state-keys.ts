@@ -25,8 +25,6 @@ export const KV = {
   machineId: 'machine.id',
   /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
   unconfirmableCount: 'reap.unconfirmable_count',
-  /** Set once the initial backfill has enqueued every existing session. */
-  backfillDoneAt: 'backfill.done_at',
 } as const;
 
 /**

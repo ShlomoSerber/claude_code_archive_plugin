@@ -287,8 +287,12 @@ async function publish(
     );
   }
 
-  {
-  }
+  // Decided here, against the disk state that verifyBundleContents and the
+  // stat sandwich above have just proved the bundle matches. Deciding it after
+  // the upload read the transcript again, minutes later, and a rewrite landing
+  // in that window could have made a bundle look like a superset of one it does
+  // not contain.
+  const contains = await describeContainment(ctx, session, previous, files);
 
   const remote = await uploadWithResume(ctx, {
     job,
@@ -373,7 +377,6 @@ async function publish(
   // contains the old one — not merely that it is bigger. Three integer
   // comparisons let one sidecar file be swapped for a larger one, and the
   // archived subagent transcript then existed nowhere.
-  const contains = await describeContainment(ctx, session, previous, files);
   if (contains !== null && supersededId !== null && supersededId !== remote.id) {
     ctx.logger.warn('backup.superseded_kept', {
       session_id: session.sessionId,
@@ -565,6 +568,10 @@ export function compareChecksums(
   if (remote.size !== null && remote.size !== bundle.bytes) {
     return `size ${String(remote.size)} != ${String(bundle.bytes)}`;
   }
+  // Drive purges the wastebasket after thirty days, so a trashed file is not a
+  // copy of anything. The reaper checks this before deleting; checking it here
+  // too means a row is never marked verified against one.
+  if (remote.trashed) return 'the remote copy is in the wastebasket';
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : 'sha256 mismatch';
   }

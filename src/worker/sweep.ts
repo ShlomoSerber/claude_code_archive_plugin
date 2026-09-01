@@ -8,7 +8,7 @@ import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
 import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
 import { getSession, markLocalPresent, upsertSession } from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
-import { FatalError, isRetryableNetworkError, toErrorInfo } from '../core/errors.ts';
+import { FatalError, isRetryableNetworkError, toErrorInfo, RetryableError } from '../core/errors.ts';
 import {
   claim,
   complete,
@@ -66,8 +66,6 @@ export type SweepOptions = {
    * is not retried every ten minutes for ever.
    */
   unblock?: boolean;
-  /** Enqueue every unarchived session, not just the ones seen since last time. */
-  backfill?: boolean;
 };
 
 export async function runSweep(
@@ -322,6 +320,12 @@ function handleJobFailure(ctx: WorkerContext, job: Job, err: unknown, report: Sw
     now,
     attempt: job.attempts,
     random: () => ctx.clock.random(),
+    // The server told us when to come back. ARCHITECTURE §6: Retry-After always
+    // wins. Only the HTTP client's own retries were honouring it.
+    ...(err instanceof RetryableError && err.retryAfterSeconds !== undefined
+      ? { retryAfterSeconds: err.retryAfterSeconds }
+      : {}),
+
   });
   ctx.logger.warn('sweep.job_retry', { session_id: job.sessionId, attempt: job.attempts, at }, err);
   retryLater(ctx.db, job, { at, error: message });

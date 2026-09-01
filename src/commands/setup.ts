@@ -11,8 +11,6 @@ import { catalogStats, SESSION_COLUMNS, toRecord, type SessionRow } from '../cor
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
 import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
-import { KV } from '../core/state-keys.ts';
-import { kvSetNumber } from '../adapters/db.ts';
 import type { Runtime } from '../composition.ts';
 import { commandContext } from './context.ts';
 import { runNow } from './now.ts';
@@ -97,9 +95,7 @@ export async function runSetup(runtime: Runtime, options: SetupOptions = {}): Pr
 
   if (options.skipBackfill !== true) {
     print('Backing up existing sessions. This continues in the background if it takes a while.');
-    await runNow(runtime, { backfill: true });
-    const now = runtime.clock.now();
-    kvSetNumber(runtime.db(), KV.backfillDoneAt, now, now);
+    await runNow(runtime, {});
   }
 
   const stats = catalogStats(runtime.db());
@@ -151,9 +147,18 @@ export async function importCatalogIfEmpty(runtime: Runtime): Promise<number> {
     );
     let imported = 0;
     for (const remote of wanted) {
-      await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
-      imported += importCatalogFile(runtime, staged);
-      await fsp.rm(staged, { force: true }).catch(() => undefined);
+      // Per file, not per run. One unreadable catalog used to abort the whole
+      // loop, discarding every other machine's history along with it.
+      try {
+        await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
+        imported += importCatalogFile(runtime, staged);
+      } catch (err) {
+        warn(
+          `Could not read ${remote.name}: ${err instanceof Error ? err.message : 'unknown error'}`,
+        );
+      } finally {
+        await fsp.rm(staged, { force: true }).catch(() => undefined);
+      }
     }
     return imported;
   } catch (err) {
@@ -177,10 +182,28 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
   const db = runtime.db();
   let imported = 0;
   try {
-    const rows = source.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions`).all() as SessionRow[];
-    // Read the values by column name rather than by object key order, so the
-    // insert cannot silently shift if the column list is ever reordered.
-    const columnNames = SESSION_COLUMNS.split(',').map((name) => name.trim());
+    // Only the columns this catalog actually has.
+    //
+    // The download is opened read-only with no migrations, so a catalog written
+    // by an older version of the plugin never gains the columns added since —
+    // and selecting the current list from it threw `no such column`. That is
+    // the disaster-recovery path: a dead laptop's catalog, written by whatever
+    // version was installed then, read by whatever version you install now. It
+    // recovered nothing and said so in a single warning line.
+    const available = new Set(
+      (source.prepare('PRAGMA table_info(sessions)').all() as { name: string }[]).map(
+        (column) => column.name,
+      ),
+    );
+    const columnNames = SESSION_COLUMNS.split(',')
+      .map((name) => name.trim())
+      .filter((name) => available.has(name));
+    if (!columnNames.includes('session_id') || !columnNames.includes('encoded_dir')) {
+      throw new Error('it has no sessions table this version can read');
+    }
+    const rows = source
+      .prepare(`SELECT ${columnNames.join(', ')} FROM sessions`)
+      .all() as SessionRow[];
     const insertSession = db.prepare(
       `INSERT OR IGNORE INTO sessions (${columnNames.join(', ')})
        VALUES (${columnNames.map(() => '?').join(', ')})`,
@@ -204,21 +227,9 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
         continue;
       }
       const values = row as unknown as Record<string, string | number | null | undefined>;
-      insertSession.run(...columnNames.map((name) => values[name] ?? null));
-      // The bytes live on Drive, not here: a recovered session is not local.
-      // Only the mtime fingerprint is dropped — it was measured against another
-      // machine's files, and it is what authorises deletion. The recorded size
-      // is a fact about the archive itself, and the guard that refuses to
-      // overwrite a larger archive with a smaller session needs it.
-      // The verification fingerprint is dropped as well. It was measured on
-      // another machine against files this one has never seen, and it is the
-      // value that authorises deleting local data. Restore still works, since
-      // that needs only the remote id and the bundle hash.
-      db.prepare(
-        `UPDATE sessions
-            SET local_present = 0, verified_local_mtime = NULL
-          WHERE session_id = ?`,
-      ).run(record.sessionId);
+      const inserted = insertSession.run(...columnNames.map((name) => values[name] ?? null));
+      // The prompts and the file list are what search runs on, and both inserts
+      // ignore conflicts, so they are worth doing for a row we already had.
       for (const prompt of selectPrompts.all(record.sessionId) as {
         seq: number;
         ts: number | null;
@@ -229,6 +240,24 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
       for (const item of selectFiles.all(record.sessionId) as { path: string }[]) {
         insertFile.run(record.sessionId, item.path);
       }
+      // Only for a row this machine did not already have. The import runs on
+      // every /archive:setup and downloads this machine's own catalog copy too,
+      // so resetting unconditionally told the plugin that sessions sitting on
+      // its own disk were not there: /archive:status counted them as reclaimed,
+      // and the next sweep re-bundled and re-uploaded every one of them.
+      if (Number(inserted.changes) === 0) continue;
+      // The bytes live on Drive, not here: a recovered session is not local.
+      // The verification fingerprint is dropped as well. It was measured on
+      // another machine against files this one has never seen, and it is the
+      // value that authorises deleting local data. Restore still works, since
+      // that needs only the remote id and the bundle hash. The recorded sizes
+      // stay: they are facts about the archive itself, and the guard that
+      // refuses to replace a larger archive with a smaller session needs them.
+      db.prepare(
+        `UPDATE sessions
+            SET local_present = 0, verified_local_mtime = NULL
+          WHERE session_id = ?`,
+      ).run(record.sessionId);
       imported++;
     }
   } catch (err) {

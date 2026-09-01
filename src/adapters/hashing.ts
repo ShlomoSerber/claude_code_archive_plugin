@@ -93,11 +93,22 @@ export async function sha256Prefix(
   if (bytes <= 0) return null;
   const handle = await fsp.open(file, 'r');
   try {
-    const buffer = Buffer.allocUnsafe(bytes);
-    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
-    signal?.throwIfAborted();
-    if (bytesRead < bytes) return null;
-    return createHash('sha256').update(buffer).digest('hex');
+    // In chunks. A transcript can be hundreds of megabytes, and allocating the
+    // whole prefix meant a matching spike on every re-archive — and, past
+    // buffer.constants.MAX_LENGTH, a throw that arrives after markVerified and
+    // re-bundles the entire session on every retry.
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(Math.min(bytes, 1024 * 1024));
+    let read = 0;
+    while (read < bytes) {
+      signal?.throwIfAborted();
+      const want = Math.min(buffer.length, bytes - read);
+      const { bytesRead } = await handle.read(buffer, 0, want, read);
+      if (bytesRead === 0) return null;
+      hash.update(buffer.subarray(0, bytesRead));
+      read += bytesRead;
+    }
+    return hash.digest('hex');
   } finally {
     await handle.close();
   }

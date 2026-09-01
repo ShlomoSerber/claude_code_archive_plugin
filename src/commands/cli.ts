@@ -60,7 +60,6 @@ async function main(): Promise<number> {
       device: { type: 'boolean' },
       reauth: { type: 'boolean' },
       'skip-backfill': { type: 'boolean' },
-      backfill: { type: 'boolean' },
       all: { type: 'boolean' },
       files: { type: 'boolean' },
       quota: { type: 'boolean' },
@@ -110,7 +109,7 @@ async function main(): Promise<number> {
       case 'status':
         return await runStatus(runtime, { json, quota: values.quota === true });
       case 'now':
-        return await runNow(runtime, { json, backfill: values.backfill === true });
+        return await runNow(runtime, { json });
       case 'search':
         return runSearch(runtime, {
           query,

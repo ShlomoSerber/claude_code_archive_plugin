@@ -17,12 +17,11 @@ import type { WorkerContext } from './context.ts';
  * loudly is a background process the user has to think about.
  */
 
-type Args = { force: boolean; backfill: boolean };
+type Args = { force: boolean };
 
 function parseArgs(argv: string[]): Args {
   return {
     force: argv.includes('--force'),
-    backfill: argv.includes('--backfill'),
   };
 }
 
@@ -73,7 +72,7 @@ async function main(): Promise<void> {
       version: runtime.version,
       signal: controller,
     };
-    report = await runSweep(ctx, { force: args.force, backfill: args.backfill });
+    report = await runSweep(ctx, { force: args.force });
   } catch (err) {
     const info = toErrorInfo(err);
     if (err instanceof FatalError) {
