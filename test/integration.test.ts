@@ -2757,7 +2757,7 @@ describe('the bundles the plugin promised nothing deletes', () => {
     const harness = makeHarness();
     fs.writeFileSync(
       path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
-      `${'{"type":"assistant","subagent":true}\n'.repeat(40)}`,
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
     );
     await runSweep(harness.ctx);
     fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
