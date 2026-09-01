@@ -2397,7 +2397,9 @@ function markReapSkipped(db, sessionId, reason, until, now) {
 }
 function markLocalDeleted(db, sessionId, now) {
   db.prepare(
-    `UPDATE sessions SET local_present = 0, local_deleted_at = ?, updated_at = ? WHERE session_id = ?`
+    `UPDATE sessions SET local_present = 0, local_deleted_at = ?,
+            reap_skip_reason = NULL, reap_skip_until = NULL, updated_at = ?
+      WHERE session_id = ?`
   ).run(now, now, sessionId);
 }
 function markLocalPresent(db, sessionId, mtime, now) {
@@ -2578,6 +2580,14 @@ function claim(db, now, visibilityMs) {
        RETURNING ${JOB_COLUMNS}`
   ).get(now + visibilityMs, token, now, now, now);
   return row === void 0 ? null : toJob(row);
+}
+function heartbeatClaim(db, job, now, visibilityMs) {
+  db.prepare(`UPDATE jobs SET visible_at = ?, updated_at = ? WHERE id = ? AND claim_token = ?`).run(
+    now + visibilityMs,
+    now,
+    job.id,
+    job.claimToken
+  );
 }
 function complete(db, job) {
   const deleted = db.prepare("DELETE FROM jobs WHERE id = ? AND claim_token = ?").run(job.id, job.claimToken);
@@ -6256,6 +6266,7 @@ async function uploadWithResume(ctx, args) {
         }
         throw err;
       }
+      heartbeatClaim(ctx.db, args.job, ctx.clock.now(), ctx.config.jobVisibilityMs);
       if (progress.done && progress.file !== null) {
         setUploadUri(ctx.db, args.job, null, ctx.clock.now());
         return progress.file;
@@ -6683,6 +6694,7 @@ async function reapLocalCopies(ctx, now, limit) {
       onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
     } catch (err) {
       log.warn("reap.stat_failed", {}, err);
+      markReapSkipped(ctx.db, record.sessionId, "stat-failed", now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }
@@ -6759,6 +6771,18 @@ async function reapLocalCopies(ctx, now, limit) {
       report.skipped++;
       continue;
     }
+    const divergence = await describeDivergence(ctx, record, settled);
+    if (divergence !== null) {
+      log.warn("reap.content_differs", { reason: divergence });
+      clearVerification(ctx.db, record.sessionId, now);
+      enqueue(
+        ctx.db,
+        { kind: "backup", sessionId: record.sessionId, payload: { encodedDir: record.encodedDir } },
+        now
+      );
+      report.unverified++;
+      continue;
+    }
     if (!await removeLocalCopy(ctx, onDisk, target)) {
       report.skipped++;
       continue;
@@ -6769,6 +6793,30 @@ async function reapLocalCopies(ctx, now, limit) {
     log.info("reap.deleted", { bytes: onDisk.transcriptBytes + onDisk.sidecarBytes });
   }
   return report;
+}
+async function describeDivergence(ctx, record, onDisk) {
+  const archived = decodeManifest(record.verifiedManifest);
+  if (archived.size === 0) return "the archived file list is not recorded";
+  let current;
+  try {
+    current = await describeSessionFiles({
+      cwd: path14.dirname(onDisk.transcriptPath),
+      entries: bundleEntries(onDisk),
+      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+    });
+  } catch (err) {
+    return `the session could not be read: ${err instanceof Error ? err.message : "unknown"}`;
+  }
+  const byPath = new Map(current.map((file) => [file.path, file.sha256]));
+  for (const [entryPath, hash] of archived) {
+    const now = byPath.get(entryPath);
+    if (now === void 0) return `${entryPath} is no longer on disk`;
+    if (now !== hash) return `${entryPath} is not the file that was archived`;
+  }
+  for (const file of current) {
+    if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
+  }
+  return null;
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));

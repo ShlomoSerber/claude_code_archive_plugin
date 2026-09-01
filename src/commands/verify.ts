@@ -1,5 +1,5 @@
 import { listUnverified } from '../core/catalog.ts';
-import { verifyArchive } from '../worker/restore.ts';
+import { verifyArchive, verifyRetained } from '../worker/restore.ts';
 import type { SessionRecord } from '../core/catalog.ts';
 import { SESSION_COLUMNS, toRecord, type SessionRow } from '../core/catalog.ts';
 import type { Runtime } from '../composition.ts';
@@ -21,10 +21,11 @@ export async function runVerify(
 
   const ctx = commandContext(runtime);
   const report = await verifyArchive(ctx, records);
+  const retained = await verifyRetained(ctx);
   const pending = listUnverified(runtime.db(), 1).length;
 
   if (options.json === true) {
-    printJson({ ...report, pendingBackup: pending });
+    printJson({ ...report, retained, pendingBackup: pending });
     return report.mismatched.length > 0 ? 1 : 0;
   }
 
@@ -35,6 +36,12 @@ export async function runVerify(
     print(
       `${String(report.unchecked.length)} could not be checked right now (network or rate limit).`,
     );
+  }
+  if (retained.checked > 0) {
+    print(`Checked ${String(retained.checked)} kept bundle(s): ${String(retained.ok)} intact.`);
+    for (const problem of retained.problems.slice(0, 5)) {
+      print(`  ${problem.fileId}: ${problem.reason}`);
+    }
   }
   if (report.missing.length > 0) {
     print(`${String(report.missing.length)} have no remote copy recorded.`);

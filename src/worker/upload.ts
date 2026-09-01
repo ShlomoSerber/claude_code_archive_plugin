@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import { UploadSessionExpired, RetryableError, FatalError } from '../core/errors.ts';
-import { setUploadUri, type Job } from '../core/queue.ts';
+import { setUploadUri, type Job, heartbeatClaim } from '../core/queue.ts';
 import { CHUNK_SIZE, alignChunkSize } from '../adapters/drive-http.ts';
 import type { RemoteFile } from '../ports/drive.ts';
 import type { WorkerContext } from './context.ts';
@@ -159,6 +159,12 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
         }
         throw err;
       }
+
+      // The claim's visibility timeout is fifteen minutes, and a large bundle
+      // on a slow line can outrun it — after which another worker may claim
+      // the same job and upload the same bytes twice. The heartbeat existed
+      // and nothing called it.
+      heartbeatClaim(ctx.db, args.job, ctx.clock.now(), ctx.config.jobVisibilityMs);
 
       if (progress.done && progress.file !== null) {
         setUploadUri(ctx.db, args.job, null, ctx.clock.now());

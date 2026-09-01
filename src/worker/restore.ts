@@ -434,6 +434,46 @@ export type VerifyReport = {
   unchecked: { sessionId: string; reason: string }[];
 };
 
+/**
+ * Check the bundles the plugin kept because a newer one did not contain them.
+ *
+ * Nothing else looks at these. /archive:status says "they hold data the newer
+ * bundle does not" — which is precisely why an unnoticed trashing of one is
+ * the loss of the only copy of something.
+ */
+export async function verifyRetained(
+  ctx: WorkerContext,
+): Promise<{ checked: number; ok: number; problems: { fileId: string; reason: string }[] }> {
+  const problems: { fileId: string; reason: string }[] = [];
+  let checked = 0;
+  let ok = 0;
+  for (const entry of listRetainedBundles(ctx.db)) {
+    checked++;
+    try {
+      const remote = await ctx.drive.getFile(entry.fileId, ctx.signal);
+      if (remote.trashed === true) {
+        problems.push({ fileId: entry.fileId, reason: 'it is in the Drive wastebasket' });
+        continue;
+      }
+      if (
+        entry.bundleSha256 !== null &&
+        remote.sha256 !== null &&
+        remote.sha256.toLowerCase() !== entry.bundleSha256.toLowerCase()
+      ) {
+        problems.push({ fileId: entry.fileId, reason: 'its hash no longer matches' });
+        continue;
+      }
+      ok++;
+    } catch (err) {
+      problems.push({
+        fileId: entry.fileId,
+        reason: err instanceof Error ? err.message : 'Drive could not be asked',
+      });
+    }
+  }
+  return { checked, ok, problems };
+}
+
 export async function verifyArchive(
   ctx: WorkerContext,
   records: SessionRecord[],

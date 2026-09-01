@@ -438,7 +438,9 @@ export function countReapSkipped(db: Db, reason: string): number {
 
 export function markLocalDeleted(db: Db, sessionId: string, now: number): void {
   db.prepare(
-    `UPDATE sessions SET local_present = 0, local_deleted_at = ?, updated_at = ? WHERE session_id = ?`,
+    `UPDATE sessions SET local_present = 0, local_deleted_at = ?,
+            reap_skip_reason = NULL, reap_skip_until = NULL, updated_at = ?
+      WHERE session_id = ?`,
   ).run(now, now, sessionId);
 }
 

@@ -2518,7 +2518,9 @@ function countReapSkipped(db, reason) {
 }
 function markLocalDeleted(db, sessionId, now) {
   db.prepare(
-    `UPDATE sessions SET local_present = 0, local_deleted_at = ?, updated_at = ? WHERE session_id = ?`
+    `UPDATE sessions SET local_present = 0, local_deleted_at = ?,
+            reap_skip_reason = NULL, reap_skip_until = NULL, updated_at = ?
+      WHERE session_id = ?`
   ).run(now, now, sessionId);
 }
 function markLocalPresent(db, sessionId, mtime, now) {
@@ -2712,6 +2714,14 @@ function claim(db, now, visibilityMs) {
        RETURNING ${JOB_COLUMNS}`
   ).get(now + visibilityMs, token, now, now, now);
   return row === void 0 ? null : toJob(row);
+}
+function heartbeatClaim(db, job, now, visibilityMs) {
+  db.prepare(`UPDATE jobs SET visible_at = ?, updated_at = ? WHERE id = ? AND claim_token = ?`).run(
+    now + visibilityMs,
+    now,
+    job.id,
+    job.claimToken
+  );
 }
 function complete(db, job) {
   const deleted = db.prepare("DELETE FROM jobs WHERE id = ? AND claim_token = ?").run(job.id, job.claimToken);
@@ -6457,6 +6467,7 @@ async function uploadWithResume(ctx, args) {
         }
         throw err;
       }
+      heartbeatClaim(ctx.db, args.job, ctx.clock.now(), ctx.config.jobVisibilityMs);
       if (progress.done && progress.file !== null) {
         setUploadUri(ctx.db, args.job, null, ctx.clock.now());
         return progress.file;
@@ -6884,6 +6895,7 @@ async function reapLocalCopies(ctx, now, limit) {
       onDisk = await statSession(ctx.paths, record.encodedDir, record.sessionId);
     } catch (err) {
       log.warn("reap.stat_failed", {}, err);
+      markReapSkipped(ctx.db, record.sessionId, "stat-failed", now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }
@@ -6960,6 +6972,18 @@ async function reapLocalCopies(ctx, now, limit) {
       report.skipped++;
       continue;
     }
+    const divergence = await describeDivergence(ctx, record, settled);
+    if (divergence !== null) {
+      log.warn("reap.content_differs", { reason: divergence });
+      clearVerification(ctx.db, record.sessionId, now);
+      enqueue(
+        ctx.db,
+        { kind: "backup", sessionId: record.sessionId, payload: { encodedDir: record.encodedDir } },
+        now
+      );
+      report.unverified++;
+      continue;
+    }
     if (!await removeLocalCopy(ctx, onDisk, target)) {
       report.skipped++;
       continue;
@@ -6970,6 +6994,30 @@ async function reapLocalCopies(ctx, now, limit) {
     log.info("reap.deleted", { bytes: onDisk.transcriptBytes + onDisk.sidecarBytes });
   }
   return report;
+}
+async function describeDivergence(ctx, record, onDisk) {
+  const archived = decodeManifest(record.verifiedManifest);
+  if (archived.size === 0) return "the archived file list is not recorded";
+  let current;
+  try {
+    current = await describeSessionFiles({
+      cwd: path13.dirname(onDisk.transcriptPath),
+      entries: bundleEntries(onDisk),
+      ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
+    });
+  } catch (err) {
+    return `the session could not be read: ${err instanceof Error ? err.message : "unknown"}`;
+  }
+  const byPath = new Map(current.map((file) => [file.path, file.sha256]));
+  for (const [entryPath, hash] of archived) {
+    const now = byPath.get(entryPath);
+    if (now === void 0) return `${entryPath} is no longer on disk`;
+    if (now !== hash) return `${entryPath} is not the file that was archived`;
+  }
+  for (const file of current) {
+    if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
+  }
+  return null;
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
@@ -8241,6 +8289,32 @@ function requireRemote(record) {
 function resumeCommand(sessionId) {
   return `claude --resume ${sessionId}`;
 }
+async function verifyRetained(ctx) {
+  const problems = [];
+  let checked = 0;
+  let ok = 0;
+  for (const entry of listRetainedBundles(ctx.db)) {
+    checked++;
+    try {
+      const remote = await ctx.drive.getFile(entry.fileId, ctx.signal);
+      if (remote.trashed === true) {
+        problems.push({ fileId: entry.fileId, reason: "it is in the Drive wastebasket" });
+        continue;
+      }
+      if (entry.bundleSha256 !== null && remote.sha256 !== null && remote.sha256.toLowerCase() !== entry.bundleSha256.toLowerCase()) {
+        problems.push({ fileId: entry.fileId, reason: "its hash no longer matches" });
+        continue;
+      }
+      ok++;
+    } catch (err) {
+      problems.push({
+        fileId: entry.fileId,
+        reason: err instanceof Error ? err.message : "Drive could not be asked"
+      });
+    }
+  }
+  return { checked, ok, problems };
+}
 async function verifyArchive(ctx, records) {
   const report = { checked: 0, ok: 0, mismatched: [], missing: [], unchecked: [] };
   for (const record of records) {
@@ -8751,6 +8825,7 @@ async function runStatus(runtime, options) {
   const queue = countJobs(db, now);
   const blocked = listJobs(db).filter((job) => job.blocked);
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
+  const catalogUploadedAt = kvGetNumber(db, KV.catalogUploadedAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
@@ -8817,6 +8892,7 @@ async function runStatus(runtime, options) {
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
       lastSweepAt,
+      catalogUploadedAt,
       circuitUntil,
       quota,
       quotaError,
@@ -8855,7 +8931,7 @@ async function runStatus(runtime, options) {
   if (skipped > 0) {
     print(`  WARNING:            ${String(skipped)} project(s) or session(s) cannot be archived`);
     print(
-      `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`
+      `                      ${String(unreadable)} could not be read; the rest have unusable names or share a session id with another project directory. See the log.`
     );
   }
   if (options.projects !== true) {
@@ -8898,6 +8974,15 @@ async function runStatus(runtime, options) {
   if (orphanSidecars > 0) {
     print(`  ${String(orphanSidecars)} session(s) have a sidecar directory but no transcript.`);
     print(`  Nothing removes those, and their bytes are not counted as reclaimed.`);
+  }
+  if (catalogUploadedAt === null && stats.verified > 0) {
+    print(`  WARNING:            the catalog has never been copied to Drive.`);
+    print(`                      A new machine could not find these sessions. Run /archive:now.`);
+  } else if (catalogUploadedAt !== null && now - catalogUploadedAt > 7 * DAY_MS) {
+    print(
+      `  WARNING:            the catalog copy on Drive is from ${formatRelative(catalogUploadedAt, now)}.`
+    );
+    print(`                      Sessions archived since then would not be findable on a new machine.`);
   }
   if (unreadableSidecars > 0) {
     print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);
@@ -8951,9 +9036,10 @@ async function runVerify(runtime, options = {}) {
   const records = options.all === true ? allArchived(runtime) : sampleArchived(runtime, options.limit ?? 20);
   const ctx = commandContext(runtime);
   const report = await verifyArchive(ctx, records);
+  const retained = await verifyRetained(ctx);
   const pending = listUnverified(runtime.db(), 1).length;
   if (options.json === true) {
-    printJson({ ...report, pendingBackup: pending });
+    printJson({ ...report, retained, pendingBackup: pending });
     return report.mismatched.length > 0 ? 1 : 0;
   }
   print(`Checked ${String(report.checked)} archived sessions: ${String(report.ok)} verified.`);
@@ -8961,6 +9047,12 @@ async function runVerify(runtime, options = {}) {
     print(
       `${String(report.unchecked.length)} could not be checked right now (network or rate limit).`
     );
+  }
+  if (retained.checked > 0) {
+    print(`Checked ${String(retained.checked)} kept bundle(s): ${String(retained.ok)} intact.`);
+    for (const problem of retained.problems.slice(0, 5)) {
+      print(`  ${problem.fileId}: ${problem.reason}`);
+    }
   }
   if (report.missing.length > 0) {
     print(`${String(report.missing.length)} have no remote copy recorded.`);

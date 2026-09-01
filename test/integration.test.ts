@@ -39,7 +39,12 @@ import {
 } from '../src/core/queue.ts';
 import { catalogFileName, machineId, runSweep } from '../src/worker/sweep.ts';
 import { importCatalogFile } from '../src/commands/setup.ts';
-import { restoreRetainedBundle, restoreSession, verifyArchive } from '../src/worker/restore.ts';
+import {
+  restoreRetainedBundle,
+  restoreSession,
+  verifyArchive,
+  verifyRetained,
+} from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
@@ -2671,5 +2676,107 @@ describe('rows the reaper can never act on', () => {
       false,
       'a session that could be reclaimed still is',
     );
+  });
+});
+
+/**
+ * Twenty-fifth round, and the first break of objective 1 in eleven rounds.
+ *
+ * Everything upstream of the delete decides from a fingerprint of (newest
+ * mtime, total size). That cannot see a same-size rewrite that preserves
+ * mtimes — which is exactly what `rsync -a`, `tar -p`, a snapshot rollback or
+ * a two-machine sync resolution produce. The row already carried a sha256 for
+ * every archived file; nothing read them.
+ */
+describe('a local file that was replaced without changing its size or mtime', () => {
+  async function archivedThenRewritten(rewrite: (harness: Harness) => void) {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+
+    const before = fs.statSync(harness.transcriptOf(SESSION_A));
+    rewrite(harness);
+    // What a backup restore does: same bytes count, same timestamps.
+    fs.utimesSync(harness.transcriptOf(SESSION_A), before.atime, before.mtime);
+
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db
+      .prepare('UPDATE sessions SET verified_local_mtime = ? WHERE session_id = ?')
+      .run(Math.trunc(fs.statSync(harness.transcriptOf(SESSION_A)).mtimeMs), SESSION_A);
+    harness.clock.advance(40 * DAY_MS);
+    return harness;
+  }
+
+  it('is not deleted against an archive that holds different bytes', async () => {
+    const harness = await archivedThenRewritten((h) => {
+      const path_ = h.transcriptOf(SESSION_A);
+      const original = fs.readFileSync(path_, 'utf8');
+      // Same length, different content: a divergence resolved the other way.
+      fs.writeFileSync(path_, original.replace('bouncing', 'BOUNCING'));
+    });
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(
+      fs.existsSync(harness.transcriptOf(SESSION_A)),
+      true,
+      'bytes Drive has never held are not deleted',
+    );
+    assert.ok(report.unverified > 0, 'and the session is queued to be archived again');
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null);
+  });
+
+  it('is archived again on the next sweep, so nothing is left behind', async () => {
+    const harness = await archivedThenRewritten((h) => {
+      const path_ = h.transcriptOf(SESSION_A);
+      const original = fs.readFileSync(path_, 'utf8');
+      fs.writeFileSync(path_, original.replace('bouncing', 'BOUNCING'));
+    });
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    const record = getSession(harness.ctx.db, SESSION_A);
+    assert.ok(record?.verifiedAt, 'the changed session is archived');
+
+    const bundle = harness.drive.files.get(record.remoteFileId ?? '');
+    assert.ok(bundle);
+    const restored = await restoreSession(harness.ctx, SESSION_A);
+    assert.ok(restored.alreadyLocal || restored.entries.length > 0);
+  });
+
+  it('still deletes a session whose files are untouched', async () => {
+    const harness = await archivedThenRewritten(() => undefined);
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.ok(report.deleted > 0, 'the guard is not vacuous');
+  });
+});
+
+describe('the bundles the plugin promised nothing deletes', () => {
+  it('are checked by /archive:verify like any other', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      `${'{"type":"assistant","subagent":true}\n'.repeat(40)}`,
+    );
+    await runSweep(harness.ctx);
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const kept = listRetainedBundles(harness.ctx.db)[0];
+    assert.ok(kept);
+    assert.deepEqual((await verifyRetained(harness.ctx)).problems, [], 'intact to begin with');
+
+    // Someone empties their Drive wastebasket in a month; until then this is
+    // the only copy of the subagent transcript.
+    harness.drive.trashedIds.add(kept.fileId);
+    const report = await verifyRetained(harness.ctx);
+    assert.equal(report.problems.length, 1, 'and the loss is reported, not assumed away');
+    assert.match(report.problems[0]?.reason ?? '', /wastebasket/);
   });
 });

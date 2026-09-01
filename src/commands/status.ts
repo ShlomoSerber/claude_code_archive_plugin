@@ -55,6 +55,7 @@ export async function runStatus(
   const queue = countJobs(db, now);
   const blocked = listJobs(db).filter((job) => job.blocked);
   const lastSweepAt = kvGetNumber(db, KV.lastSweepAt) ?? null;
+  const catalogUploadedAt = kvGetNumber(db, KV.catalogUploadedAt) ?? null;
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
@@ -153,6 +154,7 @@ export async function runStatus(
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
       lastSweepAt,
+      catalogUploadedAt,
       circuitUntil,
       quota,
       quotaError,
@@ -196,7 +198,8 @@ export async function runStatus(
   if (skipped > 0) {
     print(`  WARNING:            ${String(skipped)} project(s) or session(s) cannot be archived`);
     print(
-      `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`,
+      `                      ${String(unreadable)} could not be read; the rest have unusable names ` +
+        `or share a session id with another project directory. See the log.`,
     );
   }
   if (options.projects !== true) {
@@ -242,6 +245,17 @@ export async function runStatus(
   if (orphanSidecars > 0) {
     print(`  ${String(orphanSidecars)} session(s) have a sidecar directory but no transcript.`);
     print(`  Nothing removes those, and their bytes are not counted as reclaimed.`);
+  }
+  // Without the catalog copy, a replacement machine can still read every
+  // bundle by hand but cannot search or restore anything archived since.
+  if (catalogUploadedAt === null && stats.verified > 0) {
+    print(`  WARNING:            the catalog has never been copied to Drive.`);
+    print(`                      A new machine could not find these sessions. Run /archive:now.`);
+  } else if (catalogUploadedAt !== null && now - catalogUploadedAt > 7 * DAY_MS) {
+    print(
+      `  WARNING:            the catalog copy on Drive is from ${formatRelative(catalogUploadedAt, now)}.`,
+    );
+    print(`                      Sessions archived since then would not be findable on a new machine.`);
   }
   if (unreadableSidecars > 0) {
     print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);

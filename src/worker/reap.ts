@@ -12,7 +12,10 @@ import { DAY_MS, reapCutoff } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
 import { assertInside, isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { enqueue } from '../core/queue.ts';
-import { statSession, type LocalSession } from '../adapters/session-scan.ts';
+import { bundleEntries, statSession, type LocalSession } from '../adapters/session-scan.ts';
+import { describeSessionFiles } from '../adapters/bundle.ts';
+import type { ManifestFile } from '../core/manifest.ts';
+import { decodeManifest } from './backup.ts';
 import { renameRetryDelay } from '../adapters/atomic.ts';
 import { kvGetNumber } from '../adapters/db.ts';
 import { ACTIVE_SESSION_TTL_MS, activeSessionKey } from '../core/state-keys.ts';
@@ -117,6 +120,10 @@ export async function reapLocalCopies(
       // "I could not look" is not "it is not there". Recording the latter made
       // /archive:status report space reclaimed from files still on disk.
       log.warn('reap.stat_failed', {}, err);
+      // As permanent as an orphan: an EACCES project directory or a dead
+      // network mount answers the same way every run, and 500 of them would
+      // hold the candidate window against every session that can be freed.
+      markReapSkipped(ctx.db, record.sessionId, 'stat-failed', now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }
@@ -142,6 +149,8 @@ export async function reapLocalCopies(
       // caught up with, and recording that as deleted made /archive:status
       // claim space it had never reclaimed and /archive:resume unpack a second
       // copy into the directory the user had moved away from.
+      // The sidecar is gone too, so whatever the row was stamped with no
+      // longer describes anything on disk.
       const elsewhere = await findSessionElsewhere(ctx, record, await projectDirs());
       if (elsewhere !== null) {
         log.info('reap.session_moved', { encoded_dir: elsewhere });
@@ -239,6 +248,28 @@ export async function reapLocalCopies(
       continue;
     }
 
+    // The last thing before the only irreversible act in this plugin: read the
+    // bytes and compare them with the hashes of the bytes that were archived.
+    //
+    // Everything above decides from a fingerprint of (newest mtime, total
+    // size), and that fingerprint cannot see a same-size rewrite that
+    // preserves mtimes — which is exactly what `rsync -a`, `tar -p`, a
+    // filesystem snapshot rollback or a two-machine sync resolution produce.
+    // The row already carries a sha256 for every archived file; not reading
+    // them was the one way left to delete bytes Drive has never held.
+    const divergence = await describeDivergence(ctx, record, settled);
+    if (divergence !== null) {
+      log.warn('reap.content_differs', { reason: divergence });
+      clearVerification(ctx.db, record.sessionId, now);
+      enqueue(
+        ctx.db,
+        { kind: 'backup', sessionId: record.sessionId, payload: { encodedDir: record.encodedDir } },
+        now,
+      );
+      report.unverified++;
+      continue;
+    }
+
     if (!(await removeLocalCopy(ctx, onDisk, target))) {
       report.skipped++;
       continue;
@@ -251,6 +282,45 @@ export async function reapLocalCopies(
   }
 
   return report;
+}
+
+/**
+ * Do the files on disk still hash to what the archive holds?
+ *
+ * Returns null when every archived file is present with the same content and
+ * nothing has been added, or a description of the first difference. Every
+ * uncertainty — no manifest, an unreadable file — is a difference: the answer
+ * authorises deletion, so "I could not tell" has to mean no.
+ */
+async function describeDivergence(
+  ctx: WorkerContext,
+  record: SessionRecord,
+  onDisk: LocalSession,
+): Promise<string | null> {
+  const archived = decodeManifest(record.verifiedManifest);
+  if (archived.size === 0) return 'the archived file list is not recorded';
+
+  let current: ManifestFile[];
+  try {
+    current = await describeSessionFiles({
+      cwd: path.dirname(onDisk.transcriptPath),
+      entries: bundleEntries(onDisk),
+      ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+    });
+  } catch (err) {
+    return `the session could not be read: ${err instanceof Error ? err.message : 'unknown'}`;
+  }
+
+  const byPath = new Map(current.map((file) => [file.path, file.sha256]));
+  for (const [entryPath, hash] of archived) {
+    const now = byPath.get(entryPath);
+    if (now === undefined) return `${entryPath} is no longer on disk`;
+    if (now !== hash) return `${entryPath} is not the file that was archived`;
+  }
+  for (const file of current) {
+    if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
+  }
+  return null;
 }
 
 /** Hooks record a heartbeat while a session is open; this reads it back. */
