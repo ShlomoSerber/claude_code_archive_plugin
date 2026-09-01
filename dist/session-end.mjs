@@ -295,6 +295,16 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN verified_transcript_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_sidecar_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_bundle_bytes INTEGER;
+  `,
+  // 6 — the file list of the archived copy.
+  //
+  // Retiring a bundle was gated on three integer comparisons: transcript bytes,
+  // sidecar bytes, total bytes. Sizes are not containment. One sidecar file
+  // removed and a larger one added passes every size check while the archived
+  // subagent transcript exists nowhere else. This column lets the retire gate
+  // prove the old bundle's contents are still present in the new one.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -1530,6 +1540,10 @@ function enqueue(db, args, now) {
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         -- A block leaves the claim's visibility timeout in place, so without this
+         -- an unblocked job stayed invisible for up to fifteen minutes and
+         -- /archive:now appeared to have done nothing.
+         visible_at  = CASE WHEN ? THEN 0 ELSE jobs.visible_at END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -1537,7 +1551,17 @@ function enqueue(db, args, now) {
          upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
-  ).get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0);
+  ).get(
+    key,
+    args.kind,
+    sessionId,
+    payload,
+    notBefore,
+    now,
+    now,
+    args.unblock === true ? 1 : 0,
+    args.unblock === true ? 1 : 0
+  );
   return row?.id ?? 0;
 }
 

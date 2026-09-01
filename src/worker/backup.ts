@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createBundle, describeSessionFiles, verifyBundleContents } from '../adapters/bundle.ts';
 import { bundleEntries, statSession, type LocalSession } from '../adapters/session-scan.ts';
 import { extractFromFile } from '../adapters/transcript-file.ts';
-import { sha256File } from '../adapters/hashing.ts';
+import { sha256File, sha256Prefix } from '../adapters/hashing.ts';
 import {
   markBundled,
   getSession,
@@ -14,7 +14,7 @@ import {
   upsertSession,
 } from '../core/catalog.ts';
 import { FatalError, RetryableError } from '../core/errors.ts';
-import { buildManifest } from '../core/manifest.ts';
+import { buildManifest, type ManifestFile } from '../core/manifest.ts';
 import { bundleBaseName, isoDate, isoYear } from '../core/slug.ts';
 import type { Job } from '../core/queue.ts';
 import type { RemoteFile } from '../ports/drive.ts';
@@ -348,6 +348,7 @@ async function publish(
       sidecarBytes: archivedSidecar,
       bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
+      manifest: encodeManifest(files),
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
       // separately opens a window in which a live session appends between the
@@ -364,14 +365,20 @@ async function publish(
   // The shrink guard should already have stopped anything smaller reaching
   // here. This is the second lock on the door: retiring the previous archive is
   // the one remaining act in this codebase that can make data unrecoverable.
-  const grewEverywhere =
-    hasAllFloors(previous) &&
-    describeShrink(previous, {
-      transcript: archivedTranscript,
-      sidecar: archivedSidecar,
-      total: archivedBytes,
-    }) === null;
-  if (supersededId !== null && supersededId !== remote.id && sameProject && grewEverywhere) {
+  // Retiring the previous archive is the only operation left in this codebase
+  // that can make data unrecoverable, so it demands proof that the new bundle
+  // contains the old one — not merely that it is bigger. Three integer
+  // comparisons let one sidecar file be swapped for a larger one, and the
+  // archived subagent transcript then existed nowhere.
+  const contains = await describeContainment(ctx, session, previous, files);
+  if (contains !== null) {
+    ctx.logger.warn('backup.superseded_kept', {
+      session_id: session.sessionId,
+      file_id: supersededId ?? '',
+      reason: contains,
+    });
+  }
+  if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
     try {
       // Trashed, not deleted. This bundle was a good archive a moment ago, and
       // every chain that has destroyed data in this codebase ended with a
@@ -437,6 +444,70 @@ export async function verifyRemote(
  * bundle on the strength of a floor we do not have is how a complete archive
  * ends up in the wastebasket with nothing pointing at it.
  */
+/** `[[path, sha256], …]`, the compact form stored on the row. */
+export function encodeManifest(files: ManifestFile[]): string {
+  return JSON.stringify(files.map((file) => [file.path, file.sha256]));
+}
+
+export function decodeManifest(encoded: string | null): Map<string, string> {
+  const out = new Map<string, string>();
+  if (encoded === null) return out;
+  try {
+    const parsed: unknown = JSON.parse(encoded);
+    if (!Array.isArray(parsed)) return out;
+    for (const entry of parsed) {
+      if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string') {
+        out.set(entry[0], entry[1]);
+      }
+    }
+  } catch {
+    // A row written by something else, or corrupted: treated as "unknown",
+    // which the caller reads as "do not retire".
+  }
+  return out;
+}
+
+/**
+ * Is everything the archived bundle held still present in what we just built?
+ *
+ * Returns null when containment is proved, or a reason when it is not. Every
+ * uncertainty is a reason: an unknown manifest, an unreadable prefix, a missing
+ * hash. The cost of refusing is a bundle left on Drive; the cost of a wrong yes
+ * is the only copy of a conversation.
+ */
+export async function describeContainment(
+  ctx: WorkerContext,
+  session: LocalSession,
+  previous: SessionRecord | null,
+  files: ManifestFile[],
+): Promise<string | null> {
+  if (!hasAllFloors(previous) || previous === null)
+    return 'the archived copy is not fully described';
+
+  const archived = decodeManifest(previous.verifiedManifest);
+  if (archived.size === 0) return 'the archived file list is not recorded';
+
+  const current = new Map(files.map((file) => [file.path, file.sha256]));
+  const transcript = `${session.sessionId}.jsonl`;
+
+  for (const [entryPath, hash] of archived) {
+    if (entryPath === transcript) continue;
+    const now = current.get(entryPath);
+    if (now === undefined) return `${entryPath} is no longer present`;
+    if (now !== hash) return `${entryPath} has different content`;
+  }
+
+  // The transcript is allowed to have grown, and only to have grown: its first
+  // N bytes must still hash to what was archived.
+  const floor = previous.verifiedTranscriptBytes;
+  const expected = previous.verifiedTranscriptSha256;
+  if (floor === null || expected === null) return 'the archived transcript is not described';
+  const prefix = await sha256Prefix(session.transcriptPath, floor, ctx.signal);
+  if (prefix === null) return 'the transcript is shorter than the archived one';
+  if (prefix !== expected) return 'the transcript no longer begins with the archived content';
+  return null;
+}
+
 export function hasAllFloors(previous: SessionRecord | null): boolean {
   return (
     previous?.verifiedTranscriptBytes != null &&

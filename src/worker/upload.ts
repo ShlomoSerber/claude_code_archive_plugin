@@ -78,15 +78,15 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       return existing;
     }
     if (existing !== null) {
-      // Refuse rather than replace. This used to delete the remote file and
-      // then upload — permanently, since Drive's DELETE bypasses the
-      // wastebasket — which meant an interrupted upload destroyed the archived
-      // copy and left nothing. Bundle names now carry a hash of their contents,
-      // so a same-name mismatch is a genuine anomaly rather than the ordinary
-      // case of a session that changed.
-      throw new RetryableError(
-        `a different file already exists on Drive as ${args.name}; refusing to replace it`,
-      );
+      // A name carries a hash of its contents, so a same-name mismatch means
+      // the bytes on Drive are not what they claim to be — bit rot, or a
+      // half-written upload. Refusing outright made that permanent: every
+      // retry regenerates the same name and collides again, so the session
+      // could never be archived and the advice /archive:verify prints was a
+      // loop. Move the impostor to the wastebasket, where it stays recoverable
+      // for thirty days, and upload the real thing.
+      log.warn('upload.trashing_mismatched_remote', { file_id: existing.id });
+      await ctx.drive.trashFile(existing.id, ctx.signal);
     }
 
     uploadUri = await ctx.drive.startResumableUpload(

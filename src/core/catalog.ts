@@ -49,6 +49,8 @@ export type SessionRecord = {
   verifiedSidecarBytes: number | null;
   /** Bundle size Drive was confirmed to hold. Written only by markVerified. */
   verifiedBundleBytes: number | null;
+  /** JSON `[[path, sha256], …]` of the archived bundle. Only markVerified writes it. */
+  verifiedManifest: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -84,6 +86,7 @@ type SessionRow = {
   verified_transcript_bytes: number | null;
   verified_sidecar_bytes: number | null;
   verified_bundle_bytes: number | null;
+  verified_manifest: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -94,7 +97,7 @@ const SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, g
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
   verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
-  verified_bundle_bytes, created_at, updated_at`;
+  verified_bundle_bytes, verified_manifest, created_at, updated_at`;
 
 /** The fields extraction knows about. Backup and verification fill the rest. */
 export type SessionUpsert = {
@@ -254,6 +257,8 @@ export function markVerified(
     transcriptBytes: number | null;
     sidecarBytes: number | null;
     bundleBytes: number | null;
+    /** Compact file list of the archived bundle. */
+    manifest: string | null;
   },
   now: number,
 ): void {
@@ -262,7 +267,8 @@ export function markVerified(
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
             verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
-            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, updated_at = ?
+            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, verified_manifest = ?,
+            updated_at = ?
       WHERE session_id = ?`,
   ).run(
     remote.fileId,
@@ -276,6 +282,7 @@ export function markVerified(
     remote.transcriptBytes,
     remote.sidecarBytes,
     remote.bundleBytes,
+    remote.manifest,
     now,
     sessionId,
   );
@@ -448,6 +455,7 @@ export function toRecord(row: SessionRow): SessionRecord {
     verifiedTranscriptBytes: row.verified_transcript_bytes,
     verifiedSidecarBytes: row.verified_sidecar_bytes,
     verifiedBundleBytes: row.verified_bundle_bytes,
+    verifiedManifest: row.verified_manifest,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

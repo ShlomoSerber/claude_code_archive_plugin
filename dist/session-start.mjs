@@ -295,6 +295,16 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN verified_transcript_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_sidecar_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_bundle_bytes INTEGER;
+  `,
+  // 6 — the file list of the archived copy.
+  //
+  // Retiring a bundle was gated on three integer comparisons: transcript bytes,
+  // sidecar bytes, total bytes. Sizes are not containment. One sidecar file
+  // removed and a larger one added passes every size check while the archived
+  // subagent transcript exists nowhere else. This column lets the retire gate
+  // prove the old bundle's contents are still present in the new one.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;

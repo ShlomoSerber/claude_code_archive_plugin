@@ -1631,7 +1631,7 @@ describe('the fingerprint describes the bytes that were hashed', () => {
     const drive = harness.drive;
     const realEnsure = drive.ensureFolder.bind(drive);
     let rewritten = false;
-    drive.ensureFolder = async (segments) => {
+    drive.ensureFolder = (segments) => {
       if (!rewritten) {
         rewritten = true;
         const replacement = original.replace('bouncing', 'REPLACE!');
@@ -1716,7 +1716,7 @@ describe('the plugin keeps archiving', () => {
     assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt);
   });
 
-  it('does not wait out the backoff of a job that is failing', async () => {
+  it('does not wait out the backoff of a job that is failing', () => {
     // Waiting is for fresh work held back by a debounce. A retrying job must
     // keep its backoff, or one broken session spins the worker.
     const db = harnessDb();
@@ -1759,5 +1759,102 @@ describe('the plugin keeps archiving', () => {
     assert.ok(
       Math.max(ACTIVE_SESSION_TTL_MS, (DEFAULT_CONFIG.retentionDays + 7) * DAY_MS) > retention,
     );
+  });
+});
+
+/**
+ * Thirteenth round. Objective 1 survived 117 fuzz seeds — 1254 reaps, 3217
+ * verifications, 326 simulated mid-sweep worker kills — with zero violations.
+ * The break was on the retire path: three integer comparisons were standing in
+ * for a containment property, while the hash that proves it sat unused.
+ */
+describe('a bundle is retired only when the new one contains it', () => {
+  async function archivedWithAgent() {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+    return { harness, original: getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '' };
+  }
+
+  function touch(harness: Harness, id: string) {
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(id), later, later);
+    harness.clock.advance(60_000);
+  }
+
+  it('keeps the old bundle when a sidecar file is swapped for a larger one', async () => {
+    // Every size grew: the subagent transcript left, a bigger tool result
+    // arrived, the transcript was appended to. Sizes said "contains"; it did not.
+    const { harness, original } = await archivedWithAgent();
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    touch(harness, SESSION_B);
+
+    await runSweep(harness.ctx);
+    assert.equal(harness.drive.trashedIds.has(original), false, 'the old bundle is kept');
+    assert.equal(harness.drive.files.has(original), true);
+  });
+
+  it('keeps the old bundle when the transcript was rewritten rather than appended', async () => {
+    const { harness, original } = await archivedWithAgent();
+    const grown = '{"type":"user","content":"different history"}\n'.repeat(60);
+    fs.writeFileSync(harness.transcriptOf(SESSION_B), grown);
+    touch(harness, SESSION_B);
+
+    await runSweep(harness.ctx);
+    assert.equal(
+      harness.drive.trashedIds.has(original),
+      false,
+      'a transcript that no longer starts with the archived content is not a superset',
+    );
+  });
+
+  it('still retires the old bundle when the session genuinely grew', async () => {
+    // The guard must not simply refuse everything.
+    const { harness, original } = await archivedWithAgent();
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user","content":"more"}\n');
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-new.json'), '{"ok":true}');
+    touch(harness, SESSION_B);
+
+    await runSweep(harness.ctx);
+    const replacement = getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '';
+    assert.notEqual(replacement, original);
+    assert.equal(harness.drive.trashedIds.has(original), true, 'a true superset supersedes');
+  });
+
+  it('gets past a corrupt file on Drive instead of colliding with it for ever', async () => {
+    // Bundle names carry a content hash, so a same-name mismatch means bit rot.
+    // Refusing outright made that permanent: every retry regenerated the same
+    // name, and the advice /archive:verify prints was a loop.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    const stored = harness.drive.files.get(record?.remoteFileId ?? '');
+    assert.ok(stored);
+    stored.content = Buffer.concat([stored.content.subarray(0, 4), Buffer.from('rot!')]);
+    clearVerification(harness.ctx.db, SESSION_A, harness.clock.now());
+    harness.ctx.db
+      .prepare('UPDATE sessions SET verified_local_mtime = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+
+    harness.clock.advance(60_000);
+    const report = await runSweep(harness.ctx, { force: true, unblock: true });
+    assert.equal(report.blocked, 0, 'the session is not wedged behind its own name');
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, 'it is archived again');
+  });
+
+  it('makes an unblocked job claimable now, not in fifteen minutes', () => {
+    const db = harnessDb();
+    const id = enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
+    const job = claim(db, 1000, 900_000)!;
+    block(db, job, { error: 'sidecar unreadable', now: 1000 });
+
+    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 2000);
+    assert.ok(claim(db, 2000, 60_000), 'the retry runs now, not after the visibility timeout');
+    assert.equal(getJob(db, id)?.blocked, false);
   });
 });

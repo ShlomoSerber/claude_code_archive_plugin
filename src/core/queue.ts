@@ -92,6 +92,10 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         -- A block leaves the claim's visibility timeout in place, so without this
+         -- an unblocked job stayed invisible for up to fifteen minutes and
+         -- /archive:now appeared to have done nothing.
+         visible_at  = CASE WHEN ? THEN 0 ELSE jobs.visible_at END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -100,8 +104,17 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
          updated_at  = excluded.updated_at
        RETURNING id`,
     )
-    .get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0) as
-    { id: number } | undefined;
+    .get(
+      key,
+      args.kind,
+      sessionId,
+      payload,
+      notBefore,
+      now,
+      now,
+      args.unblock === true ? 1 : 0,
+      args.unblock === true ? 1 : 0,
+    ) as { id: number } | undefined;
   return row?.id ?? 0;
 }
 

@@ -1,5 +1,6 @@
 import { createHash, type Hash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
+import fsp from 'node:fs/promises';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { BugError } from '../core/errors.ts';
@@ -75,4 +76,29 @@ export function sha256OfBuffer(data: Uint8Array | string): string {
 
 export function md5OfBuffer(data: Uint8Array | string): string {
   return createHash('md5').update(data).digest('hex');
+}
+
+/**
+ * Hash the first `bytes` of a file.
+ *
+ * Used to prove a transcript still begins with the content that was archived:
+ * an append-only file that grew is an extension of its archive, and one that
+ * was rewritten is not. Sizes cannot tell those apart.
+ */
+export async function sha256Prefix(
+  file: string,
+  bytes: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (bytes <= 0) return null;
+  const handle = await fsp.open(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    signal?.throwIfAborted();
+    if (bytesRead < bytes) return null;
+    return createHash('sha256').update(buffer).digest('hex');
+  } finally {
+    await handle.close();
+  }
 }

@@ -203,6 +203,7 @@ export async function restoreSession(
           transcriptBytes: restored.transcriptBytes,
           sidecarBytes: restored.sidecarBytes,
           bundleBytes: record.verifiedBundleBytes,
+          manifest: record.verifiedManifest,
           bundleSha256: record.verifiedBundleSha256,
           transcriptSha256: record.verifiedTranscriptSha256,
         },

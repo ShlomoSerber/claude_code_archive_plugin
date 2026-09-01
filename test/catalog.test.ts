@@ -134,6 +134,7 @@ describe('the backup lifecycle', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       3000,
     );
@@ -163,6 +164,7 @@ describe('the backup lifecycle', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       3000,
     );
@@ -219,6 +221,7 @@ describe('listReapable', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       1,
     );
@@ -248,6 +251,7 @@ describe('listReapable', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       1,
     );
@@ -305,6 +309,7 @@ describe('listUnverified', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       1,
     );
@@ -351,6 +356,7 @@ describe('catalogStats', () => {
         transcriptBytes: 500,
         sidecarBytes: 100,
         bundleBytes: 120,
+        manifest: null,
       },
       1,
     );

@@ -294,6 +294,16 @@ var MIGRATIONS = [
   ALTER TABLE sessions ADD COLUMN verified_transcript_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_sidecar_bytes INTEGER;
   ALTER TABLE sessions ADD COLUMN verified_bundle_bytes INTEGER;
+  `,
+  // 6 — the file list of the archived copy.
+  //
+  // Retiring a bundle was gated on three integer comparisons: transcript bytes,
+  // sidecar bytes, total bytes. Sizes are not containment. One sidecar file
+  // removed and a larger one added passes every size check while the archived
+  // subagent transcript exists nowhere else. This column lets the retire gate
+  // prove the old bundle's contents are still present in the new one.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -2002,7 +2012,7 @@ function writeCache(file, found) {
 }
 
 // src/worker/sweep.ts
-import fsp11 from "node:fs/promises";
+import fsp12 from "node:fs/promises";
 import os4 from "node:os";
 import { createHash as createHash4, randomBytes as randomBytes4 } from "node:crypto";
 import path14 from "node:path";
@@ -2146,7 +2156,7 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
   verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
-  verified_bundle_bytes, created_at, updated_at`;
+  verified_bundle_bytes, verified_manifest, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -2244,7 +2254,8 @@ function markVerified(db, sessionId, remote, now) {
         SET remote_file_id = ?, remote_path = ?, backed_up_at = ?, verified_at = ?,
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
             verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
-            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, updated_at = ?
+            verified_sidecar_bytes = ?, verified_bundle_bytes = ?, verified_manifest = ?,
+            updated_at = ?
       WHERE session_id = ?`
   ).run(
     remote.fileId,
@@ -2258,6 +2269,7 @@ function markVerified(db, sessionId, remote, now) {
     remote.transcriptBytes,
     remote.sidecarBytes,
     remote.bundleBytes,
+    remote.manifest,
     now,
     sessionId
   );
@@ -2373,6 +2385,7 @@ function toRecord(row) {
     verifiedTranscriptBytes: row.verified_transcript_bytes,
     verifiedSidecarBytes: row.verified_sidecar_bytes,
     verifiedBundleBytes: row.verified_bundle_bytes,
+    verifiedManifest: row.verified_manifest,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2398,6 +2411,10 @@ function enqueue(db, args, now) {
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
          blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
+         -- A block leaves the claim's visibility timeout in place, so without this
+         -- an unblocked job stayed invisible for up to fifteen minutes and
+         -- /archive:now appeared to have done nothing.
+         visible_at  = CASE WHEN ? THEN 0 ELSE jobs.visible_at END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -2405,7 +2422,17 @@ function enqueue(db, args, now) {
          upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
-  ).get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0);
+  ).get(
+    key,
+    args.kind,
+    sessionId,
+    payload,
+    notBefore,
+    now,
+    now,
+    args.unblock === true ? 1 : 0,
+    args.unblock === true ? 1 : 0
+  );
   return row?.id ?? 0;
 }
 function claim(db, now, visibilityMs) {
@@ -2537,11 +2564,11 @@ function activeSessionKey(sessionId) {
 var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
-import fsp9 from "node:fs/promises";
+import fsp10 from "node:fs/promises";
 import path12 from "node:path";
 
 // src/adapters/bundle.ts
-import fsp7 from "node:fs/promises";
+import fsp8 from "node:fs/promises";
 import fs7 from "node:fs";
 import path11 from "node:path";
 import zlib from "node:zlib";
@@ -5520,6 +5547,7 @@ var To = (s3) => {
 // src/adapters/hashing.ts
 import { createHash as createHash2 } from "node:crypto";
 import { createReadStream } from "node:fs";
+import fsp7 from "node:fs/promises";
 import { Transform } from "node:stream";
 import { pipeline as pipeline2 } from "node:stream/promises";
 async function sha256File(file, signal) {
@@ -5554,13 +5582,26 @@ function createHashTee(algorithms = ["sha256", "md5"]) {
     bytes: () => seen
   };
 }
+async function sha256Prefix(file, bytes, signal) {
+  if (bytes <= 0) return null;
+  const handle = await fsp7.open(file, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    signal?.throwIfAborted();
+    if (bytesRead < bytes) return null;
+    return createHash2("sha256").update(buffer).digest("hex");
+  } finally {
+    await handle.close();
+  }
+}
 
 // src/adapters/bundle.ts
 var DEFAULT_ZSTD_LEVEL = 19;
 var TAR_READ_OPTIONS = { maxDecompressionRatio: Infinity };
 async function createBundle(input) {
   const level = input.compressionLevel ?? DEFAULT_ZSTD_LEVEL;
-  await fsp7.mkdir(path11.dirname(input.outputPath), { recursive: true });
+  await fsp8.mkdir(path11.dirname(input.outputPath), { recursive: true });
   const temp = siblingTempPath(input.outputPath);
   const tee = createHashTee();
   try {
@@ -5591,12 +5632,12 @@ async function createBundle(input) {
       compressionLevel: level
     };
   } catch (err) {
-    await fsp7.rm(temp, { force: true }).catch(() => void 0);
+    await fsp8.rm(temp, { force: true }).catch(() => void 0);
     throw err;
   }
 }
 async function fsyncPath(file) {
-  const handle = await fsp7.open(file, "r+");
+  const handle = await fsp8.open(file, "r+");
   try {
     await handle.sync();
   } finally {
@@ -5604,7 +5645,7 @@ async function fsyncPath(file) {
   }
 }
 async function extractBundle(args) {
-  await fsp7.mkdir(args.targetDir, { recursive: true });
+  await fsp8.mkdir(args.targetDir, { recursive: true });
   const entries = [];
   const rejected = [];
   await So({
@@ -5640,7 +5681,7 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
   const absolute = path11.join(cwd, relative);
   let stat;
   try {
-    stat = await fsp7.lstat(absolute);
+    stat = await fsp8.lstat(absolute);
   } catch (err) {
     if (optional && err.code === "ENOENT") return;
     throw err;
@@ -5654,7 +5695,7 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
     return;
   }
   if (!stat.isDirectory()) return;
-  const children = await fsp7.readdir(absolute);
+  const children = await fsp8.readdir(absolute);
   for (const child of children) {
     await describeInto(out, cwd, path11.join(relative, child), signal);
   }
@@ -6002,7 +6043,7 @@ function truncateUtf8(input, maxBytes) {
 }
 
 // src/worker/upload.ts
-import fsp8 from "node:fs/promises";
+import fsp9 from "node:fs/promises";
 async function uploadWithResume(ctx, args) {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? "", name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
@@ -6046,9 +6087,8 @@ async function uploadWithResume(ctx, args) {
       return existing;
     }
     if (existing !== null) {
-      throw new RetryableError(
-        `a different file already exists on Drive as ${args.name}; refusing to replace it`
-      );
+      log.warn("upload.trashing_mismatched_remote", { file_id: existing.id });
+      await ctx.drive.trashFile(existing.id, ctx.signal);
     }
     uploadUri = await ctx.drive.startResumableUpload(
       {
@@ -6064,7 +6104,7 @@ async function uploadWithResume(ctx, args) {
     setUploadUri(ctx.db, args.job, tagUploadUri(uploadUri, args.sha256), ctx.clock.now());
     confirmed = 0;
   }
-  const handle = await fsp8.open(args.filePath, "r");
+  const handle = await fsp9.open(args.filePath, "r");
   try {
     while (confirmed < args.totalBytes) {
       ctx.signal?.throwIfAborted();
@@ -6144,7 +6184,7 @@ async function backupSession(ctx, job, args) {
     log.info("backup.verified", { bytes: bundle.bytes, file_id: remote.id });
     return { status: "verified", bundleBytes: bundle.bytes, remoteFileId: remote.id };
   } finally {
-    await fsp9.rm(bundle.path, { force: true }).catch(() => void 0);
+    await fsp10.rm(bundle.path, { force: true }).catch(() => void 0);
   }
 }
 async function indexSession(ctx, session, now) {
@@ -6317,6 +6357,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       sidecarBytes: archivedSidecar,
       bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
+      manifest: encodeManifest(files),
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
       // separately opens a window in which a live session appends between the
@@ -6326,12 +6367,15 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  const grewEverywhere = hasAllFloors(previous) && describeShrink(previous, {
-    transcript: archivedTranscript,
-    sidecar: archivedSidecar,
-    total: archivedBytes
-  }) === null;
-  if (supersededId !== null && supersededId !== remote.id && sameProject && grewEverywhere) {
+  const contains = await describeContainment(ctx, session, previous, files);
+  if (contains !== null) {
+    ctx.logger.warn("backup.superseded_kept", {
+      session_id: session.sessionId,
+      file_id: supersededId ?? "",
+      reason: contains
+    });
+  }
+  if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
     try {
       await ctx.drive.trashFile(supersededId, ctx.signal);
     } catch (err) {
@@ -6354,6 +6398,45 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   clearVerification(ctx.db, sessionId, ctx.clock.now());
   await ctx.drive.trashFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
+}
+function encodeManifest(files) {
+  return JSON.stringify(files.map((file) => [file.path, file.sha256]));
+}
+function decodeManifest(encoded) {
+  const out = /* @__PURE__ */ new Map();
+  if (encoded === null) return out;
+  try {
+    const parsed = JSON.parse(encoded);
+    if (!Array.isArray(parsed)) return out;
+    for (const entry of parsed) {
+      if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string") {
+        out.set(entry[0], entry[1]);
+      }
+    }
+  } catch {
+  }
+  return out;
+}
+async function describeContainment(ctx, session, previous, files) {
+  if (!hasAllFloors(previous) || previous === null)
+    return "the archived copy is not fully described";
+  const archived = decodeManifest(previous.verifiedManifest);
+  if (archived.size === 0) return "the archived file list is not recorded";
+  const current = new Map(files.map((file) => [file.path, file.sha256]));
+  const transcript = `${session.sessionId}.jsonl`;
+  for (const [entryPath, hash] of archived) {
+    if (entryPath === transcript) continue;
+    const now = current.get(entryPath);
+    if (now === void 0) return `${entryPath} is no longer present`;
+    if (now !== hash) return `${entryPath} has different content`;
+  }
+  const floor = previous.verifiedTranscriptBytes;
+  const expected = previous.verifiedTranscriptSha256;
+  if (floor === null || expected === null) return "the archived transcript is not described";
+  const prefix = await sha256Prefix(session.transcriptPath, floor, ctx.signal);
+  if (prefix === null) return "the transcript is shorter than the archived one";
+  if (prefix !== expected) return "the transcript no longer begins with the archived content";
+  return null;
 }
 function hasAllFloors(previous) {
   return previous?.verifiedTranscriptBytes != null && previous.verifiedSidecarBytes !== null && previous.verifiedLocalBytes !== null && previous.verifiedTranscriptSha256 !== null;
@@ -6385,7 +6468,7 @@ function compareChecksums(remote, bundle) {
 }
 
 // src/worker/reap.ts
-import fsp10 from "node:fs/promises";
+import fsp11 from "node:fs/promises";
 import path13 from "node:path";
 async function reapLocalCopies(ctx, now) {
   const report = { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 };
@@ -6530,7 +6613,7 @@ async function removeLocalCopy(ctx, onDisk, target) {
   const log = ctx.logger.child({ session_id: onDisk.sessionId });
   if (onDisk.hasSidecar) {
     try {
-      await fsp10.rm(target.sidecarDir, { recursive: true, force: true });
+      await fsp11.rm(target.sidecarDir, { recursive: true, force: true });
     } catch (err) {
       log.warn("reap.sidecar_delete_failed", {}, err);
       return false;
@@ -6538,7 +6621,7 @@ async function removeLocalCopy(ctx, onDisk, target) {
   }
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      await fsp10.rm(target.transcriptPath, { force: true });
+      await fsp11.rm(target.transcriptPath, { force: true });
       return true;
     } catch (err) {
       const code = err.code;
@@ -6791,8 +6874,8 @@ function machineId(ctx) {
 async function uploadCatalogCopy(ctx) {
   const destination = path14.join(ctx.paths.stagingDir, "catalog.sqlite");
   try {
-    await fsp11.mkdir(ctx.paths.stagingDir, { recursive: true });
-    await fsp11.rm(destination, { force: true });
+    await fsp12.mkdir(ctx.paths.stagingDir, { recursive: true });
+    await fsp12.rm(destination, { force: true });
     await getSqlite().backup(ctx.db, destination);
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
     const cached2 = kvGet(ctx.db, KV.catalogFileId);
@@ -6803,7 +6886,7 @@ async function uploadCatalogCopy(ctx) {
         name: catalogFileName(machineId(ctx)),
         parentId,
         mimeType: "application/vnd.sqlite3",
-        body: await fsp11.readFile(destination),
+        body: await fsp12.readFile(destination),
         ...existing === void 0 ? {} : { replaceFileId: existing }
       },
       ctx.signal
@@ -6818,7 +6901,7 @@ async function uploadCatalogCopy(ctx) {
     ctx.logger.warn("catalog.upload_failed", {}, err);
     return false;
   } finally {
-    await fsp11.rm(destination, { force: true }).catch(() => void 0);
+    await fsp12.rm(destination, { force: true }).catch(() => void 0);
   }
 }
 function describe(err) {
@@ -6827,7 +6910,7 @@ function describe(err) {
 }
 
 // src/worker/status.ts
-import fsp12 from "node:fs/promises";
+import fsp13 from "node:fs/promises";
 function buildStatus(ctx, report) {
   const now = ctx.clock.now();
   return {
@@ -6860,7 +6943,7 @@ async function writeStatusFile(ctx, report) {
 }
 async function readStatusFile(file) {
   try {
-    const parsed = JSON.parse(await fsp12.readFile(file, "utf8"));
+    const parsed = JSON.parse(await fsp13.readFile(file, "utf8"));
     return typeof parsed === "object" && parsed !== null ? parsed : null;
   } catch {
     return null;
@@ -7353,7 +7436,7 @@ function addMonths(epochMs, months) {
 }
 
 // src/worker/restore.ts
-import fsp13 from "node:fs/promises";
+import fsp14 from "node:fs/promises";
 import path16 from "node:path";
 function isIncomplete(record, onDisk) {
   const smaller = (floor, current) => floor !== null && current < floor;
@@ -7391,7 +7474,7 @@ async function restoreSession(ctx, sessionId) {
           `the downloaded bundle does not match the catalog hash for ${sessionId}`
         );
       }
-      await fsp13.mkdir(recovery, { recursive: true });
+      await fsp14.mkdir(recovery, { recursive: true });
       const result = await extractBundle({
         bundlePath: staged2,
         targetDir: recovery,
@@ -7399,10 +7482,10 @@ async function restoreSession(ctx, sessionId) {
       });
       recovered = result.entries;
     } finally {
-      await fsp13.rm(staged2, { force: true }).catch(() => void 0);
+      await fsp14.rm(staged2, { force: true }).catch(() => void 0);
     }
     if (recovered.length === 0) {
-      await fsp13.rm(recovery, { recursive: true, force: true }).catch(() => void 0);
+      await fsp14.rm(recovery, { recursive: true, force: true }).catch(() => void 0);
       throw new RetryableError(`nothing could be recovered for ${sessionId}`);
     }
     ctx.logger.warn("restore.recovered_beside", {
@@ -7435,7 +7518,7 @@ async function restoreSession(ctx, sessionId) {
   }
   if (await isDirectory(path16.join(targetDir, sessionId))) {
     const aside = path16.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
-    await fsp13.rename(path16.join(targetDir, sessionId), aside).catch(() => void 0);
+    await fsp14.rename(path16.join(targetDir, sessionId), aside).catch(() => void 0);
     ctx.logger.warn("restore.sidecar_moved_aside", { session_id: sessionId, path: aside });
   }
   const remoteFileId = requireRemote(record);
@@ -7488,6 +7571,7 @@ async function restoreSession(ctx, sessionId) {
           transcriptBytes: restored.transcriptBytes,
           sidecarBytes: restored.sidecarBytes,
           bundleBytes: record.verifiedBundleBytes,
+          manifest: record.verifiedManifest,
           bundleSha256: record.verifiedBundleSha256,
           transcriptSha256: record.verifiedTranscriptSha256
         },
@@ -7505,7 +7589,7 @@ async function restoreSession(ctx, sessionId) {
       resumeCommand: resumeCommand(sessionId)
     };
   } finally {
-    await fsp13.rm(staged, { force: true }).catch(() => void 0);
+    await fsp14.rm(staged, { force: true }).catch(() => void 0);
   }
 }
 async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
@@ -7525,15 +7609,15 @@ async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
 }
 async function removePartialRestore(targetDir, sessionId, stamp) {
   const quarantine = path16.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
-  await fsp13.mkdir(quarantine, { recursive: true });
+  await fsp14.mkdir(quarantine, { recursive: true });
   for (const name of [`${sessionId}.jsonl`, sessionId]) {
-    await fsp13.rename(path16.join(targetDir, name), path16.join(quarantine, name)).catch(() => void 0);
+    await fsp14.rename(path16.join(targetDir, name), path16.join(quarantine, name)).catch(() => void 0);
   }
   return quarantine;
 }
 async function isDirectory(candidate) {
   try {
-    return (await fsp13.stat(candidate)).isDirectory();
+    return (await fsp14.stat(candidate)).isDirectory();
   } catch {
     return false;
   }
@@ -7696,11 +7780,11 @@ function resolveSessionId(runtime, query) {
 }
 
 // src/commands/setup.ts
-import fsp15 from "node:fs/promises";
+import fsp16 from "node:fs/promises";
 import path18 from "node:path";
 
 // src/adapters/claude-settings.ts
-import fsp14 from "node:fs/promises";
+import fsp15 from "node:fs/promises";
 import path17 from "node:path";
 async function readCleanupPeriodDays(file) {
   const read = await readSettings(file);
@@ -7752,7 +7836,7 @@ async function competingCleanupSettings(claudeDir) {
 async function readSettings(file) {
   let raw;
   try {
-    raw = await fsp14.readFile(file, "utf8");
+    raw = await fsp15.readFile(file, "utf8");
   } catch (err) {
     if (err.code === "ENOENT") return { status: "absent" };
     throw err;
@@ -7771,14 +7855,14 @@ async function readSettings(file) {
 }
 async function resolveLink(file) {
   try {
-    return await fsp14.realpath(file);
+    return await fsp15.realpath(file);
   } catch {
     return file;
   }
 }
 async function currentMode(file, fallback) {
   try {
-    return (await fsp14.stat(file)).mode & 511;
+    return (await fsp15.stat(file)).mode & 511;
   } catch {
     return fallback;
   }
@@ -7871,7 +7955,7 @@ async function importCatalogIfEmpty(runtime) {
     for (const remote of wanted) {
       await ctx.drive.downloadToFile({ fileId: remote.id, destination: staged }, ctx.signal);
       imported += importCatalogFile(runtime, staged);
-      await fsp15.rm(staged, { force: true }).catch(() => void 0);
+      await fsp16.rm(staged, { force: true }).catch(() => void 0);
     }
     return imported;
   } catch (err) {
@@ -7880,7 +7964,7 @@ async function importCatalogIfEmpty(runtime) {
     );
     return 0;
   } finally {
-    await fsp15.rm(staged, { force: true }).catch(() => void 0);
+    await fsp16.rm(staged, { force: true }).catch(() => void 0);
   }
 }
 function importCatalogFile(runtime, file) {
