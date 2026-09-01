@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { cleanPromptText, createExtractor, MAX_PROMPT_CHARS } from '../src/core/transcript.ts';
+import {
+  cleanPromptText,
+  createExtractor,
+  MAX_PROMPT_CHARS,
+  MAX_PROMPTS,
+} from '../src/core/transcript.ts';
 import { extractFromFile } from '../src/adapters/transcript-file.ts';
 import { tempDir } from './helpers.ts';
 
@@ -200,5 +205,30 @@ describe('extractFromFile', () => {
     const file = path.join(tempDir(), 'sess-crlf.jsonl');
     await fsp.writeFile(file, LINES.map((line) => JSON.stringify(line)).join('\r\n'), 'utf8');
     assert.equal((await extractFromFile(file)).prompts.length, 2);
+  });
+});
+
+describe('a session with more prompts than the cap', () => {
+  it('keeps the opening and the most recent, not the first thousand', () => {
+    // The later prompts are the ones a person remembers; keeping only the
+    // first N made a long session unsearchable by anything it ended with.
+    const extractor = createExtractor();
+    for (let index = 0; index < MAX_PROMPTS + 200; index++) {
+      extractor.pushLine(
+        JSON.stringify({
+          type: 'user',
+          userType: 'external',
+          message: { role: 'user', content: `prompt ${String(index)}` },
+        }),
+      );
+    }
+    const result = extractor.finish();
+    assert.equal(result.prompts.length, MAX_PROMPTS);
+    assert.equal(result.prompts[0]?.text, 'prompt 0', 'the opening survives');
+    assert.equal(
+      result.prompts[result.prompts.length - 1]?.text,
+      `prompt ${String(MAX_PROMPTS + 199)}`,
+      'and so does the end',
+    );
   });
 });

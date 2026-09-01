@@ -13,6 +13,8 @@
 /** Beyond this a prompt is an artefact of a paste, not something to index. */
 export const MAX_PROMPT_CHARS = 8_000;
 export const MAX_PROMPTS = 1_000;
+/** How much of the opening survives when a session outgrows the cap. */
+export const KEEP_FIRST_PROMPTS = 200;
 export const MAX_FILES = 500;
 
 export type ExtractedPrompt = {
@@ -118,7 +120,10 @@ export function createExtractor(): Extractor {
 
       const text = userPromptText(record);
       if (text === null) return;
-      if (prompts.length >= MAX_PROMPTS) return;
+      // Keep the opening and drop from the middle, rather than stopping at
+      // the cap: a long session's *later* prompts are the ones a person
+      // remembers, and keeping only the first N made them unsearchable.
+      if (prompts.length >= MAX_PROMPTS) prompts.splice(KEEP_FIRST_PROMPTS, 1);
       prompts.push({
         seq: prompts.length,
         ts: parseTimestamp(record['timestamp']),

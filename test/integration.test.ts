@@ -9,6 +9,9 @@ import { spawnWorker } from '../src/adapters/spawn-worker.ts';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import {
+  SESSION_COLUMNS,
+  toRecord,
+  type SessionRow,
   catalogStats,
   clearVerification,
   getSession,
@@ -2356,7 +2359,8 @@ describe('a hook that cannot even open the catalog', () => {
     );
 
     assert.equal(result.status, 0, 'a hook never disturbs the session');
-    const wrote = fs.existsSync(path.join(dataDir, 'hook-error.json'));
+    // Per hook, so one hook's success cannot erase the other's failure.
+    const wrote = fs.existsSync(path.join(dataDir, 'hook-error-end.json'));
     assert.ok(wrote, 'the failure is recorded where /archive:status reads it');
   });
 });
@@ -2416,3 +2420,83 @@ describe('a bundle the plugin kept', () => {
     );
   });
 });
+
+/**
+ * Twentieth round. Objective 1 held under 180 000 adversarial steps across 600
+ * seeds, with a direct assertion at every single retire that the doomed bundle
+ * held nothing unique. The findings were all about what the plugin can still
+ * find, and what it admits to.
+ */
+describe('what disaster recovery brings back', () => {
+  it('includes the bundles the plugin kept rather than replaced', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+    assert.equal(listRetainedBundles(harness.ctx.db).length, 1);
+
+    // The dead laptop's catalog, read on a replacement machine.
+    harness.clock.advance(25 * 60 * 60_000);
+    await runSweep(harness.ctx, { force: true });
+    const exported = harness.drive.fileByName(catalogFileName(machineId(harness.ctx)));
+    assert.ok(exported);
+    const fresh = makeHarness();
+    fresh.ctx.db.prepare('DELETE FROM sessions').run();
+    importCatalogFile({ db: () => fresh.ctx.db } as never, writeCatalogTo(exported.content));
+
+    const kept = listRetainedBundles(fresh.ctx.db);
+    assert.equal(kept.length, 1, 'a bundle holding data nothing else holds is still named');
+    assert.ok(kept[0]?.fileId, 'and can be fetched with /archive:resume --bundle');
+  });
+});
+
+describe('a Drive copy that went bad after the local one was deleted', () => {
+  it('is still reported on every verify, not just the first', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false, 'it was reclaimed');
+
+    // Bit rot on Drive, after the local copy is gone.
+    const record = getSession(harness.ctx.db, SESSION_A);
+    const stored = harness.drive.files.get(record?.remoteFileId ?? '');
+    assert.ok(stored);
+    stored.content = Buffer.concat([stored.content, Buffer.from('rot')]);
+
+    const first = await verifyArchive(harness.ctx, allArchivedRows(harness.ctx.db));
+    assert.equal(first.mismatched.length, 1);
+    assert.equal(
+      first.mismatched[0]?.localDeleted,
+      true,
+      'and it says there is nothing to re-send',
+    );
+
+    const second = await verifyArchive(harness.ctx, allArchivedRows(harness.ctx.db));
+    assert.equal(second.mismatched.length, 1, 'the damage does not disappear from the report');
+  });
+});
+
+/** The rows /archive:verify --all walks. */
+function allArchivedRows(db: ReturnType<typeof openDatabase>) {
+  const rows = db
+    .prepare(
+      `SELECT ${SESSION_COLUMNS} FROM sessions
+        WHERE remote_file_id IS NOT NULL
+          AND (verified_at IS NOT NULL OR local_deleted_at IS NOT NULL)`,
+    )
+    .all() as SessionRow[];
+  return rows.map(toRecord);
+}

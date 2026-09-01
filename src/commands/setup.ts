@@ -7,7 +7,13 @@ import {
   loginWithLoopback,
   resolveOAuthClient,
 } from '../adapters/google-auth.ts';
-import { catalogStats, SESSION_COLUMNS, toRecord, type SessionRow } from '../core/catalog.ts';
+import {
+  catalogStats,
+  recordRetainedBundle,
+  SESSION_COLUMNS,
+  toRecord,
+  type SessionRow,
+} from '../core/catalog.ts';
 import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
 import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
@@ -182,6 +188,15 @@ export async function importCatalogIfEmpty(runtime: Runtime): Promise<number> {
  * A second connection rather than `ATTACH`: the downloaded file is untrusted
  * input, and reading it read-only with no migrations keeps it that way.
  */
+/** A statement an older catalog may not support. Absence is not an error. */
+function tryPrepare(db: ReturnType<typeof openDatabase>, sql: string) {
+  try {
+    return db.prepare(sql);
+  } catch {
+    return null;
+  }
+}
+
 export function importCatalogFile(runtime: Runtime, file: string): number {
   const source = openDatabase(file, { readOnly: true, skipMigrations: true });
   const db = runtime.db();
@@ -221,6 +236,17 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
     );
     const selectPrompts = source.prepare('SELECT seq, ts, text FROM prompts WHERE session_id = ?');
     const selectFiles = source.prepare('SELECT path FROM session_files WHERE session_id = ?');
+    // A retained bundle is, by definition, one whose contents the newer bundle
+    // could not be proved to contain — so it holds data nothing else holds.
+    // The table travels inside the catalog copy; only this import ignored it,
+    // which left a replacement machine with no way to name or fetch them.
+    const selectRetained = available.has('session_id')
+      ? tryPrepare(
+          source,
+          `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
+             FROM retained_bundles WHERE session_id = ?`,
+        )
+      : null;
 
     for (const row of rows) {
       const record = toRecord(row);
@@ -256,6 +282,28 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
       }
       for (const item of selectFiles.all(record.sessionId) as { path: string }[]) {
         insertFile.run(record.sessionId, item.path);
+      }
+      for (const kept of (selectRetained?.all(record.sessionId) ?? []) as {
+        session_id: string;
+        file_id: string;
+        remote_path: string | null;
+        bundle_sha256: string | null;
+        manifest: string | null;
+        reason: string;
+        created_at: number;
+      }[]) {
+        recordRetainedBundle(
+          db,
+          {
+            sessionId: kept.session_id,
+            fileId: kept.file_id,
+            remotePath: kept.remote_path,
+            bundleSha256: kept.bundle_sha256,
+            manifest: kept.manifest,
+            reason: kept.reason,
+          },
+          kept.created_at,
+        );
       }
       // Only for a row this machine did not already have. The import runs on
       // every /archive:setup and downloads this machine's own catalog copy too,

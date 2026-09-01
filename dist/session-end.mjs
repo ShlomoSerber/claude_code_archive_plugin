@@ -1854,11 +1854,14 @@ function emitSystemMessage(message) {
 // src/hooks/last-resort.ts
 import fs5 from "node:fs";
 import path8 from "node:path";
-function clearLastResort() {
+function clearLastResort(event) {
   try {
-    fs5.rmSync(path8.join(resolvePaths(process.env).dataDir, "hook-error.json"), { force: true });
+    fs5.rmSync(path8.join(resolvePaths(process.env).dataDir, markerName(event)), { force: true });
   } catch {
   }
+}
+function markerName(event) {
+  return event.startsWith("hook.session_start") ? "hook-error-start.json" : "hook-error-end.json";
 }
 function logLastResort(event, err) {
   try {
@@ -1876,7 +1879,7 @@ function logLastResort(event, err) {
     fs5.appendFileSync(paths.logFile, `${line}
 `, { mode: 384 });
     fs5.writeFileSync(
-      path8.join(paths.dataDir, "hook-error.json"),
+      path8.join(paths.dataDir, markerName(event)),
       `${JSON.stringify({ at: Date.now(), event, message: line })}
 `,
       { mode: 384 }
@@ -2126,7 +2129,7 @@ function workerPath() {
 }
 try {
   await main();
-  clearLastResort();
+  clearLastResort("hook.session_end_failed");
 } catch (err) {
   logLastResort("hook.session_end_failed", err);
 }

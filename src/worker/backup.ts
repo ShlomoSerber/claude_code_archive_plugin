@@ -592,7 +592,11 @@ export function compareChecksums(
   remote: RemoteFile,
   bundle: { bytes: number; sha256: string; md5: string },
 ): string | null {
-  // The hash first. A size that disagrees with a matching hash is Drive
+  // Before anything else: a file in the wastebasket is not a copy, whatever
+  // its hash says. The size-versus-hash branch below returns early, and used
+  // to skip this.
+  if (remote.trashed === true) return 'the remote copy is in the wastebasket';
+  // Then the hash. A size that disagrees with a matching hash is Drive
   // contradicting itself, and answering that by trashing the file destroys a
   // copy that was provably correct.
   const sizeProblem =
@@ -610,7 +614,6 @@ export function compareChecksums(
   // Drive purges the wastebasket after thirty days, so a trashed file is not a
   // copy of anything. The reaper checks this before deleting; checking it here
   // too means a row is never marked verified against one.
-  if (remote.trashed === true) return 'the remote copy is in the wastebasket';
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : 'sha256 mismatch';
   }

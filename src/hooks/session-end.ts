@@ -108,7 +108,7 @@ function workerPath(): string {
 try {
   await main();
   // A run that finished means the last failure is history, not the state.
-  clearLastResort();
+  clearLastResort('hook.session_end_failed');
 } catch (err) {
   // Swallowed on purpose — the session must not care — but never silently:
   // this writes with node:fs alone, so it still works when the catalog is

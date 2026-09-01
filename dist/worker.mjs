@@ -5796,6 +5796,7 @@ import readline from "node:readline";
 // src/core/transcript.ts
 var MAX_PROMPT_CHARS = 8e3;
 var MAX_PROMPTS = 1e3;
+var KEEP_FIRST_PROMPTS = 200;
 var MAX_FILES = 500;
 function createExtractor() {
   let sessionId = null;
@@ -5860,7 +5861,7 @@ function createExtractor() {
       if (record["toolUseResult"] !== void 0) return;
       const text = userPromptText(record);
       if (text === null) return;
-      if (prompts.length >= MAX_PROMPTS) return;
+      if (prompts.length >= MAX_PROMPTS) prompts.splice(KEEP_FIRST_PROMPTS, 1);
       prompts.push({
         seq: prompts.length,
         ts: parseTimestamp(record["timestamp"]),
@@ -6551,6 +6552,7 @@ function describeShrink(previous, now) {
   return complaints.length === 0 ? null : complaints.join("; ");
 }
 function compareChecksums(remote, bundle) {
+  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   const sizeProblem = remote.size !== null && remote.size !== bundle.bytes ? `size ${String(remote.size)} != ${String(bundle.bytes)}` : null;
   if (sizeProblem !== null && remote.sha256 === null && remote.md5 === null) return sizeProblem;
   if (sizeProblem !== null) {
@@ -6558,7 +6560,6 @@ function compareChecksums(remote, bundle) {
     if (!hashAgrees) return sizeProblem;
     return null;
   }
-  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6653,7 +6654,6 @@ async function reapLocalCopies(ctx, now) {
     }
     if (remote === "blocked") {
       report.skipped++;
-      report.unconfirmable++;
       break;
     }
     if (remote === "unavailable") {

@@ -98,7 +98,10 @@ export function parseQuery(text: string, now: number): ParsedQuery {
       since = start;
       until = start + DAY_MS;
     }
-  } else if (isoMonth !== null) {
+  } else if (isoMonth !== null && plausibleYear(isoMonth[1])) {
+    // "3000-01" in a query is a version, a port range or an id, not a month.
+    // Reading it as one narrowed the search to a month with no matches and no
+    // indication that a date filter had been applied at all.
     const start = Date.parse(`${isoMonth[1] ?? ''}-${isoMonth[2] ?? ''}-01T00:00:00Z`);
     if (!Number.isNaN(start)) {
       since = start;
@@ -119,6 +122,12 @@ export function parseQuery(text: string, now: number): ParsedQuery {
   }
 
   return { terms: extractTerms(text), since, until };
+}
+
+/** Claude Code did not exist before 2023, and this is not a calendar app. */
+function plausibleYear(value: string | undefined): boolean {
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 2000 && year <= 2100;
 }
 
 export function extractTerms(text: string): string[] {

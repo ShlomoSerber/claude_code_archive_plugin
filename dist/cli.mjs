@@ -5993,6 +5993,7 @@ import readline from "node:readline";
 // src/core/transcript.ts
 var MAX_PROMPT_CHARS = 8e3;
 var MAX_PROMPTS = 1e3;
+var KEEP_FIRST_PROMPTS = 200;
 var MAX_FILES = 500;
 function createExtractor() {
   let sessionId = null;
@@ -6057,7 +6058,7 @@ function createExtractor() {
       if (record["toolUseResult"] !== void 0) return;
       const text = userPromptText(record);
       if (text === null) return;
-      if (prompts.length >= MAX_PROMPTS) return;
+      if (prompts.length >= MAX_PROMPTS) prompts.splice(KEEP_FIRST_PROMPTS, 1);
       prompts.push({
         seq: prompts.length,
         ts: parseTimestamp(record["timestamp"]),
@@ -6748,6 +6749,7 @@ function describeShrink(previous, now) {
   return complaints.length === 0 ? null : complaints.join("; ");
 }
 function compareChecksums(remote, bundle) {
+  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   const sizeProblem = remote.size !== null && remote.size !== bundle.bytes ? `size ${String(remote.size)} != ${String(bundle.bytes)}` : null;
   if (sizeProblem !== null && remote.sha256 === null && remote.md5 === null) return sizeProblem;
   if (sizeProblem !== null) {
@@ -6755,7 +6757,6 @@ function compareChecksums(remote, bundle) {
     if (!hashAgrees) return sizeProblem;
     return null;
   }
-  if (remote.trashed === true) return "the remote copy is in the wastebasket";
   if (remote.sha256 !== null) {
     return remote.sha256.toLowerCase() === bundle.sha256.toLowerCase() ? null : "sha256 mismatch";
   }
@@ -6850,7 +6851,6 @@ async function reapLocalCopies(ctx, now) {
     }
     if (remote === "blocked") {
       report.skipped++;
-      report.unconfirmable++;
       break;
     }
     if (remote === "unavailable") {
@@ -7645,7 +7645,7 @@ function parseQuery(text, now) {
       since = start;
       until = start + DAY_MS2;
     }
-  } else if (isoMonth !== null) {
+  } else if (isoMonth !== null && plausibleYear(isoMonth[1])) {
     const start = Date.parse(`${isoMonth[1] ?? ""}-${isoMonth[2] ?? ""}-01T00:00:00Z`);
     if (!Number.isNaN(start)) {
       since = start;
@@ -7665,6 +7665,10 @@ function parseQuery(text, now) {
     since = now - 366 * DAY_MS2;
   }
   return { terms: extractTerms(text), since, until };
+}
+function plausibleYear(value) {
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 2e3 && year <= 2100;
 }
 function extractTerms(text) {
   const quoted = [...text.matchAll(/"([^"]+)"/g)].map((match) => match[1] ?? "");
@@ -7848,11 +7852,16 @@ async function restoreRetainedBundle(ctx, fileId) {
   let entries = [];
   try {
     await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
-    if (retained.bundleSha256 !== null) {
-      const actual = await sha256File(staged, ctx.signal);
-      if (actual !== retained.bundleSha256) {
-        throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
-      }
+    const actual = await sha256File(staged, ctx.signal);
+    const expected = retained.bundleSha256 ?? await stampedSha256(ctx, fileId);
+    if (expected === null) {
+      throw new FatalError(
+        `no recorded hash for the retained bundle ${fileId}`,
+        "Download it from Drive by hand: it is a plain .tar.zst that tar and zstd can read."
+      );
+    }
+    if (actual !== expected) {
+      throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
     }
     await fsp14.mkdir(destination, { recursive: true });
     const result = await extractBundle({
@@ -7880,6 +7889,14 @@ async function restoreRetainedBundle(ctx, fileId) {
     recoveredTo: destination,
     resumeCommand: resumeCommand(record.sessionId)
   };
+}
+async function stampedSha256(ctx, fileId) {
+  try {
+    const remote = await ctx.drive.getFile(fileId, ctx.signal);
+    return remote.sha256;
+  } catch {
+    return null;
+  }
 }
 async function restoreSession(ctx, sessionId) {
   const record = getSession(ctx.db, sessionId);
@@ -8104,7 +8121,13 @@ async function verifyArchive(ctx, records) {
         report.ok++;
       } else {
         clearVerification(ctx.db, record.sessionId, ctx.clock.now());
-        report.mismatched.push({ sessionId: record.sessionId, reason });
+        report.mismatched.push({
+          sessionId: record.sessionId,
+          reason,
+          // No local copy means "run /archive:now" cannot be the advice: there
+          // is nothing left on this machine to upload.
+          localDeleted: !record.localPresent
+        });
       }
     } catch (err) {
       report.checked--;
@@ -8156,6 +8179,14 @@ function runSearch(runtime, options) {
   if (candidates.length === 0) {
     print("No sessions matched.");
     return 0;
+  }
+  if (prefilterTruncated(db, options.query, now, {
+    since: options.since ?? null,
+    until: options.until ?? null,
+    project: options.project ?? null
+  })) {
+    print("More sessions matched than were scanned \u2014 narrow with --since/--until.");
+    print();
   }
   for (const candidate of candidates) {
     const session = candidate.session;
@@ -8435,6 +8466,13 @@ async function importCatalogIfEmpty(runtime) {
     await fsp16.rm(staged, { force: true }).catch(() => void 0);
   }
 }
+function tryPrepare(db, sql) {
+  try {
+    return db.prepare(sql);
+  } catch {
+    return null;
+  }
+}
 function importCatalogFile(runtime, file) {
   const source = openDatabase(file, { readOnly: true, skipMigrations: true });
   const db = runtime.db();
@@ -8462,6 +8500,11 @@ function importCatalogFile(runtime, file) {
     );
     const selectPrompts = source.prepare("SELECT seq, ts, text FROM prompts WHERE session_id = ?");
     const selectFiles = source.prepare("SELECT path FROM session_files WHERE session_id = ?");
+    const selectRetained = available.has("session_id") ? tryPrepare(
+      source,
+      `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
+             FROM retained_bundles WHERE session_id = ?`
+    ) : null;
     for (const row of rows) {
       const record = toRecord(row);
       if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
@@ -8483,6 +8526,20 @@ function importCatalogFile(runtime, file) {
       }
       for (const item of selectFiles.all(record.sessionId)) {
         insertFile.run(record.sessionId, item.path);
+      }
+      for (const kept of selectRetained?.all(record.sessionId) ?? []) {
+        recordRetainedBundle(
+          db,
+          {
+            sessionId: kept.session_id,
+            fileId: kept.file_id,
+            remotePath: kept.remote_path,
+            bundleSha256: kept.bundle_sha256,
+            manifest: kept.manifest,
+            reason: kept.reason
+          },
+          kept.created_at
+        );
       }
       if (Number(inserted.changes) === 0) continue;
       db.prepare(
@@ -8506,9 +8563,9 @@ function importCatalogFile(runtime, file) {
 // src/commands/status.ts
 import fsp17 from "node:fs/promises";
 import path19 from "node:path";
-async function readHookError(dataDir) {
+async function readHookError(dataDir, file) {
   try {
-    const raw = await fsp17.readFile(path19.join(dataDir, "hook-error.json"), "utf8");
+    const raw = await fsp17.readFile(path19.join(dataDir, file), "utf8");
     const parsed = JSON.parse(raw);
     const message = parsed?.message;
     if (typeof message !== "string") return null;
@@ -8536,7 +8593,12 @@ async function runStatus(runtime, options) {
   const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
   const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
   const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 6e4;
-  const hookError = await readHookError(runtime.paths.dataDir);
+  const hookError = (await Promise.all([
+    readHookError(runtime.paths.dataDir, "hook-error-end.json"),
+    readHookError(runtime.paths.dataDir, "hook-error-start.json")
+  ])).filter((entry) => entry !== null).join("; ");
+  const sweepNeverRan = stats.sessions > 0 && lastSweepAt === null;
+  const sweepStale = lastSweepAt !== null && stats.pendingBackup > 0 && now - lastSweepAt > 3 * DAY_MS;
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
@@ -8563,7 +8625,9 @@ async function runStatus(runtime, options) {
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
-      hookError,
+      hookError: hookError === "" ? null : hookError,
+      sweepNeverRan,
+      sweepStale,
       reapBlocked: reapBlocked === "" ? null : reapBlocked,
       retainedBundles: retained.map((entry) => ({
         sessionId: entry.sessionId,
@@ -8631,8 +8695,15 @@ async function runStatus(runtime, options) {
     print(`  WARNING:            the background worker was started but never ran.`);
     print(`                      Nothing is being archived. Run /archive:now and check the log.`);
   }
-  if (hookError !== null) {
+  if (hookError !== "") {
     print(`  WARNING:            a hook failed: ${hookError}`);
+  }
+  if (sweepNeverRan) {
+    print(`  WARNING:            no sweep has ever finished, though sessions are known.`);
+    print(`                      Nothing is being archived. Run /archive:now.`);
+  } else if (sweepStale) {
+    print(`  WARNING:            sessions are waiting and the last finished sweep was`);
+    print(`                      ${formatRelative(lastSweepAt, now)}. Run /archive:now.`);
   }
   if (reapBlocked !== "") {
     print(`  WARNING:            Drive would not answer the last check:`);
@@ -8705,7 +8776,15 @@ async function runVerify(runtime, options = {}) {
     for (const item of report.mismatched.slice(0, 10)) {
       print(`  ${item.sessionId}: ${item.reason}`);
     }
-    print("Run /archive:now to re-upload the sessions that failed.");
+    const gone = report.mismatched.filter((item) => item.localDeleted);
+    if (gone.length > 0) {
+      print(`${String(gone.length)} of those have no local copy left to re-upload.`);
+      print("For those, /archive:status lists any older bundle that was kept:");
+      print("  /archive:resume --bundle <file id>");
+    }
+    if (gone.length < report.mismatched.length) {
+      print("Run /archive:now to re-upload the sessions that still have a local copy.");
+    }
     return 1;
   }
   if (pending > 0) print("Some sessions are still waiting to be archived \u2014 run /archive:now.");
@@ -8714,16 +8793,18 @@ async function runVerify(runtime, options = {}) {
 function sampleArchived(runtime, limit) {
   const rows = runtime.db().prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY verified_at DESC LIMIT ?`
+        WHERE remote_file_id IS NOT NULL
+          AND (verified_at IS NOT NULL OR local_deleted_at IS NOT NULL)
+        ORDER BY COALESCE(verified_at, local_deleted_at) DESC LIMIT ?`
   ).all(limit);
   return rows.map(toRecord);
 }
 function allArchived(runtime) {
   const rows = runtime.db().prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY verified_at ASC`
+        WHERE remote_file_id IS NOT NULL
+          AND (verified_at IS NOT NULL OR local_deleted_at IS NOT NULL)
+        ORDER BY COALESCE(verified_at, local_deleted_at) ASC`
   ).all();
   return rows.map(toRecord);
 }

@@ -209,3 +209,18 @@ describe('queries that are not in English', () => {
     assert.deepEqual(extractTerms('fix the auth redirect'), ['fix', 'auth', 'redirect']);
   });
 });
+
+describe('a number that is not a date', () => {
+  it('does not narrow the search to a month', () => {
+    // "3000-01" is a version or an id. Reading it as a month collapsed the
+    // results to zero with nothing saying a date filter had been applied.
+    const parsed = parseQuery('that 3000-01 thing', Date.UTC(2026, 7, 31));
+    assert.equal(parsed.since, null);
+    assert.equal(parsed.until, null);
+  });
+
+  it('still reads a real month', () => {
+    const parsed = parseQuery('the auth work in 2026-08', Date.UTC(2026, 7, 31));
+    assert.equal(parsed.since, Date.UTC(2026, 7, 1));
+  });
+});

@@ -165,8 +165,10 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       // Whatever is wrong is wrong for every session, so asking again for each
       // of the other two hundred just burns quota against a Drive that is
       // already refusing us.
+      // Not counted as one unconfirmable session: the fault is not this
+      // session's, and reporting "1 could not be confirmed" when it is all of
+      // them understates it. blockedReason carries the real signal.
       report.skipped++;
-      report.unconfirmable++;
       break;
     }
     if (remote === 'unavailable') {

@@ -52,6 +52,18 @@ export function runSearch(runtime: Runtime, options: SearchOptions): number {
     print('No sessions matched.');
     return 0;
   }
+  if (
+    prefilterTruncated(db, options.query, now, {
+      since: options.since ?? null,
+      until: options.until ?? null,
+      project: options.project ?? null,
+    })
+  ) {
+    // The scan orders by recency, so older matches were cut. Rewording will
+    // not reach them; narrowing the window will.
+    print('More sessions matched than were scanned — narrow with --since/--until.');
+    print();
+  }
   for (const candidate of candidates) {
     const session = candidate.session;
     print(`${formatDate(session.endedAt ?? session.startedAt)}  ${session.title ?? '(untitled)'}`);

@@ -82,7 +82,7 @@ function workerPath(): string {
 try {
   await main();
   // A run that finished means the last failure is history, not the state.
-  clearLastResort();
+  clearLastResort('hook.session_start_failed');
 } catch (err) {
   // Never let a hook disturb a session that is just starting — but never
   // silently: see last-resort.ts.

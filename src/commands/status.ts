@@ -3,7 +3,7 @@ import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGet, kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
 import { competingCleanupSettings, readCleanupPeriodDays } from '../adapters/claude-settings.ts';
-import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
+import { CLEANUP_PERIOD_DAYS, DAY_MS } from '../core/config.ts';
 import { readStatusFile } from '../worker/status.ts';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -17,9 +17,9 @@ import { formatBytes, formatDate, formatRelative, print, printJson } from './out
  * the network unless the user asks for the Drive quota.
  */
 /** The line a hook wrote when it could not even open the catalog. */
-async function readHookError(dataDir: string): Promise<string | null> {
+async function readHookError(dataDir: string, file: string): Promise<string | null> {
   try {
-    const raw = await fsp.readFile(path.join(dataDir, 'hook-error.json'), 'utf8');
+    const raw = await fsp.readFile(path.join(dataDir, file), 'utf8');
     const parsed = JSON.parse(raw) as { message?: unknown; at?: unknown } | null;
     const message = parsed?.message;
     if (typeof message !== 'string') return null;
@@ -53,7 +53,19 @@ export async function runStatus(
   // A worker that dies on its first line looks exactly like a healthy one:
   // spawn() succeeds because the interpreter exists, and stdio is discarded.
   const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 60_000;
-  const hookError = await readHookError(runtime.paths.dataDir);
+  const hookError = (
+    await Promise.all([
+      readHookError(runtime.paths.dataDir, 'hook-error-end.json'),
+      readHookError(runtime.paths.dataDir, 'hook-error-start.json'),
+    ])
+  )
+    .filter((entry): entry is string => entry !== null)
+    .join('; ');
+  // A sweep that throws leaves lastSweepAt unwritten. Without this the page is
+  // clean while nothing has ever been archived.
+  const sweepNeverRan = stats.sessions > 0 && lastSweepAt === null;
+  const sweepStale =
+    lastSweepAt !== null && stats.pendingBackup > 0 && now - lastSweepAt > 3 * DAY_MS;
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore
     .read()
@@ -86,7 +98,9 @@ export async function runStatus(
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
-      hookError,
+      hookError: hookError === '' ? null : hookError,
+      sweepNeverRan,
+      sweepStale,
       reapBlocked: reapBlocked === '' ? null : reapBlocked,
       retainedBundles: retained.map((entry) => ({
         sessionId: entry.sessionId,
@@ -159,8 +173,15 @@ export async function runStatus(
     print(`  WARNING:            the background worker was started but never ran.`);
     print(`                      Nothing is being archived. Run /archive:now and check the log.`);
   }
-  if (hookError !== null) {
+  if (hookError !== '') {
     print(`  WARNING:            a hook failed: ${hookError}`);
+  }
+  if (sweepNeverRan) {
+    print(`  WARNING:            no sweep has ever finished, though sessions are known.`);
+    print(`                      Nothing is being archived. Run /archive:now.`);
+  } else if (sweepStale) {
+    print(`  WARNING:            sessions are waiting and the last finished sweep was`);
+    print(`                      ${formatRelative(lastSweepAt, now)}. Run /archive:now.`);
   }
   if (reapBlocked !== '') {
     // The remediation Drive's refusal came with. It used to be swallowed here,

@@ -44,7 +44,15 @@ export async function runVerify(
     for (const item of report.mismatched.slice(0, 10)) {
       print(`  ${item.sessionId}: ${item.reason}`);
     }
-    print('Run /archive:now to re-upload the sessions that failed.');
+    const gone = report.mismatched.filter((item) => item.localDeleted);
+    if (gone.length > 0) {
+      print(`${String(gone.length)} of those have no local copy left to re-upload.`);
+      print('For those, /archive:status lists any older bundle that was kept:');
+      print('  /archive:resume --bundle <file id>');
+    }
+    if (gone.length < report.mismatched.length) {
+      print('Run /archive:now to re-upload the sessions that still have a local copy.');
+    }
     return 1;
   }
   if (pending > 0) print('Some sessions are still waiting to be archived — run /archive:now.');
@@ -57,8 +65,9 @@ function sampleArchived(runtime: Runtime, limit: number): SessionRecord[] {
     .db()
     .prepare(
       `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY verified_at DESC LIMIT ?`,
+        WHERE remote_file_id IS NOT NULL
+          AND (verified_at IS NOT NULL OR local_deleted_at IS NOT NULL)
+        ORDER BY COALESCE(verified_at, local_deleted_at) DESC LIMIT ?`,
     )
     .all(limit) as SessionRow[];
   return rows.map(toRecord);
@@ -67,10 +76,15 @@ function sampleArchived(runtime: Runtime, limit: number): SessionRecord[] {
 function allArchived(runtime: Runtime): SessionRecord[] {
   const rows = runtime
     .db()
+    // Rows whose verification was withdrawn are included when the local copy
+    // is already gone. Excluding them meant a damaged bundle was reported once
+    // and then never again — and that session has no local copy to re-archive,
+    // so nothing else would ever notice.
     .prepare(
       `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY verified_at ASC`,
+        WHERE remote_file_id IS NOT NULL
+          AND (verified_at IS NOT NULL OR local_deleted_at IS NOT NULL)
+        ORDER BY COALESCE(verified_at, local_deleted_at) ASC`,
     )
     .all() as SessionRow[];
   return rows.map(toRecord);

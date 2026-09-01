@@ -86,11 +86,21 @@ export async function restoreRetainedBundle(
   let entries: string[] = [];
   try {
     await ctx.drive.downloadToFile({ fileId, destination: staged }, ctx.signal);
-    if (retained.bundleSha256 !== null) {
-      const actual = await sha256File(staged, ctx.signal);
-      if (actual !== retained.bundleSha256) {
-        throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
-      }
+    const actual = await sha256File(staged, ctx.signal);
+    // The catalog's hash when it has one. A row recovered from an older
+    // catalog may not, and unpacking unchecked bytes beside a live session —
+    // then telling the user to "remove whichever you do not want" — is not a
+    // position to put them in. Drive stamps the hash into appProperties at
+    // upload time, so there is a second source.
+    const expected = retained.bundleSha256 ?? (await stampedSha256(ctx, fileId));
+    if (expected === null) {
+      throw new FatalError(
+        `no recorded hash for the retained bundle ${fileId}`,
+        'Download it from Drive by hand: it is a plain .tar.zst that tar and zstd can read.',
+      );
+    }
+    if (actual !== expected) {
+      throw new RetryableError(`the retained bundle ${fileId} does not match its recorded hash`);
     }
     await fsp.mkdir(destination, { recursive: true });
     const result = await extractBundle({
@@ -118,6 +128,16 @@ export async function restoreRetainedBundle(
     recoveredTo: destination,
     resumeCommand: resumeCommand(record.sessionId),
   };
+}
+
+/** The sha256 the uploader stamped on the file, when the catalog lacks one. */
+async function stampedSha256(ctx: WorkerContext, fileId: string): Promise<string | null> {
+  try {
+    const remote = await ctx.drive.getFile(fileId, ctx.signal);
+    return remote.sha256;
+  } catch {
+    return null;
+  }
 }
 
 export async function restoreSession(
@@ -401,7 +421,7 @@ export function resumeCommand(sessionId: string): string {
 export type VerifyReport = {
   checked: number;
   ok: number;
-  mismatched: { sessionId: string; reason: string }[];
+  mismatched: { sessionId: string; reason: string; localDeleted: boolean }[];
   missing: string[];
   /** Rows Drive could not be asked about. Not a verdict, and not a failure. */
   unchecked: { sessionId: string; reason: string }[];
@@ -444,7 +464,13 @@ export async function verifyArchive(
         // what stops the reaper deleting a local copy against a bundle Drive
         // no longer holds intact.
         clearVerification(ctx.db, record.sessionId, ctx.clock.now());
-        report.mismatched.push({ sessionId: record.sessionId, reason });
+        report.mismatched.push({
+          sessionId: record.sessionId,
+          reason,
+          // No local copy means "run /archive:now" cannot be the advice: there
+          // is nothing left on this machine to upload.
+          localDeleted: !record.localPresent,
+        });
       }
     } catch (err) {
       // Drive did not answer. That is a statement about the network, not about
