@@ -2296,6 +2296,13 @@ function block(db, job, args) {
 function setUploadUri(db, job, uri, now) {
   db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?").run(uri, now, job.id);
 }
+function nextRunnableAt(db, now) {
+  const row = db.prepare(
+    `SELECT min(not_before) AS at FROM jobs
+        WHERE blocked = 0 AND attempts = 0 AND visible_at <= ?`
+  ).get(now);
+  return row?.at ?? null;
+}
 function listJobs(db) {
   const rows = db.prepare(`SELECT ${JOB_COLUMNS} FROM jobs ORDER BY not_before ASC, id ASC`).all();
   return rows.map(toJob);
@@ -6293,7 +6300,8 @@ async function reapLocalCopies(ctx, now) {
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
   if (seen === void 0) return false;
-  return now - seen < ACTIVE_SESSION_TTL_MS;
+  const ttl = Math.max(ACTIVE_SESSION_TTL_MS, (ctx.config.retentionDays + 7) * DAY_MS);
+  return now - seen < ttl;
 }
 function safeTarget(ctx, record) {
   if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) return null;
@@ -6394,7 +6402,7 @@ async function runSweep(ctx, options = {}) {
   }
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info("sweep.removed_partials", { count: removed.length });
-  const discovery = await discover(ctx, startedAt);
+  const discovery = await discover(ctx, startedAt, options.unblock === true);
   report.discovered = discovery.discovered;
   report.enqueued = discovery.enqueued;
   const deadline = startedAt + ctx.config.workerBudgetMs;
@@ -6418,7 +6426,7 @@ async function runSweep(ctx, options = {}) {
   });
   return report;
 }
-async function discover(ctx, now) {
+async function discover(ctx, now, unblock) {
   let discovered = 0;
   let enqueued = 0;
   const skipped = [];
@@ -6450,7 +6458,8 @@ async function discover(ctx, now) {
         {
           kind: "backup",
           sessionId: session.sessionId,
-          payload: { encodedDir: session.encodedDir }
+          payload: { encodedDir: session.encodedDir },
+          ...unblock ? { unblock: true } : {}
         },
         now
       );
@@ -6479,7 +6488,14 @@ async function drain(ctx, deadline, report) {
     if (now >= deadline) return { budgetExhausted: true };
     ctx.signal?.throwIfAborted();
     const job = claim(ctx.db, now, ctx.config.jobVisibilityMs);
-    if (job === null) return { budgetExhausted: false };
+    if (job === null) {
+      const soonest = nextRunnableAt(ctx.db, now);
+      if (soonest !== null && soonest - now <= DEBOUNCE_WAIT_MS && soonest < deadline) {
+        await ctx.clock.sleep(Math.max(0, soonest - now));
+        continue;
+      }
+      return { budgetExhausted: false };
+    }
     report.processed++;
     try {
       await runJob(ctx, job, report);
@@ -6573,6 +6589,7 @@ function clockLooksSane(ctx, now) {
   }
   return true;
 }
+var DEBOUNCE_WAIT_MS = 6e4;
 var LOCAL_FAILURE_LIMIT = 5;
 var CATALOG_REFRESH_MS = 24 * 36e5;
 function catalogCopyIsStale(ctx) {

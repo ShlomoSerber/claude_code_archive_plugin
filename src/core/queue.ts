@@ -194,6 +194,23 @@ export function setUploadUri(db: Db, job: Job, uri: string | null, now: number):
   db.prepare('UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ?').run(uri, now, job.id);
 }
 
+/**
+ * When the next job becomes claimable, or null if none ever will.
+ *
+ * Only jobs that have never been attempted count. A worker should wait out the
+ * debounce on work a hook just enqueued, and must never wait out the backoff on
+ * a job that is failing — that delay exists to space attempts apart.
+ */
+export function nextRunnableAt(db: Db, now: number): number | null {
+  const row = db
+    .prepare(
+      `SELECT min(not_before) AS at FROM jobs
+        WHERE blocked = 0 AND attempts = 0 AND visible_at <= ?`,
+    )
+    .get(now) as { at: number | null } | undefined;
+  return row?.at ?? null;
+}
+
 export function getJob(db: Db, id: number): Job | null {
   const row = db.prepare(`SELECT ${JOB_COLUMNS} FROM jobs WHERE id = ?`).get(id) as
     JobRow | undefined;

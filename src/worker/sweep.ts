@@ -15,6 +15,7 @@ import {
   countJobs,
   enqueue,
   block,
+  nextRunnableAt,
   retryLater,
   parsePayload,
   type Job,
@@ -57,6 +58,14 @@ export type SweepReport = {
 export type SweepOptions = {
   /** Ignore the minimum interval and the circuit breaker. */
   force?: boolean;
+  /**
+   * Retry jobs that were parked for a person to look at.
+   *
+   * Set by `/archive:now`, which is what every remediation message tells the
+   * user to run. A background sweep never sets it, so a fault nobody has fixed
+   * is not retried every ten minutes for ever.
+   */
+  unblock?: boolean;
   /** Enqueue every unarchived session, not just the ones seen since last time. */
   backfill?: boolean;
 };
@@ -100,7 +109,7 @@ export async function runSweep(
   const removed = await removePartials(ctx.paths.stagingDir);
   if (removed.length > 0) ctx.logger.info('sweep.removed_partials', { count: removed.length });
 
-  const discovery = await discover(ctx, startedAt);
+  const discovery = await discover(ctx, startedAt, options.unblock === true);
   report.discovered = discovery.discovered;
   report.enqueued = discovery.enqueued;
 
@@ -138,6 +147,7 @@ export async function runSweep(
 async function discover(
   ctx: WorkerContext,
   now: number,
+  unblock: boolean,
 ): Promise<{ discovered: number; enqueued: number }> {
   let discovered = 0;
   let enqueued = 0;
@@ -180,6 +190,7 @@ async function discover(
           kind: 'backup',
           sessionId: session.sessionId,
           payload: { encodedDir: session.encodedDir },
+          ...(unblock ? { unblock: true } : {}),
         },
         now,
       );
@@ -216,7 +227,19 @@ async function drain(
     ctx.signal?.throwIfAborted();
 
     const job = claim(ctx.db, now, ctx.config.jobVisibilityMs);
-    if (job === null) return { budgetExhausted: false };
+    if (job === null) {
+      // The hook enqueues with a short debounce and spawns this worker
+      // immediately, so the worker always lost the race with its own delay and
+      // exited — leaving the session that just closed unarchived until the next
+      // time Claude Code ran. For the last session before a laptop is lost,
+      // that is for ever, which is the case the product exists for.
+      const soonest = nextRunnableAt(ctx.db, now);
+      if (soonest !== null && soonest - now <= DEBOUNCE_WAIT_MS && soonest < deadline) {
+        await ctx.clock.sleep(Math.max(0, soonest - now));
+        continue;
+      }
+      return { budgetExhausted: false };
+    }
 
     report.processed++;
     try {
@@ -346,6 +369,9 @@ function clockLooksSane(ctx: WorkerContext, now: number): boolean {
   }
   return true;
 }
+
+/** How long a worker will wait for a job whose debounce has not elapsed. */
+const DEBOUNCE_WAIT_MS = 60_000;
 
 /** Consecutive local failures before a job is parked where a person sees it. */
 const LOCAL_FAILURE_LIMIT = 5;

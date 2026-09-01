@@ -179,8 +179,12 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
 function isSessionActive(ctx: WorkerContext, sessionId: string, now: number): boolean {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
   if (seen === undefined) return false;
-  // A crashed Claude Code never fires SessionEnd, so the mark has to expire.
-  return now - seen < ACTIVE_SESSION_TTL_MS;
+  // A crashed Claude Code never fires SessionEnd, so the mark has to expire —
+  // but it is written once at SessionStart and never refreshed, so a TTL below
+  // the retention window can never protect anything: by the time a session is
+  // old enough to reap, its mark has always expired.
+  const ttl = Math.max(ACTIVE_SESSION_TTL_MS, (ctx.config.retentionDays + 7) * DAY_MS);
+  return now - seen < ttl;
 }
 
 type Target = { transcriptPath: string; sidecarDir: string };

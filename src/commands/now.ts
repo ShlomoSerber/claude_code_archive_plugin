@@ -25,7 +25,14 @@ export async function runNow(
 
   try {
     const ctx = commandContext(runtime, { timeoutMs: runtime.config.workerBudgetMs });
-    const report = await runSweep(ctx, { force: true, backfill: options.backfill === true });
+    // unblock: every FatalError in this codebase tells the user to run
+    // /archive:now, and until now that command could not clear a block. One
+    // full Drive froze the whole archive behind a remediation that did nothing.
+    const report = await runSweep(ctx, {
+      force: true,
+      unblock: true,
+      backfill: options.backfill === true,
+    });
     await writeStatusFile(ctx, report);
 
     if (options.json === true) {

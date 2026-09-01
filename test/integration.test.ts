@@ -15,7 +15,16 @@ import {
 } from '../src/core/config.ts';
 import { RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
-import { claim, enqueue, getJob, listJobs, setUploadUri } from '../src/core/queue.ts';
+import {
+  block,
+  claim,
+  enqueue,
+  getJob,
+  listJobs,
+  nextRunnableAt,
+  retryLater,
+  setUploadUri,
+} from '../src/core/queue.ts';
 import { catalogFileName, machineId, runSweep } from '../src/worker/sweep.ts';
 import { importCatalogFile } from '../src/commands/setup.ts';
 import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
@@ -25,7 +34,7 @@ import { nullLogger } from '../src/ports/logger.ts';
 import { competingCleanupSettings } from '../src/adapters/claude-settings.ts';
 import { createExtractor } from '../src/core/transcript.ts';
 import { kvGetNumber, kvSetNumber } from '../src/adapters/db.ts';
-import { KV, activeSessionKey } from '../src/core/state-keys.ts';
+import { ACTIVE_SESSION_TTL_MS, KV, activeSessionKey } from '../src/core/state-keys.ts';
 import { FakeDrive } from './fakes/fake-drive.ts';
 import { fakeClock, tempDir } from './helpers.ts';
 
@@ -644,7 +653,10 @@ describe('deletion safety, second pass', () => {
       harness.clock.now(),
     );
 
-    harness.clock.advance(31 * DAY);
+    // Past the mark's lifetime, which is deliberately longer than the retention
+    // window: written once at SessionStart and never refreshed, a shorter TTL
+    // could never protect anything.
+    harness.clock.advance(60 * DAY);
     const report = await reapLocalCopies(harness.ctx, harness.clock.now());
     assert.equal(report.deleted, 2);
   });
@@ -1675,3 +1687,77 @@ function writeCatalogTo(content: Buffer): string {
   fs.writeFileSync(file, content);
   return file;
 }
+
+/**
+ * Twelfth round. Objective 1 held under 52 fuzz seeds with interference
+ * injected inside the reaper's last Drive call. Both findings were the plugin
+ * quietly stopping archiving — the failure direction the spec calls safe, taken
+ * without saying so.
+ */
+describe('the plugin keeps archiving', () => {
+  it('archives the session that just closed, without waiting for the next one', async () => {
+    // The hook enqueues with a debounce and spawns the worker immediately, so
+    // the worker used to lose the race with its own delay and exit. For the
+    // last session before a laptop is lost, "later" is never.
+    const harness = makeHarness({ debounceMs: 5_000 });
+    enqueue(
+      harness.ctx.db,
+      {
+        kind: 'backup',
+        sessionId: SESSION_A,
+        payload: { encodedDir: ENCODED },
+        notBefore: harness.clock.now() + 5_000,
+      },
+      harness.clock.now(),
+    );
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.verified, 2, 'the debounced job ran in this sweep');
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt);
+  });
+
+  it('does not wait out the backoff of a job that is failing', async () => {
+    // Waiting is for fresh work held back by a debounce. A retrying job must
+    // keep its backoff, or one broken session spins the worker.
+    const db = harnessDb();
+    enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
+    const job = claim(db, 1000, 60_000)!;
+    retryLater(db, job, { at: 30_000, error: 'network' });
+    assert.equal(nextRunnableAt(db, 1000), null, 'a retrying job is not worth waiting for');
+
+    enqueue(db, { kind: 'backup', sessionId: 's2', notBefore: 6000 }, 1000);
+    assert.equal(nextRunnableAt(db, 1000), 6000, 'but fresh debounced work is');
+  });
+
+  it('lets /archive:now retry a blocked job, since that is what it tells you to run', async () => {
+    // Every FatalError remediation in this codebase says "run /archive:now",
+    // and that command could not clear a block — so one full Drive froze the
+    // whole archive behind advice that did nothing.
+    const harness = makeHarness();
+    const db = harness.ctx.db;
+    enqueue(db, { kind: 'backup', sessionId: SESSION_A, payload: { encodedDir: ENCODED } }, 1000);
+    const job = claim(db, 1000, 60_000)!;
+    block(db, job, { error: 'Drive is full', now: 1000 });
+    assert.equal(getJob(db, job.id)?.blocked, true);
+
+    // A background sweep leaves it parked.
+    await runSweep(harness.ctx);
+    assert.equal(getJob(db, job.id)?.blocked, true, 'a rescan does not unblock');
+
+    // /archive:now does not.
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true, unblock: true });
+    assert.ok(getSession(db, SESSION_A)?.verifiedAt, 'the session is archived after the retry');
+  });
+
+  it('keeps an open session safe for longer than the retention window', () => {
+    // The mark is written once at SessionStart and never refreshed, so a TTL
+    // below the retention window could never protect anything: by the time a
+    // session is old enough to reap, its mark has always expired.
+    assert.ok(ACTIVE_SESSION_TTL_MS > 0);
+    const retention = DEFAULT_CONFIG.retentionDays * DAY_MS;
+    assert.ok(
+      Math.max(ACTIVE_SESSION_TTL_MS, (DEFAULT_CONFIG.retentionDays + 7) * DAY_MS) > retention,
+    );
+  });
+});
