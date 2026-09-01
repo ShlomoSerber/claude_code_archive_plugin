@@ -6527,7 +6527,10 @@ async function bundleOrExplain(ctx, session, work) {
   } catch (err) {
     if (err instanceof FatalError || err instanceof RetryableError) throw err;
     const after = await statSession(ctx.paths, session.encodedDir, session.sessionId);
-    const moved = before === null || after === null || after.transcriptBytes !== before.transcriptBytes || after.sidecarBytes !== before.sidecarBytes || Math.trunc(after.mtimeMs) !== Math.trunc(before.mtimeMs);
+    const mark = (state) => state === null ? "" : `${String(state.transcriptBytes)}:${String(state.sidecarBytes)}:${String(Math.trunc(state.mtimeMs))}`;
+    const beforeMark = mark(before);
+    const afterMark = mark(after);
+    const moved = beforeMark === "" || afterMark === "" || beforeMark !== afterMark;
     const detail = err instanceof Error ? err.message : "unknown error";
     throw new RetryableError(
       moved ? `the session was written to while it was being archived; it will be archived when it next closes (${detail})` : `the bundle could not be built or read back: ${detail}`,

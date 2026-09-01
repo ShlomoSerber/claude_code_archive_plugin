@@ -233,12 +233,16 @@ export async function bundleOrExplain<T>(
   } catch (err) {
     if (err instanceof FatalError || err instanceof RetryableError) throw err;
     const after = await statSession(ctx.paths, session.encodedDir, session.sessionId);
-    const moved =
-      before === null ||
-      after === null ||
-      after.transcriptBytes !== before.transcriptBytes ||
-      after.sidecarBytes !== before.sidecarBytes ||
-      Math.trunc(after.mtimeMs) !== Math.trunc(before.mtimeMs);
+    // Unknown counts as moved: if we cannot compare, the session is the
+    // likelier explanation than a corrupt archive, and both answers are
+    // retryable anyway.
+    const mark = (state: LocalSession | null): string =>
+      state === null
+        ? ''
+        : `${String(state.transcriptBytes)}:${String(state.sidecarBytes)}:${String(Math.trunc(state.mtimeMs))}`;
+    const beforeMark = mark(before);
+    const afterMark = mark(after);
+    const moved = beforeMark === '' || afterMark === '' || beforeMark !== afterMark;
     const detail = err instanceof Error ? err.message : 'unknown error';
     throw new RetryableError(
       moved
