@@ -112,7 +112,13 @@ export function createHttpClient(options: HttpClientOptions = {}): HttpClient {
           retryAfterSeconds: retryAfter,
           status: response.status,
         });
-        if (!waited) return response;
+        // Not `return response`: its body was drained above, so every caller
+        // died on `Body is unusable` — a TypeError that is neither fatal nor a
+        // network error, so the queue treated a rate limit as a local bug, kept
+        // hammering Drive without opening the circuit breaker, and showed the
+        // user that TypeError with no remediation. The status and Retry-After
+        // are already captured in lastError, which is what should surface.
+        if (!waited) throw asThrowable(lastError, url);
       }
 
       throw asThrowable(lastError, url);

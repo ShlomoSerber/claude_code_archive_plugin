@@ -39,9 +39,6 @@ const WINDOWS_RESERVED = new Set([
 /** Leaves room for the longest suffix we append: `.tar.zst.partial`. */
 export const MAX_FILENAME_BYTES = 200;
 
-/** Total path budget; Windows long-path support cannot be assumed. */
-export const MAX_PATH_LENGTH = 240;
-
 /**
  * True when a basename is reserved on Windows, including with an extension:
  * `CON`, `con.txt` and `COM1.tar.zst` are all unusable.
@@ -125,14 +122,30 @@ export function contentTag(hash: string | null | undefined): string {
   return hex.length === 8 ? `_${hex}` : '';
 }
 
+/**
+ * Keep a timestamp inside the range that produces a four-digit year.
+ *
+ * These two functions name files and Drive folders, and both are called from
+ * outside the fail-soft boundary around transcript parsing — so `new Date(x)`
+ * throwing `Invalid time value` on a nonsense timestamp blocked the session's
+ * backup for good, and a negative one produced a folder named `-029`.
+ */
+function nameableEpoch(epochMs: number): number {
+  if (!Number.isFinite(epochMs)) return 0;
+  return Math.min(Math.max(Math.trunc(epochMs), 0), MAX_NAMEABLE_EPOCH_MS);
+}
+
+/** 9999-12-31T23:59:59.999Z, the last epoch with a four-digit ISO year. */
+const MAX_NAMEABLE_EPOCH_MS = 253_402_300_799_999;
+
 /** `YYYY-MM-DD` in UTC. Bundle names must not shift with the user's timezone. */
 export function isoDate(epochMs: number): string {
-  return new Date(epochMs).toISOString().slice(0, 10);
+  return new Date(nameableEpoch(epochMs)).toISOString().slice(0, 10);
 }
 
 /** Calendar year in UTC, used for the Drive year subfolder. */
 export function isoYear(epochMs: number): string {
-  return new Date(epochMs).toISOString().slice(0, 4);
+  return new Date(nameableEpoch(epochMs)).toISOString().slice(0, 4);
 }
 
 /**
@@ -152,26 +165,3 @@ export function truncateUtf8(input: string, maxBytes: number): string {
   return out;
 }
 
-/**
- * Shorten the variable middle of a bundle name until the whole path fits the
- * Windows budget. The date and session id are never sacrificed: identity beats
- * readability.
- */
-export function fitPathBudget(args: {
-  directory: string;
-  date: string;
-  title: string | null | undefined;
-  sessionId: string;
-  suffix: string;
-  maxPathLength?: number;
-}): string {
-  const limit = args.maxPathLength ?? MAX_PATH_LENGTH;
-  const short = shortSessionId(args.sessionId);
-  const withoutSlug = `${args.date}_${short}`;
-  // `+2` covers the path separator and the extra `_` a slug would introduce.
-  const fixed = args.directory.length + 2 + withoutSlug.length + args.suffix.length;
-  const room = Math.min(60, Math.max(0, limit - fixed));
-  const base =
-    room === 0 ? withoutSlug : `${args.date}_${slugifyTitle(args.title ?? '', room)}_${short}`;
-  return `${sanitizeFileName(base, withoutSlug)}${args.suffix}`;
-}

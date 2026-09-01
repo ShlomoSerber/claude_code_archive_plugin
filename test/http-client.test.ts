@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
 import { createHttpClient, describeApiError, readJson } from '../src/adapters/http-client.ts';
+import { RetryableError } from '../src/core/errors.ts';
 import { fakeClock } from './helpers.ts';
 
 /** A fetch that replays a queue of canned outcomes and records what it saw. */
@@ -74,14 +75,25 @@ describe('createHttpClient', () => {
   });
 
   it('gives up once the run is out of budget instead of retrying forever', async () => {
-    const scripted = scriptedFetch([new Response('', { status: 503 })]);
+    const scripted = scriptedFetch([
+      new Response('', { status: 503, headers: { 'retry-after': '30' } }),
+    ]);
     const client = createHttpClient({
       fetch: scripted.fetch,
       clock: fakeClock(),
       budgetMs: 1,
       maxAttempts: 20,
     });
-    assert.equal((await client.send('https://drive.test/files')).status, 503);
+    // It throws rather than returning the response: the body was drained to
+    // decide on the retry, so handing it back gave every caller a TypeError
+    // instead of a rate limit, with the status and Retry-After lost.
+    const err = await client.send('https://drive.test/files').then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    assert.ok(err instanceof RetryableError);
+    assert.equal(err.status, 503);
+    assert.equal(err.retryAfterSeconds, 30);
     assert.equal(scripted.calls.length, 1, 'no time to wait means no second attempt');
   });
 

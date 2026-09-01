@@ -905,7 +905,7 @@ function createHttpClient(options = {}) {
           retryAfterSeconds: retryAfter,
           status: response.status
         });
-        if (!waited) return response;
+        if (!waited) throw asThrowable(lastError, url);
       }
       throw asThrowable(lastError, url);
     }
@@ -1165,6 +1165,12 @@ function createDriveTransport(deps) {
     if (response.status === 403 && isRateLimited(body)) {
       throw new RetryableError(message, { status: response.status });
     }
+    if (isRetryableHttpStatus(response.status)) {
+      throw new RetryableError(message, {
+        status: response.status,
+        ...retryAfterOf(response)
+      });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, "Run /archive:status for details.");
     }
@@ -1392,6 +1398,12 @@ async function interpretUploadResponse(response, totalBytes) {
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  if (isRetryableHttpStatus(response.status)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response)
+    });
+  }
   if (response.status >= 400 && response.status < 500) {
     throw new FatalError(
       `Drive refused the upload: ${message}`,
@@ -1399,6 +1411,10 @@ async function interpretUploadResponse(response, totalBytes) {
     );
   }
   throw new RetryableError(`Drive upload failed: ${message}`, { status: response.status });
+}
+function retryAfterOf(response) {
+  const seconds = parseRetryAfter(response.headers.get("retry-after"), Date.now());
+  return seconds === void 0 ? {} : { retryAfterSeconds: seconds };
 }
 function confirmedFromRange(header) {
   if (header === null) return 0;
@@ -1492,9 +1508,10 @@ function unknownConfigKeys(source) {
 }
 function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
+  const fromEnv = envSource(env);
   applySource(config, file ?? {});
-  applySource(config, envSource(env));
-  if (file !== null && unreadableSafetyValues(file).length > 0) {
+  applySource(config, fromEnv);
+  if (file !== null && unreadableSafetyValues(file).length > 0 || unreadableSafetyValues(fromEnv).length > 0) {
     config.keepLocalForever = true;
   }
   return clamp(config);
@@ -5803,10 +5820,11 @@ function collectToolPaths(record, into) {
 function asString3(value) {
   return typeof value === "string" ? value : null;
 }
+var MAX_EPOCH_MS = 864e13;
 function parseTimestamp(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
     const truncated = Math.trunc(value);
-    return Number.isSafeInteger(truncated) ? truncated : null;
+    return Math.abs(truncated) <= MAX_EPOCH_MS ? truncated : null;
   }
   if (typeof value !== "string") return null;
   const parsed = Date.parse(value);
@@ -5921,11 +5939,16 @@ function contentTag(hash) {
   const hex = hash.replace(/[^0-9a-f]/gi, "").slice(0, 8).toLowerCase();
   return hex.length === 8 ? `_${hex}` : "";
 }
+function nameableEpoch(epochMs) {
+  if (!Number.isFinite(epochMs)) return 0;
+  return Math.min(Math.max(Math.trunc(epochMs), 0), MAX_NAMEABLE_EPOCH_MS);
+}
+var MAX_NAMEABLE_EPOCH_MS = 253402300799999;
 function isoDate(epochMs) {
-  return new Date(epochMs).toISOString().slice(0, 10);
+  return new Date(nameableEpoch(epochMs)).toISOString().slice(0, 10);
 }
 function isoYear(epochMs) {
-  return new Date(epochMs).toISOString().slice(0, 4);
+  return new Date(nameableEpoch(epochMs)).toISOString().slice(0, 4);
 }
 function truncateUtf8(input, maxBytes) {
   if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;

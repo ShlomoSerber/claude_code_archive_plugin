@@ -105,3 +105,24 @@ describe('compareVersions', () => {
     assert.equal(compareVersions('23', '22.16.0'), 1);
   });
 });
+
+describe('safety switches in the environment', () => {
+  it('treats an unreadable value as a request to stop deleting', () => {
+    // The file source already did this. Someone exporting
+    // ARCHIVE_KEEP_LOCAL_FOREVER="yes please" is asking for deletion to stop,
+    // and discarding it silently gave them deletion.
+    const config = resolveConfig(null, { ARCHIVE_KEEP_LOCAL_FOREVER: 'yes please' });
+    assert.equal(config.keepLocalForever, true);
+  });
+
+  it('still reads a value it understands', () => {
+    assert.equal(
+      resolveConfig(null, { ARCHIVE_KEEP_LOCAL_FOREVER: 'false' }).keepLocalForever,
+      false,
+    );
+    assert.equal(
+      resolveConfig(null, { ARCHIVE_KEEP_LOCAL_FOREVER: 'true' }).keepLocalForever,
+      true,
+    );
+  });
+});

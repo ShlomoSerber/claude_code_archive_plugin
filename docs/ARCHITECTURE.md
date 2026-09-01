@@ -123,7 +123,7 @@ Own ~25-line slugifier (reimplement `sanitize-filename`'s rule set, no dep):
 - Trim trailing dots/spaces (Windows silently strips them) and leading dots.
 - Cap filenames at ~200 **bytes** (UTF-8, truncate on codepoint boundary), leaving room for `.tar.zst.partial`.
 - Uniqueness comes from the session id, not the title: `<date>_<slug>_<shortId>.tar.zst`.
-- Windows path budget: do not rely on `LongPathsEnabled` or automatic `\\?\` prefixing (Node's behavior is mixed). Keep the plugin's own tree shallow and shorten slugs so total path length ≤ ~240. When reading arbitrarily deep session dirs, `path.toNamespacedPath()` on fully resolved absolute paths is permitted.
+- Windows path budget: do not rely on `LongPathsEnabled` or automatic `\\?\` prefixing (Node's behavior is mixed). What this actually costs is bounded: the slug appears only in the Drive object name, never in a local path. Local paths are the ones Claude Code itself created plus a fixed suffix (`<session-id>.building.tar.zst` in a shallow data dir), so the enforced rule is the ~200-byte filename cap in `sanitizeFileName`. When reading arbitrarily deep session dirs, `path.toNamespacedPath()` on fully resolved absolute paths is permitted.
 
 ## 11. Logging, errors, status
 
@@ -176,4 +176,4 @@ strategy:
 | Tokens | 0600 file in data dir; opt-in DPAPI/keychain shell-outs | keytar/@napi-rs/keyring | Native deps banned; file storage is the AWS/gcloud norm |
 | Catalog backup | `sqlite.backup()` / `VACUUM INTO` | `fs.copyFile` | Live-WAL copy is a documented corruption class |
 | Logging | Sync NDJSON, hand-rolled | pino | Worker-thread transports break bundles; hooks need sync flush |
-| Slugs | Own slugifier + path-length budget ≤ 240 | sanitize-filename dep; `\\?\` reliance | Trivial to own; long-path support can't be assumed |
+| Slugs | Own slugifier, ~200-byte filename cap | sanitize-filename dep; `\\?\` reliance | Trivial to own; long-path support can't be assumed |

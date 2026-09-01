@@ -118,6 +118,15 @@ export async function runStatus(
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
     print(`                      That file outranks the one this plugin wrote.`);
   }
+  if (!runtime.config.enabled) {
+    print(`  WARNING:            archiving is switched off (enabled: false).`);
+    print(`                      Nothing is being backed up or deleted.`);
+  }
+  if (queue.failing > 0) {
+    print(
+      `  Retrying:           ${String(queue.failing)} job(s) are in backoff after a failure`,
+    );
+  }
   if (unconfirmable > 0) {
     // Everything says verified and nothing is ever reclaimed: without this line
     // the plugin looks healthy while its whole purpose has quietly stopped.

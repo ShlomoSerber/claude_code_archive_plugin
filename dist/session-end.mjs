@@ -716,7 +716,7 @@ function createHttpClient(options = {}) {
           retryAfterSeconds: retryAfter,
           status: response.status
         });
-        if (!waited) return response;
+        if (!waited) throw asThrowable(lastError, url);
       }
       throw asThrowable(lastError, url);
     }
@@ -976,6 +976,12 @@ function createDriveTransport(deps) {
     if (response.status === 403 && isRateLimited(body)) {
       throw new RetryableError(message, { status: response.status });
     }
+    if (isRetryableHttpStatus(response.status)) {
+      throw new RetryableError(message, {
+        status: response.status,
+        ...retryAfterOf(response)
+      });
+    }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, "Run /archive:status for details.");
     }
@@ -1203,6 +1209,12 @@ async function interpretUploadResponse(response, totalBytes) {
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  if (isRetryableHttpStatus(response.status)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response)
+    });
+  }
   if (response.status >= 400 && response.status < 500) {
     throw new FatalError(
       `Drive refused the upload: ${message}`,
@@ -1210,6 +1222,10 @@ async function interpretUploadResponse(response, totalBytes) {
     );
   }
   throw new RetryableError(`Drive upload failed: ${message}`, { status: response.status });
+}
+function retryAfterOf(response) {
+  const seconds = parseRetryAfter(response.headers.get("retry-after"), Date.now());
+  return seconds === void 0 ? {} : { retryAfterSeconds: seconds };
 }
 function confirmedFromRange(header) {
   if (header === null) return 0;
@@ -1298,9 +1314,10 @@ function unknownConfigKeys(source) {
 }
 function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
+  const fromEnv = envSource(env);
   applySource(config, file ?? {});
-  applySource(config, envSource(env));
-  if (file !== null && unreadableSafetyValues(file).length > 0) {
+  applySource(config, fromEnv);
+  if (file !== null && unreadableSafetyValues(file).length > 0 || unreadableSafetyValues(fromEnv).length > 0) {
     config.keepLocalForever = true;
   }
   return clamp(config);

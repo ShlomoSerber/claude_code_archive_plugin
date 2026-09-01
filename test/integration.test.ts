@@ -2113,7 +2113,7 @@ describe('a server that says when to come back', () => {
     const drive = harness.drive;
     const original = drive.startResumableUpload.bind(drive);
     let thrown = false;
-    drive.startResumableUpload = ((args: Parameters<typeof original>[0]) => {
+    drive.startResumableUpload = (args: Parameters<typeof original>[0]) => {
       if (!thrown) {
         thrown = true;
         return Promise.reject(
@@ -2121,7 +2121,7 @@ describe('a server that says when to come back', () => {
         );
       }
       return original(args);
-    });
+    };
 
     const now = harness.clock.now();
     await runSweep(harness.ctx);
@@ -2132,5 +2132,37 @@ describe('a server that says when to come back', () => {
       waiting.notBefore - now >= 900_000,
       `Retry-After must win: waited ${String(waiting.notBefore - now)}ms`,
     );
+  });
+});
+
+/**
+ * Sixteenth round. Objective 1 held under 270 fuzz seeds, 583 injected worker
+ * kills and two workers racing on one database. Both breaks were in the HTTP
+ * layer, and both ended the same way: this session is never archived, and
+ * nothing ever retries it.
+ */
+describe('a rate limit is not a refusal', () => {
+  it('retries a 429 on a chunk instead of blocking the session for good', async () => {
+    const harness = makeHarness();
+    let first = true;
+    const drive = harness.drive;
+    const original = drive.uploadChunk.bind(drive);
+    drive.uploadChunk = ((args: Parameters<typeof original>[0]) => {
+      if (first) {
+        first = false;
+        // What Drive answers when the initial backfill uploads too fast. The
+        // chunk path disables the HTTP client's own retries, so this classifier
+        // is the only one — and it used to call 429 a FatalError, which blocks.
+        return Promise.reject(new RetryableError('rate limited', { status: 429 }));
+      }
+      return original(args);
+    });
+
+    const first_run = await runSweep(harness.ctx);
+    assert.equal(first_run.blocked, 0, 'a rate limit does not park the job for a person');
+
+    harness.clock.advance(60 * 60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, 'the next sweep archives it');
   });
 });

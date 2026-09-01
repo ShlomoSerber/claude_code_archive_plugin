@@ -3,10 +3,16 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { FatalError, RetryableError, UploadSessionExpired } from '../core/errors.ts';
+import {
+  FatalError,
+  RetryableError,
+  UploadSessionExpired,
+  isRetryableHttpStatus,
+} from '../core/errors.ts';
 import { nullLogger, type Logger } from '../ports/logger.ts';
 import type { DriveTransport, RemoteFile, StorageQuota, UploadProgress } from '../ports/drive.ts';
 import { describeApiError, readJson, type HttpClient, type SendOptions } from './http-client.ts';
+import { parseRetryAfter } from '../core/backoff.ts';
 import { renameWithRetry, siblingTempPath } from './atomic.ts';
 import { REAUTH_REMEDIATION, type AuthProvider } from './google-auth.ts';
 
@@ -72,6 +78,12 @@ export function createDriveTransport(deps: DriveDeps): DriveTransport {
     // former as fatal made the reaper read "slow down" as "the archive is gone".
     if (response.status === 403 && isRateLimited(body)) {
       throw new RetryableError(message, { status: response.status });
+    }
+    if (isRetryableHttpStatus(response.status)) {
+      throw new RetryableError(message, {
+        status: response.status,
+        ...retryAfterOf(response),
+      });
     }
     if (response.status >= 400 && response.status < 500) {
       throw new FatalError(message, 'Run /archive:status for details.');
@@ -341,6 +353,17 @@ export async function interpretUploadResponse(
   }
   const body = await readJson(response);
   const message = describeApiError(response.status, body);
+  // Chunks are uploaded with retry disabled, because replaying one blindly is
+  // how a resumable upload corrupts itself. That left this the only classifier
+  // for a chunk's status — and it called 429 a refusal, so a single rate limit
+  // during the initial backfill blocked that session's backup for good, with no
+  // circuit breaker and nothing that ever retried it.
+  if (isRetryableHttpStatus(response.status)) {
+    throw new RetryableError(`Drive upload failed: ${message}`, {
+      status: response.status,
+      ...retryAfterOf(response),
+    });
+  }
   if (response.status >= 400 && response.status < 500) {
     throw new FatalError(
       `Drive refused the upload: ${message}`,
@@ -348,6 +371,12 @@ export async function interpretUploadResponse(
     );
   }
   throw new RetryableError(`Drive upload failed: ${message}`, { status: response.status });
+}
+
+/** The server's own answer to "when should I come back?", when it gave one. */
+function retryAfterOf(response: Response): { retryAfterSeconds?: number } {
+  const seconds = parseRetryAfter(response.headers.get('retry-after'), Date.now());
+  return seconds === undefined ? {} : { retryAfterSeconds: seconds };
 }
 
 /** `bytes=0-262143` means 262144 bytes are stored; an absent header means none. */

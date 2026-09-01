@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   bundleBaseName,
-  fitPathBudget,
   isWindowsReservedName,
   isoDate,
   isoYear,
@@ -130,39 +129,20 @@ describe('isoDate / isoYear', () => {
   });
 });
 
-describe('fitPathBudget', () => {
-  it('keeps the whole path inside the budget', () => {
-    const directory = 'C:/Users/someone/'.padEnd(200, 'x');
-    const name = fitPathBudget({
-      directory,
-      date: '2026-08-31',
-      title: 'a very long session title that will not fit anywhere near this path',
-      sessionId: '1a2b3c4d-5e6f',
-      suffix: '.tar.zst',
-    });
-    assert.ok(`${directory}/${name}`.length <= 240, `${directory}/${name}`.length.toString());
+describe('naming a bundle from a nonsense timestamp', () => {
+  it('does not throw on a date the calendar cannot hold', () => {
+    // isoDate is called from outside the fail-soft boundary around transcript
+    // parsing, so `Invalid time value` here blocked the session's backup for
+    // good — and a negative epoch produced a Drive folder named `-029`.
+    for (const value of [9e15, -1e15, Number.NaN, Number.POSITIVE_INFINITY, 8.64e15 + 1]) {
+      const date = isoDate(value);
+      assert.match(date, /^\d{4}-\d{2}-\d{2}$/, `isoDate(${String(value)}) = ${date}`);
+      assert.match(isoYear(value), /^\d{4}$/);
+    }
   });
 
-  it('sacrifices the slug before the identity', () => {
-    const directory = 'x'.repeat(230);
-    const name = fitPathBudget({
-      directory,
-      date: '2026-08-31',
-      title: 'dropped entirely',
-      sessionId: '1a2b3c4d',
-      suffix: '.tar.zst',
-    });
-    assert.equal(name, '2026-08-31_1a2b3c4d.tar.zst');
-  });
-
-  it('keeps the slug when there is room', () => {
-    const name = fitPathBudget({
-      directory: '/archive/2026',
-      date: '2026-08-31',
-      title: 'fix auth redirect',
-      sessionId: '1a2b3c4d',
-      suffix: '.tar.zst',
-    });
-    assert.equal(name, '2026-08-31_fix-auth-redirect_1a2b3c4d.tar.zst');
+  it('still names an ordinary date correctly', () => {
+    assert.equal(isoDate(Date.UTC(2026, 7, 31)), '2026-08-31');
+    assert.equal(isoYear(Date.UTC(2026, 7, 31)), '2026');
   });
 });

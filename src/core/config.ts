@@ -86,11 +86,17 @@ export function resolveConfig(
   env: Readonly<Record<string, string | undefined>>,
 ): ArchiveConfig {
   const config = { ...DEFAULT_CONFIG };
+  const fromEnv = envSource(env);
   applySource(config, file ?? {});
-  applySource(config, envSource(env));
+  applySource(config, fromEnv);
   // An unreadable value on a switch whose only job is to prevent deletion is
-  // treated as an attempt to prevent deletion.
-  if (file !== null && unreadableSafetyValues(file).length > 0) {
+  // treated as an attempt to prevent deletion. The environment counts: someone
+  // typing ARCHIVE_KEEP_LOCAL_FOREVER="yes please" is asking for deletion to
+  // stop, and discarding that silently gave them the opposite.
+  if (
+    (file !== null && unreadableSafetyValues(file).length > 0) ||
+    unreadableSafetyValues(fromEnv).length > 0
+  ) {
     config.keepLocalForever = true;
   }
   return clamp(config);

@@ -8,7 +8,7 @@ import {
   interpretUploadResponse,
   toRemoteFile,
 } from '../src/adapters/drive-http.ts';
-import { FatalError, UploadSessionExpired } from '../src/core/errors.ts';
+import { FatalError, RetryableError, UploadSessionExpired } from '../src/core/errors.ts';
 import { createLazyDrive } from '../src/adapters/lazy-drive.ts';
 import { FakeDrive } from './fakes/fake-drive.ts';
 import { matchesLocal } from '../src/worker/upload.ts';
@@ -234,5 +234,34 @@ describe('createLazyDrive', () => {
       Promise.reject(new FatalError('not signed in', 'Run /archive:setup.')),
     );
     await assert.rejects(drive.storageQuota(), /not signed in/);
+  });
+});
+
+describe('classifying a chunk upload response', () => {
+  it('treats 429 as retryable, with the window it asked for', async () => {
+    const err = await interpretUploadResponse(
+      new Response('{"error":{"message":"rate limit"}}', {
+        status: 429,
+        headers: { 'retry-after': '120' },
+      }),
+      10,
+    ).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    assert.ok(err instanceof RetryableError, 'a rate limit is not a refusal');
+    assert.equal(err.status, 429);
+    assert.equal(err.retryAfterSeconds, 120);
+  });
+
+  it('still treats a genuine refusal as fatal', async () => {
+    const err = await interpretUploadResponse(
+      new Response('{"error":{"message":"bad request"}}', { status: 400 }),
+      10,
+    ).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    assert.ok(err instanceof FatalError);
   });
 });

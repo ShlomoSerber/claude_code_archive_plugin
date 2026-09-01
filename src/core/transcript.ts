@@ -243,6 +243,9 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/** The largest epoch a JavaScript Date can represent: ±100 000 000 days. */
+const MAX_EPOCH_MS = 8.64e15;
+
 function parseTimestamp(value: unknown): number | null {
   // Rounded, not merely finite: these land in STRICT INTEGER columns, and a
   // fractional value makes the insert throw, which fails the whole backup for
@@ -253,7 +256,10 @@ function parseTimestamp(value: unknown): number | null {
   // timestamp made a session permanently unarchivable.
   if (typeof value === 'number' && Number.isFinite(value)) {
     const truncated = Math.trunc(value);
-    return Number.isSafeInteger(truncated) ? truncated : null;
+    // Date's own range, which is narrower than Number.isSafeInteger: a value
+    // between the two stores fine and then throws `Invalid time value` out of
+    // the bundle namer, which sits outside the fail-soft boundary here.
+    return Math.abs(truncated) <= MAX_EPOCH_MS ? truncated : null;
   }
   if (typeof value !== 'string') return null;
   const parsed = Date.parse(value);
