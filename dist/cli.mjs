@@ -1730,7 +1730,8 @@ function resolvePaths(env, homedir = os.homedir) {
     statusFile: path6.join(dataDir, "status.json"),
     lockDir: path6.join(dataDir, "worker.lock"),
     runtimeCacheFile: path6.join(dataDir, "runtime.json"),
-    stagingDir: path6.join(dataDir, "staging")
+    stagingDir: path6.join(dataDir, "staging"),
+    restoreDir: path6.join(dataDir, "restoring")
   };
 }
 function trimmed(value) {
@@ -2003,7 +2004,7 @@ function writeCache(file, found) {
 // src/worker/sweep.ts
 import fsp11 from "node:fs/promises";
 import os4 from "node:os";
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash4, randomBytes as randomBytes4 } from "node:crypto";
 import path14 from "node:path";
 
 // src/adapters/session-scan.ts
@@ -2518,6 +2519,8 @@ var KV = {
   skippedCount: "scan.skipped_count",
   /** How many of those were unreadable rather than badly named. */
   unreadableCount: "scan.unreadable_count",
+  /** Stable id for this installation, so two machines never share a catalog file. */
+  machineId: "machine.id",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
@@ -6221,6 +6224,7 @@ async function buildBundle(ctx, session, index, now) {
 async function publish(ctx, job, session, bundle, index, previous, now) {
   const folderPath = [ctx.config.driveRootFolder, session.encodedDir, bundle.year];
   const parentId = await ctx.drive.ensureFolder(folderPath, ctx.signal);
+  const before = await statSession(ctx.paths, session.encodedDir, session.sessionId);
   const files = await describeSessionFiles({
     cwd: path12.dirname(session.transcriptPath),
     entries: bundleEntries(session),
@@ -6234,6 +6238,9 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError("the session changed while it was being archived");
+  }
+  if (before === null || Math.trunc(confirmed.mtimeMs) !== Math.trunc(before.mtimeMs)) {
+    throw new RetryableError("the session was written to while it was being archived");
   }
   const archivedTranscript = files.find((file) => file.path === `${session.sessionId}.jsonl`)?.bytes ?? 0;
   const archivedSidecar = archivedBytes - archivedTranscript;
@@ -6338,11 +6345,11 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   }
   ctx.logger.error("backup.verification_failed", { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
-  await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
+  await ctx.drive.trashFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
 }
 function hasAllFloors(previous) {
-  return previous?.verifiedTranscriptBytes != null && previous.verifiedSidecarBytes !== null && previous.verifiedLocalBytes !== null;
+  return previous?.verifiedTranscriptBytes != null && previous.verifiedSidecarBytes !== null && previous.verifiedLocalBytes !== null && previous.verifiedTranscriptSha256 !== null;
 }
 function describeShrink(previous, now) {
   if (previous?.remoteFileId == null) return null;
@@ -6446,6 +6453,11 @@ async function reapLocalCopies(ctx, now) {
       continue;
     }
     if (remote === "unavailable") {
+      report.skipped++;
+      continue;
+    }
+    const settled = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    if (settled === null || changedSinceVerification(record, settled) || isSessionActive(ctx, record.sessionId, ctx.clock.now())) {
       report.skipped++;
       continue;
     }
@@ -6749,9 +6761,15 @@ function catalogCopyIsStale(ctx) {
   const last = kvGetNumber(ctx.db, KV.catalogUploadedAt) ?? 0;
   return ctx.clock.now() - last > CATALOG_REFRESH_MS;
 }
-function catalogFileName(hostname = os4.hostname()) {
-  const tag = createHash4("sha256").update(hostname).digest("hex").slice(0, 8);
-  return `catalog-${tag}.sqlite`;
+function catalogFileName(machineId2) {
+  return `catalog-${machineId2}.sqlite`;
+}
+function machineId(ctx) {
+  const existing = kvGet(ctx.db, KV.machineId);
+  if (existing !== void 0 && existing !== "") return existing;
+  const minted = createHash4("sha256").update(`${os4.hostname()}:${randomBytes4(8).toString("hex")}`).digest("hex").slice(0, 8);
+  kvSet(ctx.db, KV.machineId, minted, ctx.clock.now());
+  return minted;
 }
 async function uploadCatalogCopy(ctx) {
   const destination = path14.join(ctx.paths.stagingDir, "catalog.sqlite");
@@ -6762,10 +6780,10 @@ async function uploadCatalogCopy(ctx) {
     const parentId = await ctx.drive.ensureFolder([ctx.config.driveRootFolder], ctx.signal);
     const cached2 = kvGet(ctx.db, KV.catalogFileId);
     const existingId = cached2 === void 0 || cached2 === "" ? void 0 : cached2;
-    const existing = existingId ?? (await ctx.drive.findFile({ name: catalogFileName(), parentId }, ctx.signal))?.id;
+    const existing = existingId ?? (await ctx.drive.findFile({ name: catalogFileName(machineId(ctx)), parentId }, ctx.signal))?.id;
     const uploaded = await ctx.drive.uploadSmallFile(
       {
-        name: catalogFileName(),
+        name: catalogFileName(machineId(ctx)),
         parentId,
         mimeType: "application/vnd.sqlite3",
         body: await fsp11.readFile(destination),
@@ -7339,7 +7357,7 @@ async function restoreSession(ctx, sessionId) {
   const existing = await statSession(ctx.paths, record.encodedDir, sessionId);
   if (existing !== null && isIncomplete(record, existing)) {
     const recovery = path16.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
-    const staged2 = path16.join(ctx.paths.stagingDir, `${sessionId}.recover.tar.zst`);
+    const staged2 = path16.join(ctx.paths.restoreDir, `${sessionId}.recover.tar.zst`);
     let recovered = [];
     try {
       await ctx.drive.downloadToFile(
@@ -7400,7 +7418,7 @@ async function restoreSession(ctx, sessionId) {
     ctx.logger.warn("restore.sidecar_moved_aside", { session_id: sessionId, path: aside });
   }
   const remoteFileId = requireRemote(record);
-  const staged = path16.join(ctx.paths.stagingDir, `${sessionId}.restore.tar.zst`);
+  const staged = path16.join(ctx.paths.restoreDir, `${sessionId}.restore.tar.zst`);
   try {
     await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
     const actual = await sha256File(staged, ctx.signal);
@@ -7820,9 +7838,6 @@ async function runSetup(runtime, options = {}) {
   return 0;
 }
 async function importCatalogIfEmpty(runtime) {
-  const db = runtime.db();
-  if (catalogStats(db).sessions > 0) return 0;
-  if ((kvGetNumber(db, KV.catalogUploadedAt) ?? 0) > 0) return 0;
   const staged = path18.join(runtime.paths.stagingDir, "catalog-recovered.sqlite");
   try {
     const ctx = commandContext(runtime);

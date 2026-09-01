@@ -12,7 +12,7 @@ import { CLEANUP_PERIOD_DAYS } from '../core/config.ts';
 import { FatalError } from '../core/errors.ts';
 import { isSafeEncodedDir, isSafeSessionId } from '../core/identifiers.ts';
 import { KV } from '../core/state-keys.ts';
-import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
+import { kvSetNumber } from '../adapters/db.ts';
 import type { Runtime } from '../composition.ts';
 import { commandContext } from './context.ts';
 import { runNow } from './now.ts';
@@ -129,9 +129,13 @@ export async function runSetup(runtime: Runtime, options: SetupOptions = {}): Pr
  * already there: a local catalog is always more current than the Drive copy.
  */
 export async function importCatalogIfEmpty(runtime: Runtime): Promise<number> {
-  const db = runtime.db();
-  if (catalogStats(db).sessions > 0) return 0;
-  if ((kvGetNumber(db, KV.catalogUploadedAt) ?? 0) > 0) return 0;
+  // Deliberately unconditional. This used to return early once the local
+  // catalog had any rows at all — and the plugin's own hooks put rows there on
+  // the first Claude Code session after install. Anyone who opened Claude Code
+  // before running /archive:setup lost access to their entire archived history,
+  // silently and permanently, which is the one promise the whole design exists
+  // to keep. Every insert below is INSERT OR IGNORE, so re-running is cheap and
+  // cannot overwrite anything this machine knows.
 
   const staged = path.join(runtime.paths.stagingDir, 'catalog-recovered.sqlite');
   try {

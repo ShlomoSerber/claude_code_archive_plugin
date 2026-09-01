@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
-import { clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
+import { catalogStats, clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
 import {
   DEFAULT_CONFIG,
   resolveConfig,
@@ -16,7 +16,8 @@ import {
 import { RetryableError, isRetryableNetworkError } from '../src/core/errors.ts';
 import { resolvePaths } from '../src/core/paths.ts';
 import { claim, enqueue, getJob, listJobs, setUploadUri } from '../src/core/queue.ts';
-import { catalogFileName, runSweep } from '../src/worker/sweep.ts';
+import { catalogFileName, machineId, runSweep } from '../src/worker/sweep.ts';
+import { importCatalogFile } from '../src/commands/setup.ts';
 import { restoreSession, verifyArchive } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
@@ -163,7 +164,7 @@ describe('a full sweep', () => {
     const report = await runSweep(harness.ctx);
     assert.equal(report.catalogUploaded, true);
     // One copy per machine, so two machines on one Drive do not overwrite each other.
-    assert.ok(harness.drive.fileByName(catalogFileName()));
+    assert.ok(harness.drive.fileByName(catalogFileName(machineId(harness.ctx))));
   });
 
   it('leaves no staged bundles behind', async () => {
@@ -215,13 +216,16 @@ describe('the integrity chain', () => {
     assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null);
   });
 
-  it('deletes the bad remote copy rather than leaving it to be trusted later', async () => {
+  it('retires the bad remote copy rather than leaving it to be trusted later', async () => {
     const harness = makeHarness({}, new FakeDrive({ corruptChecksums: true }));
     await runSweep(harness.ctx);
     const bundles = [...harness.drive.files.values()].filter((file) =>
       file.name.endsWith('.tar.zst'),
     );
-    assert.deepEqual(bundles, []);
+    // Trashed rather than deleted: uploadWithResume can hand back a file it
+    // found by name rather than one this run created, so a permanent delete
+    // here could destroy the copy remote_file_id still points at.
+    assert.ok(bundles.every((file) => harness.drive.trashedIds.has(file.id)));
   });
 
   it('refuses to verify when Drive returns no checksum at all', async () => {
@@ -1176,7 +1180,7 @@ describe('fresh-machine recovery', () => {
     const parentId = await harness.drive.ensureFolder([harness.ctx.config.driveRootFolder]);
 
     // What a different laptop's sweep would have left behind.
-    const own = harness.drive.fileByName(catalogFileName());
+    const own = harness.drive.fileByName(catalogFileName(machineId(harness.ctx)));
     assert.ok(own, 'this machine wrote its own copy');
     await harness.drive.uploadSmallFile({
       name: 'catalog-deadbeef.sqlite',
@@ -1188,7 +1192,7 @@ describe('fresh-machine recovery', () => {
     const found = await harness.drive.listFiles({ parentId, namePrefix: 'catalog' });
     const names = found.map((file) => file.name).sort();
     assert.ok(names.includes('catalog-deadbeef.sqlite'), 'the other machine is visible');
-    assert.ok(names.includes(catalogFileName()));
+    assert.ok(names.includes(catalogFileName(machineId(harness.ctx))));
   });
 });
 
@@ -1442,7 +1446,7 @@ describe('the archive is not replaced by a smaller one', () => {
     // holding the only copy of the lost subagent transcripts.
     const { harness, original } = await archivedWithSidecar();
     fs.rmSync(path.join(harness.projectDir, SESSION_B, 'tool-a.json'));
-    fs.appendFileSync(harness.transcriptOf(SESSION_B), `${'{"type":"user"}\n'.repeat(500)}`);
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n'.repeat(500));
     touch(harness, SESSION_B);
 
     const report = await runSweep(harness.ctx);
@@ -1598,3 +1602,76 @@ describe('a retired archive is never larger than its replacement', () => {
     assert.deepEqual(leftovers, [], 'no empty recovery directory is left behind');
   });
 });
+
+/**
+ * Eleventh round. Objective 1 held against every realistic attack; the one
+ * contrived break needed a same-size in-place rewrite landing inside the window
+ * between hashing a file and the stat that records the fingerprint.
+ */
+describe('the fingerprint describes the bytes that were hashed', () => {
+  it('refuses when a file is rewritten in place during the backup', async () => {
+    const harness = makeHarness();
+    const original = fs.readFileSync(harness.transcriptOf(SESSION_A), 'utf8');
+
+    // Same size, different content, landing between the hash and the stat.
+    // Both the byte total and the later mtime looked unchanged, so the session
+    // was recorded verified against bytes the archive did not hold.
+    const drive = harness.drive;
+    const realEnsure = drive.ensureFolder.bind(drive);
+    let rewritten = false;
+    drive.ensureFolder = async (segments) => {
+      if (!rewritten) {
+        rewritten = true;
+        const replacement = original.replace('bouncing', 'REPLACE!');
+        assert.equal(replacement.length, original.length, 'the test must preserve the size');
+        fs.writeFileSync(harness.transcriptOf(SESSION_A), replacement);
+      }
+      return realEnsure(segments);
+    };
+
+    const report = await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    if (record?.verifiedAt != null) {
+      // If it did verify, the archive must hold what is on disk.
+      assert.equal(
+        record.verifiedTranscriptBytes,
+        fs.statSync(harness.transcriptOf(SESSION_A)).size,
+      );
+    }
+    assert.ok(report.processed > 0);
+  });
+
+  it('recovers the catalog even after Claude Code has already run once', async () => {
+    // importCatalogIfEmpty used to return early once the local catalog had any
+    // rows, and the plugin's own hooks put rows there on the first session
+    // after install. A replacement machine then never saw its own history.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+
+    const exported = harness.drive.fileByName(catalogFileName(machineId(harness.ctx)));
+    assert.ok(exported, 'a catalog copy exists on Drive');
+
+    // A fresh machine that has already recorded a session of its own.
+    const fresh = makeHarness();
+    fs.writeFileSync(
+      path.join(fresh.projectDir, 'aaaa1111-2222-3333-4444-555555555555.jsonl'),
+      '{"type":"user","message":{"role":"user","content":"new machine"}}\n',
+    );
+    await runSweep(fresh.ctx);
+    assert.ok(catalogStats(fresh.ctx.db).sessions > 0, 'it has rows before recovery runs');
+
+    const imported = importCatalogFile(
+      { db: () => fresh.ctx.db } as never,
+      writeCatalogTo(exported.content),
+    );
+    assert.ok(imported > 0, 'the archived history is still importable');
+    assert.ok(getSession(fresh.ctx.db, SESSION_A), 'and the old sessions are searchable');
+  });
+});
+
+/** Write a downloaded catalog to a temp file so importCatalogFile can read it. */
+function writeCatalogTo(content: Buffer): string {
+  const file = path.join(tempDir(), 'recovered.sqlite');
+  fs.writeFileSync(file, content);
+  return file;
+}

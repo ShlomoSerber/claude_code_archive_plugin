@@ -148,6 +148,19 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       continue;
     }
 
+    // Everything above this line was decided before a network round trip.
+    // A session resumed in the meantime would otherwise be unlinked under a
+    // live writer, losing whatever it had written since.
+    const settled = await statSession(ctx.paths, record.encodedDir, record.sessionId);
+    if (
+      settled === null ||
+      changedSinceVerification(record, settled) ||
+      isSessionActive(ctx, record.sessionId, ctx.clock.now())
+    ) {
+      report.skipped++;
+      continue;
+    }
+
     if (!(await removeLocalCopy(ctx, onDisk, target))) {
       report.skipped++;
       continue;

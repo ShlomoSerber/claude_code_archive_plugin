@@ -1389,7 +1389,8 @@ function resolvePaths(env, homedir = os.homedir) {
     statusFile: path6.join(dataDir, "status.json"),
     lockDir: path6.join(dataDir, "worker.lock"),
     runtimeCacheFile: path6.join(dataDir, "runtime.json"),
-    stagingDir: path6.join(dataDir, "staging")
+    stagingDir: path6.join(dataDir, "staging"),
+    restoreDir: path6.join(dataDir, "restoring")
   };
 }
 function encodedDirOfTranscript(transcriptPath) {

@@ -74,7 +74,7 @@ export async function restoreSession(
     // The directory is created only once verified bytes exist to put in it,
     // so a failed recovery leaves nothing behind to be mistaken for one.
     const recovery = path.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
-    const staged = path.join(ctx.paths.stagingDir, `${sessionId}.recover.tar.zst`);
+    const staged = path.join(ctx.paths.restoreDir, `${sessionId}.recover.tar.zst`);
     let recovered: string[] = [];
     try {
       await ctx.drive.downloadToFile(
@@ -140,7 +140,7 @@ export async function restoreSession(
   }
 
   const remoteFileId = requireRemote(record);
-  const staged = path.join(ctx.paths.stagingDir, `${sessionId}.restore.tar.zst`);
+  const staged = path.join(ctx.paths.restoreDir, `${sessionId}.restore.tar.zst`);
   try {
     await ctx.drive.downloadToFile({ fileId: remoteFileId, destination: staged }, ctx.signal);
 

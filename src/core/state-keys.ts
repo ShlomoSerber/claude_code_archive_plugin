@@ -21,6 +21,8 @@ export const KV = {
   skippedCount: 'scan.skipped_count',
   /** How many of those were unreadable rather than badly named. */
   unreadableCount: 'scan.unreadable_count',
+  /** Stable id for this installation, so two machines never share a catalog file. */
+  machineId: 'machine.id',
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: 'backfill.done_at',
 } as const;

@@ -28,6 +28,8 @@ export type ArchivePaths = {
   readonly runtimeCacheFile: string;
   /** Scratch space for `.partial` bundles, a sibling of nothing else. */
   readonly stagingDir: string;
+  /** Downloads in progress. Separate from staging, which sweeps clean out. */
+  readonly restoreDir: string;
 };
 
 /**
@@ -70,6 +72,7 @@ export function resolvePaths(env: Environment, homedir: () => string = os.homedi
     lockDir: path.join(dataDir, 'worker.lock'),
     runtimeCacheFile: path.join(dataDir, 'runtime.json'),
     stagingDir: path.join(dataDir, 'staging'),
+    restoreDir: path.join(dataDir, 'restoring'),
   };
 }
 

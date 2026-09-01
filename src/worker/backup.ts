@@ -225,6 +225,13 @@ async function publish(
   // check it holds exactly those bytes. Everything downstream compares our
   // hash of the bundle with Drive's hash of the bundle, which proves the
   // transfer and would happily certify a bundle of the wrong session.
+  // Stat before hashing, so the closing stat below can prove nothing moved
+  // while the files were being read. Without it the recorded mtime described a
+  // moment *after* the hashes, and a same-size in-place rewrite landing between
+  // the two was invisible to both checks — the session was marked verified and
+  // the reaper then deleted bytes the archive did not contain.
+  const before = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+
   const files = await describeSessionFiles({
     cwd: path.dirname(session.transcriptPath),
     entries: bundleEntries(session),
@@ -242,6 +249,11 @@ async function publish(
   const confirmed = await statSession(ctx.paths, session.encodedDir, session.sessionId);
   if (confirmed === null || confirmed.transcriptBytes + confirmed.sidecarBytes !== archivedBytes) {
     throw new RetryableError('the session changed while it was being archived');
+  }
+  if (before === null || Math.trunc(confirmed.mtimeMs) !== Math.trunc(before.mtimeMs)) {
+    // Same size, different mtime: something rewrote a file in place while it
+    // was being hashed. The bundle and the fingerprint would disagree.
+    throw new RetryableError('the session was written to while it was being archived');
   }
 
   // A session that has shrunk since it was archived is the signature of
@@ -401,9 +413,11 @@ export async function verifyRemote(
 
   ctx.logger.error('backup.verification_failed', { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
-  // This one is safe to remove outright: it is the file this run just uploaded
-  // and just proved wrong, and nothing else points at it.
-  await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => undefined);
+  // Trashed, not deleted. uploadWithResume can hand back a *pre-existing*
+  // file it found by name, so "the file this run just created" is not always
+  // true, and a permanent delete would be unrecoverable if it were the copy
+  // remote_file_id still points at.
+  await ctx.drive.trashFile(uploaded.id, ctx.signal).catch(() => undefined);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
 }
 
@@ -427,7 +441,8 @@ export function hasAllFloors(previous: SessionRecord | null): boolean {
   return (
     previous?.verifiedTranscriptBytes != null &&
     previous.verifiedSidecarBytes !== null &&
-    previous.verifiedLocalBytes !== null
+    previous.verifiedLocalBytes !== null &&
+    previous.verifiedTranscriptSha256 !== null
   );
 }
 

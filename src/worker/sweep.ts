@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import os from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { getSqlite } from '../adapters/sqlite.ts';
 import { removePartials } from '../adapters/atomic.ts';
@@ -371,9 +371,26 @@ function catalogCopyIsStale(ctx: WorkerContext): boolean {
  * only whichever swept last. The bundles were all still there; the promise that
  * a dead laptop loses nothing was not.
  */
-export function catalogFileName(hostname: string = os.hostname()): string {
-  const tag = createHash('sha256').update(hostname).digest('hex').slice(0, 8);
-  return `catalog-${tag}.sqlite`;
+export function catalogFileName(machineId: string): string {
+  return `catalog-${machineId}.sqlite`;
+}
+
+/**
+ * A stable id for this installation, minted once and kept in the catalog.
+ *
+ * Derived from the hostname plus randomness, because two machines with the
+ * same name — a corporate image, two default macOS installs — would otherwise
+ * share a catalog file and overwrite each other every sweep.
+ */
+export function machineId(ctx: WorkerContext): string {
+  const existing = kvGet(ctx.db, KV.machineId);
+  if (existing !== undefined && existing !== '') return existing;
+  const minted = createHash('sha256')
+    .update(`${os.hostname()}:${randomBytes(8).toString('hex')}`)
+    .digest('hex')
+    .slice(0, 8);
+  kvSet(ctx.db, KV.machineId, minted, ctx.clock.now());
+  return minted;
 }
 
 export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
@@ -388,11 +405,12 @@ export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
     const existingId = cached === undefined || cached === '' ? undefined : cached;
     const existing =
       existingId ??
-      (await ctx.drive.findFile({ name: catalogFileName(), parentId }, ctx.signal))?.id;
+      (await ctx.drive.findFile({ name: catalogFileName(machineId(ctx)), parentId }, ctx.signal))
+        ?.id;
 
     const uploaded = await ctx.drive.uploadSmallFile(
       {
-        name: catalogFileName(),
+        name: catalogFileName(machineId(ctx)),
         parentId,
         mimeType: 'application/vnd.sqlite3',
         body: await fsp.readFile(destination),
