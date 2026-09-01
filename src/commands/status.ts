@@ -275,7 +275,9 @@ export async function runStatus(
     );
   }
   if (auditMismatched > 0) {
-    print(`  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`);
+    print(
+      `  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`,
+    );
     print(`                      and a Drive copy that failed its last check.`);
     print(`                      Run /archive:verify --all, and check the Drive wastebasket.`);
   }

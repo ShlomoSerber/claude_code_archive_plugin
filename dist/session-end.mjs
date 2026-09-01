@@ -1773,8 +1773,6 @@ var KV = {
   catalogUploadedAt: "catalog.uploaded_at",
   /** Drive file id of the catalog copy, so it is replaced and not duplicated. */
   catalogFileId: "catalog.file_id",
-  /** Sessions counted at the last full scan, shown by /archive:status. */
-  lastScanAt: "scan.last_at",
   /** Sessions or projects the last scan could not archive, for /archive:status. */
   skippedCount: "scan.skipped_count",
   /** How many of those were unreadable rather than badly named. */
@@ -1785,10 +1783,6 @@ var KV = {
   workerSpawnedAt: "worker.spawned_at",
   /** Last time a worker actually reached its main loop. */
   workerRanAt: "worker.ran_at",
-  /** Sidecar directories left on disk by a transcript that vanished. */
-  orphanSidecars: "reap.orphan_sidecars",
-  /** Reaped sessions whose Drive copy failed a re-check. */
-  auditMismatched: "audit.mismatched",
   /** Last time a session was told the plugin is installed but not set up. */
   setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */

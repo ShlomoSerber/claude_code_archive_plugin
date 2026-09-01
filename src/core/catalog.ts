@@ -253,14 +253,6 @@ export type RetainedBundle = {
   createdAt: number;
 };
 
-/**
- * Remember a superseded bundle that was deliberately not retired.
- *
- * When the replacement does not provably contain the old bundle, the old one
- * stays on Drive — but `remote_file_id` has already moved on, so nothing
- * pointed at it and its unique contents were reachable only by browsing Drive
- * by hand. This row is that pointer.
- */
 /** How many verbatim prompts the catalog already holds for a session. */
 export function countPrompts(db: Db, sessionId: string): number {
   const row = db
@@ -277,6 +269,14 @@ export function countSessionFiles(db: Db, sessionId: string): number {
   return row?.n ?? 0;
 }
 
+/**
+ * Remember a superseded bundle that was deliberately not retired.
+ *
+ * When the replacement does not provably contain the old bundle, the old one
+ * stays on Drive — but `remote_file_id` has already moved on, so nothing
+ * pointed at it and its unique contents were reachable only by browsing Drive
+ * by hand. This row is that pointer.
+ */
 export function recordRetainedBundle(
   db: Db,
   entry: {
@@ -591,12 +591,21 @@ export function markAudited(db: Db, sessionIds: readonly string[], now: number):
   });
 }
 
-/** Sessions that still need a verified copy on Drive. */
+/**
+ * Sessions that still need a verified copy on Drive.
+ *
+ * local_present, because a session with no local copy cannot be backed up:
+ * there is nothing left to send. Those rows land here when an audit withdraws
+ * a verification, and counting them made /archive:verify answer a damaged
+ * archive with "run /archive:now", which cannot help, and made
+ * /archive:status warn that sessions were waiting when none were.
+ * countDamagedArchives is what describes that condition.
+ */
 export function listUnverified(db: Db, limit = 500): SessionRecord[] {
   const rows = db
     .prepare(
       `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NULL
+        WHERE verified_at IS NULL AND local_present = 1
         ORDER BY COALESCE(ended_at, created_at) DESC
         LIMIT ?`,
     )
@@ -623,7 +632,10 @@ export function catalogStats(db: Db): CatalogStats {
          count(*) AS sessions,
          sum(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END) AS verified,
          sum(CASE WHEN local_present = 1 THEN 1 ELSE 0 END) AS local_present,
-         sum(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END) AS pending_backup,
+         -- Same reasoning as listUnverified: a reaped session whose audit
+         -- withdrew its verification is not waiting to be backed up.
+         sum(CASE WHEN verified_at IS NULL AND local_present = 1 THEN 1 ELSE 0 END)
+           AS pending_backup,
          -- An orphan-sidecar row is local_present = 1 with no transcript, so
          -- counting its transcript_bytes overstated the disk by the size of a
          -- file that is not there.

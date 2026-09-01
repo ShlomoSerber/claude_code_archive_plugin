@@ -138,6 +138,15 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
 }
 
 /**
+ * Every write to a claimed job is scoped `claim_token = ?`, never `IS ?`.
+ *
+ * With `=`, a job object carrying no token — one read back with getJob rather
+ * than claimed — matches nothing and the write is a no-op. With `IS`, it would
+ * match every unclaimed row with that id and quietly rewrite work this worker
+ * does not hold.
+ */
+
+/**
  * Take the oldest runnable job, if any.
  *
  * SQLite serializes writers, so this single statement is the whole mutual
@@ -205,7 +214,7 @@ export function retryLater(db: Db, job: Job, args: { at: number; error: string }
             claim_token = NULL,
             last_error  = ?,
             updated_at  = ?
-      WHERE id = ? AND claim_token IS ?`,
+      WHERE id = ? AND claim_token = ?`,
   ).run(args.at, args.error, args.at, job.id, job.claimToken);
 }
 
@@ -217,7 +226,7 @@ export function block(db: Db, job: Job, args: { error: string; now: number }): v
   db.prepare(
     `UPDATE jobs
         SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
-      WHERE id = ? AND claim_token IS ?`,
+      WHERE id = ? AND claim_token = ?`,
   ).run(args.now, args.error, args.now, job.id, job.claimToken);
 }
 
@@ -246,9 +255,12 @@ export function setUploadUri(db: Db, job: Job, uri: string | null, now: number):
   // Scoped to the claim, like complete() and heartbeatClaim(). A worker whose
   // claim has been superseded could otherwise null the new claimant's URI and
   // make it restart an upload that was nearly done.
-  db.prepare(
-    'UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token IS ?',
-  ).run(uri, now, job.id, job.claimToken);
+  db.prepare('UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token = ?').run(
+    uri,
+    now,
+    job.id,
+    job.claimToken,
+  );
 }
 
 /**

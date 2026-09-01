@@ -301,9 +301,9 @@ export async function restoreSession(
       throw new RetryableError(
         quarantine === null
           ? `the restored session is incomplete: ${problem}. It could not be moved aside, ` +
-            `so it is still in ${targetDir} — remove it by hand before archiving runs again.`
+              `so it is still in ${targetDir} — remove it by hand before archiving runs again.`
           : `the restored session is incomplete: ${problem}. What was unpacked has been ` +
-            `moved to ${quarantine} rather than deleted.`,
+              `moved to ${quarantine} rather than deleted.`,
       );
     }
 
@@ -538,8 +538,14 @@ export async function verifyArchive(
   ctx: WorkerContext,
   records: SessionRecord[],
 ): Promise<VerifyReport> {
-  const report: VerifyReport = { checked: 0, ok: 0,
-    okIds: [], mismatched: [], missing: [], unchecked: [] };
+  const report: VerifyReport = {
+    checked: 0,
+    ok: 0,
+    okIds: [],
+    mismatched: [],
+    missing: [],
+    unchecked: [],
+  };
   for (const record of records) {
     ctx.signal?.throwIfAborted();
     if (record.remoteFileId === null) {

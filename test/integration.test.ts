@@ -10,6 +10,7 @@ import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
 import {
   countDamagedArchives,
+  listUnverified,
   SESSION_COLUMNS,
   toRecord,
   type SessionRow,
@@ -2872,7 +2873,7 @@ describe('an archived bundle that goes bad after its local copy is freed', () =>
     harness.clock.advance(60_000);
     await runSweep(harness.ctx, { force: true });
     assert.ok(
-      (kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) > 0,
+      countDamagedArchives(harness.ctx.db) > 0,
       'the damage is found without anyone asking',
     );
   });
@@ -2928,7 +2929,7 @@ describe('an archive check that failed once', () => {
     harness.clock.advance(60_000);
     await runSweep(harness.ctx, { force: true });
     assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null, 'trust withdrawn');
-    assert.ok((kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) > 0);
+    assert.ok(countDamagedArchives(harness.ctx.db) > 0);
 
     harness.drive.options = { ...harness.drive.options, corruptChecksums: false };
     for (let sweep = 0; sweep < 2; sweep++) {
@@ -2939,7 +2940,7 @@ describe('an archive check that failed once', () => {
       getSession(harness.ctx.db, SESSION_A)?.verifiedAt,
       'a session with no local copy can get its verification back',
     );
-    assert.equal(kvGetNumber(harness.ctx.db, KV.auditMismatched), 0, 'and the warning clears');
+    assert.equal(countDamagedArchives(harness.ctx.db), 0, 'and the warning clears');
   });
 });
 
@@ -2979,7 +2980,11 @@ describe('an audit that could not reach Drive', () => {
       null,
       'a check that could not be made is not a check that passed',
     );
-    assert.ok((kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) >= 0);
+    assert.equal(
+      countDamagedArchives(harness.ctx.db),
+      1,
+      'a check that could not be made leaves the damage counted',
+    );
   });
 });
 
@@ -3182,5 +3187,61 @@ describe('an account whose token Google has rejected', () => {
     assert.equal(result.status, 0);
     assert.match(result.stdout, /cannot back up/);
     assert.match(result.stdout, /archive:status/);
+  });
+});
+
+/**
+ * A whole-system read, after the thirty-two adversarial rounds. These are the
+ * seams between modules rather than faults inside one: a query whose meaning
+ * had drifted from what its callers say about it, and a choice that depended
+ * on directory order.
+ */
+describe('what "waiting to be archived" counts', () => {
+  it('excludes a session with no local copy left to send', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
+    await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(catalogStats(harness.ctx.db).pendingBackup, 0, 'everything is archived');
+
+    // An audit withdraws the verification of a session that has no local copy.
+    // It is a damaged archive, not work waiting to be done — and the advice
+    // for the two is opposite: /archive:now cannot send what is not there.
+    clearVerification(harness.ctx.db, SESSION_A, harness.clock.now());
+
+    assert.equal(catalogStats(harness.ctx.db).pendingBackup, 0);
+    assert.deepEqual(listUnverified(harness.ctx.db, 10), []);
+  });
+});
+
+describe('the same session id under two project directories', () => {
+  it('keeps archiving the copy the catalog already knows', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const known = getSession(harness.ctx.db, SESSION_A)?.encodedDir;
+    assert.ok(known);
+
+    // A copied project directory: the same session id now exists twice.
+    const second = path.join(harness.ctx.paths.projectsDir, '-home-a-shop-copy');
+    fs.mkdirSync(second, { recursive: true });
+    fs.copyFileSync(harness.transcriptOf(SESSION_A), path.join(second, `${SESSION_A}.jsonl`));
+
+    // The winner must not change between sweeps: each change is a full
+    // re-bundle and another bundle on Drive nothing collects. Directory order
+    // is not controllable from here, so this pins the invariant rather than
+    // proving the tie-break — it passes with the tie-break removed too.
+    for (let sweep = 0; sweep < 3; sweep++) {
+      harness.clock.advance(60_000);
+      await runSweep(harness.ctx, { force: true });
+      assert.equal(
+        getSession(harness.ctx.db, SESSION_A)?.encodedDir,
+        known,
+        `sweep ${String(sweep)}`,
+      );
+    }
+    assert.equal(listRetainedBundles(harness.ctx.db).length, 0, 'and nothing is left behind');
   });
 });

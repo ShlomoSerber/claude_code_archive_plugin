@@ -2625,7 +2625,7 @@ function markAudited(db, sessionIds, now) {
 function listUnverified(db, limit = 500) {
   const rows = db.prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE verified_at IS NULL
+        WHERE verified_at IS NULL AND local_present = 1
         ORDER BY COALESCE(ended_at, created_at) DESC
         LIMIT ?`
   ).all(limit);
@@ -2637,7 +2637,10 @@ function catalogStats(db) {
          count(*) AS sessions,
          sum(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END) AS verified,
          sum(CASE WHEN local_present = 1 THEN 1 ELSE 0 END) AS local_present,
-         sum(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END) AS pending_backup,
+         -- Same reasoning as listUnverified: a reaped session whose audit
+         -- withdrew its verification is not waiting to be backed up.
+         sum(CASE WHEN verified_at IS NULL AND local_present = 1 THEN 1 ELSE 0 END)
+           AS pending_backup,
          -- An orphan-sidecar row is local_present = 1 with no transcript, so
          -- counting its transcript_bytes overstated the disk by the size of a
          -- file that is not there.
@@ -2806,14 +2809,14 @@ function retryLater(db, job, args) {
             claim_token = NULL,
             last_error  = ?,
             updated_at  = ?
-      WHERE id = ? AND claim_token IS ?`
+      WHERE id = ? AND claim_token = ?`
   ).run(args.at, args.error, args.at, job.id, job.claimToken);
 }
 function block(db, job, args) {
   db.prepare(
     `UPDATE jobs
         SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
-      WHERE id = ? AND claim_token IS ?`
+      WHERE id = ? AND claim_token = ?`
   ).run(args.now, args.error, args.now, job.id, job.claimToken);
 }
 function unblockStale(db, now, olderThanMs) {
@@ -2825,9 +2828,12 @@ function unblockStale(db, now, olderThanMs) {
   return Number(result.changes);
 }
 function setUploadUri(db, job, uri, now) {
-  db.prepare(
-    "UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token IS ?"
-  ).run(uri, now, job.id, job.claimToken);
+  db.prepare("UPDATE jobs SET upload_uri = ?, updated_at = ? WHERE id = ? AND claim_token = ?").run(
+    uri,
+    now,
+    job.id,
+    job.claimToken
+  );
 }
 function nextRunnableAt(db, now) {
   const row = db.prepare(
@@ -2900,8 +2906,6 @@ var KV = {
   catalogUploadedAt: "catalog.uploaded_at",
   /** Drive file id of the catalog copy, so it is replaced and not duplicated. */
   catalogFileId: "catalog.file_id",
-  /** Sessions counted at the last full scan, shown by /archive:status. */
-  lastScanAt: "scan.last_at",
   /** Sessions or projects the last scan could not archive, for /archive:status. */
   skippedCount: "scan.skipped_count",
   /** How many of those were unreadable rather than badly named. */
@@ -2912,10 +2916,6 @@ var KV = {
   workerSpawnedAt: "worker.spawned_at",
   /** Last time a worker actually reached its main loop. */
   workerRanAt: "worker.ran_at",
-  /** Sidecar directories left on disk by a transcript that vanished. */
-  orphanSidecars: "reap.orphan_sidecars",
-  /** Reaped sessions whose Drive copy failed a re-check. */
-  auditMismatched: "audit.mismatched",
   /** Last time a session was told the plugin is installed but not set up. */
   setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */
@@ -7695,7 +7695,6 @@ async function runSweep(ctx, options = {}) {
     const at2 = ctx.clock.now();
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at2);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at2);
-    kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at2);
     kvSetNumber(ctx.db, KV.reapRanAt, at2, at2);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
@@ -7723,6 +7722,8 @@ async function discover(ctx, now, flags) {
   for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
+    const mtime = Math.trunc(session.mtimeMs);
+    const known = getSession(ctx.db, session.sessionId);
     if (seen.has(session.sessionId)) {
       skipped.push({ kind: "session", name: session.sessionId, reason: "duplicate" });
       ctx.logger.warn("sweep.duplicate_session", {
@@ -7731,9 +7732,15 @@ async function discover(ctx, now, flags) {
       });
       continue;
     }
+    if (known !== null && known.encodedDir !== session.encodedDir && await alsoAtKnownDir(ctx, known)) {
+      skipped.push({ kind: "session", name: session.sessionId, reason: "duplicate" });
+      ctx.logger.warn("sweep.duplicate_session", {
+        session_id: session.sessionId,
+        encoded_dir: session.encodedDir
+      });
+      continue;
+    }
     seen.add(session.sessionId);
-    const mtime = Math.trunc(session.mtimeMs);
-    const known = getSession(ctx.db, session.sessionId);
     if (known === null) {
       upsertSession(
         ctx.db,
@@ -7770,7 +7777,6 @@ async function discover(ctx, now, flags) {
       enqueued++;
     }
   }
-  kvSetNumber(ctx.db, KV.lastScanAt, now, now);
   if (skipped.length > 0) {
     const unreadable = skipped.filter((entry) => entry.reason === "unreadable");
     ctx.logger.error("sweep.skipped_unarchivable", {
@@ -7785,6 +7791,9 @@ async function discover(ctx, now, flags) {
     kvSetNumber(ctx.db, KV.unreadableCount, 0, now);
   }
   return { discovered, enqueued };
+}
+async function alsoAtKnownDir(ctx, known) {
+  return await statSession(ctx.paths, known.encodedDir, known.sessionId) !== null;
 }
 async function drain(ctx, deadline, report) {
   for (; ; ) {
@@ -7914,7 +7923,6 @@ async function auditReaped(ctx) {
       first: report.mismatched[0]?.reason ?? ""
     });
   }
-  kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
   return report.checked;
 }
 function catalogCopyIsStale(ctx) {
@@ -9184,7 +9192,9 @@ async function runStatus(runtime, options) {
     );
   }
   if (auditMismatched > 0) {
-    print(`  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`);
+    print(
+      `  WARNING:            ${String(auditMismatched)} archived session(s) have no local copy`
+    );
     print(`                      and a Drive copy that failed its last check.`);
     print(`                      Run /archive:verify --all, and check the Drive wastebasket.`);
   }

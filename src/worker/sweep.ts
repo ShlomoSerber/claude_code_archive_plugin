@@ -5,13 +5,16 @@ import path from 'node:path';
 import { getSqlite } from '../adapters/sqlite.ts';
 import { removePartials } from '../adapters/atomic.ts';
 import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
-import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
+import { scanSessions, statSession, type ScanSkip } from '../adapters/session-scan.ts';
+import type { SessionRecord } from '../core/catalog.ts';
 import {
   getSession,
   markLocalPresent,
   upsertSession,
   listReapedForAudit,
-  markAudited, restoreVerification } from '../core/catalog.ts';
+  markAudited,
+  restoreVerification,
+} from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
 import {
   FatalError,
@@ -159,7 +162,6 @@ export async function runSweep(
     const at = ctx.clock.now();
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at);
-    kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at);
     kvSetNumber(ctx.db, KV.reapRanAt, at, at);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? '', at);
   }
@@ -208,6 +210,8 @@ async function discover(
   for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
+    const mtime = Math.trunc(session.mtimeMs);
+    const known = getSession(ctx.db, session.sessionId);
     if (seen.has(session.sessionId)) {
       skipped.push({ kind: 'session', name: session.sessionId, reason: 'duplicate' });
       ctx.logger.warn('sweep.duplicate_session', {
@@ -216,9 +220,23 @@ async function discover(
       });
       continue;
     }
+    // The copy the catalog already knows wins, not whichever readdir happened
+    // to return first. Otherwise the winner can change between sweeps, and each
+    // change is a full re-bundle of the session and another retained bundle on
+    // Drive that nothing will ever collect.
+    if (
+      known !== null &&
+      known.encodedDir !== session.encodedDir &&
+      (await alsoAtKnownDir(ctx, known))
+    ) {
+      skipped.push({ kind: 'session', name: session.sessionId, reason: 'duplicate' });
+      ctx.logger.warn('sweep.duplicate_session', {
+        session_id: session.sessionId,
+        encoded_dir: session.encodedDir,
+      });
+      continue;
+    }
     seen.add(session.sessionId);
-    const mtime = Math.trunc(session.mtimeMs);
-    const known = getSession(ctx.db, session.sessionId);
 
     if (known === null) {
       upsertSession(
@@ -265,7 +283,6 @@ async function discover(
     }
   }
 
-  kvSetNumber(ctx.db, KV.lastScanAt, now, now);
   if (skipped.length > 0) {
     const unreadable = skipped.filter((entry) => entry.reason === 'unreadable');
     ctx.logger.error('sweep.skipped_unarchivable', {
@@ -280,6 +297,11 @@ async function discover(
     kvSetNumber(ctx.db, KV.unreadableCount, 0, now);
   }
   return { discovered, enqueued };
+}
+
+/** Is this session also present under the project directory the catalog names? */
+async function alsoAtKnownDir(ctx: WorkerContext, known: SessionRecord): Promise<boolean> {
+  return (await statSession(ctx.paths, known.encodedDir, known.sessionId)) !== null;
 }
 
 /** Run queued jobs until the queue empties or the run runs out of time. */
@@ -473,8 +495,6 @@ async function auditReaped(ctx: WorkerContext): Promise<number> {
       first: report.mismatched[0]?.reason ?? '',
     });
   }
-  // Written every run, including zero: the warning has to be able to clear.
-  kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at);
   return report.checked;
 }
 
