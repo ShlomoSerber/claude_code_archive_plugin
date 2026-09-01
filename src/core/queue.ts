@@ -205,8 +205,8 @@ export function retryLater(db: Db, job: Job, args: { at: number; error: string }
             claim_token = NULL,
             last_error  = ?,
             updated_at  = ?
-      WHERE id = ?`,
-  ).run(args.at, args.error, args.at, job.id);
+      WHERE id = ? AND claim_token IS ?`,
+  ).run(args.at, args.error, args.at, job.id, job.claimToken);
 }
 
 /**
@@ -217,8 +217,8 @@ export function block(db: Db, job: Job, args: { error: string; now: number }): v
   db.prepare(
     `UPDATE jobs
         SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
-      WHERE id = ?`,
-  ).run(args.now, args.error, args.now, job.id);
+      WHERE id = ? AND claim_token IS ?`,
+  ).run(args.now, args.error, args.now, job.id, job.claimToken);
 }
 
 /**

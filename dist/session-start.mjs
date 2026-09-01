@@ -2140,9 +2140,9 @@ async function main() {
 async function warnIfUnconfigured(runtime, now) {
   const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
   if (now - lastWarned < DAY_MS) return;
-  const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => true);
-  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => null);
-  const owned = cleanup === CLEANUP_PERIOD_DAYS;
+  const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
+  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => void 0);
+  const owned = cleanup === void 0 || cleanup === CLEANUP_PERIOD_DAYS;
   if (signedIn && owned) return;
   kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);
   emitSystemMessage(

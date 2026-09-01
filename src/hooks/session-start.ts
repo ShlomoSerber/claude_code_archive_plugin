@@ -94,12 +94,17 @@ async function warnIfUnconfigured(runtime: Runtime, now: number): Promise<void> 
   const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
   if (now - lastWarned < DAY_MS) return;
 
+  // A token file that cannot be read is a token file that cannot be used, and
+  // /archive:status says "not connected" for exactly this. The two readers
+  // disagreeing meant a chmod-000 tokens.json produced no warning anywhere.
   const signedIn = await runtime.tokenStore
     .read()
     .then((tokens) => tokens !== null)
-    .catch(() => true);
-  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => null);
-  const owned = cleanup === CLEANUP_PERIOD_DAYS;
+    .catch(() => false);
+  // Unreadable settings, on the other hand, is not evidence that Claude Code
+  // is still deleting transcripts — and saying so would be a false alarm.
+  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => undefined);
+  const owned = cleanup === undefined || cleanup === CLEANUP_PERIOD_DAYS;
   if (signedIn && owned) return;
 
   kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);

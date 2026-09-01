@@ -246,6 +246,12 @@ function trimmed(value) {
 }
 
 // src/hooks/last-resort.ts
+function clearLastResort(event) {
+  try {
+    fs2.rmSync(path3.join(resolvePaths(process.env).dataDir, markerName(event)), { force: true });
+  } catch {
+  }
+}
 function markerName(event) {
   if (event.startsWith("worker.")) return "worker-error.json";
   return event.startsWith("hook.session_start") ? "hook-error-start.json" : "hook-error-end.json";
@@ -933,6 +939,7 @@ var DISPOSABLE = [
   ".retained.tar.zst"
 ];
 var RESTORE_GRACE_MS = 60 * 6e4;
+var RESTORE_SUFFIXES = [".restore.tar.zst", ".recover.tar.zst", ".retained.tar.zst"];
 async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
@@ -946,7 +953,8 @@ async function removePartials(dir, now = Date.now()) {
     const full = path6.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
-      const grace = entry.endsWith(".partial") || entry.endsWith(".building.tar.zst") ? PARTIAL_GRACE_MS : RESTORE_GRACE_MS;
+      const restoring = RESTORE_SUFFIXES.some((suffix) => entry.includes(suffix));
+      const grace = restoring ? RESTORE_GRACE_MS : PARTIAL_GRACE_MS;
       if (now - stat.mtimeMs < grace) continue;
     } catch {
       continue;
@@ -2703,15 +2711,15 @@ function retryLater(db, job, args) {
             claim_token = NULL,
             last_error  = ?,
             updated_at  = ?
-      WHERE id = ?`
-  ).run(args.at, args.error, args.at, job.id);
+      WHERE id = ? AND claim_token IS ?`
+  ).run(args.at, args.error, args.at, job.id, job.claimToken);
 }
 function block(db, job, args) {
   db.prepare(
     `UPDATE jobs
         SET blocked = 1, blocked_at = ?, claim_token = NULL, last_error = ?, updated_at = ?
-      WHERE id = ?`
-  ).run(args.now, args.error, args.now, job.id);
+      WHERE id = ? AND claim_token IS ?`
+  ).run(args.now, args.error, args.now, job.id, job.claimToken);
 }
 function unblockStale(db, now, olderThanMs) {
   const result = db.prepare(
@@ -6865,6 +6873,7 @@ async function reapLocalCopies(ctx, now, limit) {
     }
     if (isSessionActive(ctx, record.sessionId, now)) {
       log.info("reap.session_active");
+      markReapSkipped(ctx.db, record.sessionId, "session-active", now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }
@@ -7591,6 +7600,7 @@ function unavailableDrive(reason) {
 }
 try {
   await main();
+  clearLastResort("worker.failed_to_start");
 } catch (err) {
   logLastResort("worker.failed_to_start", err);
 }

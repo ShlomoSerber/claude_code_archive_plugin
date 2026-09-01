@@ -203,6 +203,11 @@ export async function reapLocalCopies(
     // the last flush is lost and the session cannot be resumed.
     if (isSessionActive(ctx, record.sessionId, now)) {
       log.info('reap.session_active');
+      // Stamped like every other skip that does not clear itself. The mark
+      // lasts six months, and these rows sort to the front of the candidate
+      // window on every run — 500 of them would stop reclamation completely.
+      // markLocalPresent clears the stamp when the session is scanned again.
+      markReapSkipped(ctx.db, record.sessionId, 'session-active', now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }

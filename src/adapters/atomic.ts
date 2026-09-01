@@ -161,6 +161,8 @@ const DISPOSABLE = [
  */
 const RESTORE_GRACE_MS = 60 * 60_000;
 
+const RESTORE_SUFFIXES = ['.restore.tar.zst', '.recover.tar.zst', '.retained.tar.zst'];
+
 export async function removePartials(dir: string, now = Date.now()): Promise<string[]> {
   let entries: string[];
   try {
@@ -180,9 +182,11 @@ export async function removePartials(dir: string, now = Date.now()): Promise<str
       // A restore downloads through a temp file with the same suffix, and a
       // sweep running beside it would otherwise delete the file mid-download.
       const stat = await fsp.stat(full);
-      const grace = entry.endsWith('.partial') || entry.endsWith('.building.tar.zst')
-        ? PARTIAL_GRACE_MS
-        : RESTORE_GRACE_MS;
+      // A download writes through <name>.<hex>.partial, so the restore
+      // suffixes appear in the middle of the name rather than at the end —
+      // which gave the file this grace exists to protect the short one.
+      const restoring = RESTORE_SUFFIXES.some((suffix) => entry.includes(suffix));
+      const grace = restoring ? RESTORE_GRACE_MS : PARTIAL_GRACE_MS;
       if (now - stat.mtimeMs < grace) continue;
     } catch {
       continue;

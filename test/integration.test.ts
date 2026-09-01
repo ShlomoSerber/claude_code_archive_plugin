@@ -125,6 +125,19 @@ function makeHarness(overrides: Partial<ArchiveConfig> = {}, drive = new FakeDri
   fs.writeFileSync(path.join(projectDir, SESSION_B, 'tool-result.json'), '{"stdout":"ok"}');
 
   const clock = fakeClock(Date.UTC(2026, 7, 31, 12));
+  // Anchor every file to the fake clock. Real mtimes against a fake clock made
+  // whether a session counted as idle depend on the wall-clock time of day the
+  // suite happened to run.
+  const anchor = new Date(clock.now());
+  const anchorTree = (target: string): void => {
+    for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+      const full = path.join(target, entry.name);
+      if (entry.isDirectory()) anchorTree(full);
+      fs.lutimesSync(full, anchor, anchor);
+    }
+    fs.utimesSync(target, anchor, anchor);
+  };
+  anchorTree(projectDir);
   const ctx: WorkerContext = {
     db: openDatabase(path.join(dataDir, 'archive.sqlite')),
     paths,
@@ -296,7 +309,6 @@ describe('reaping local copies', () => {
 
     harness.clock.advance(31 * DAY_MS);
     const report = await reapLocalCopies(harness.ctx, harness.clock.now());
-
     assert.equal(report.deleted, 2);
     assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false);
     assert.equal(fs.existsSync(path.join(harness.projectDir, SESSION_B)), false, 'sidecar too');
@@ -3064,5 +3076,60 @@ describe('a plugin that is installed but not set up', () => {
 
     // At most once a day: a warning on every session start is noise.
     assert.equal(runHook(home).stdout.includes('systemMessage'), false);
+  });
+});
+
+/**
+ * Thirty-first round. Objective 1 held under ~1 900 randomized rounds with a
+ * validated negative control. The finding was that the longer open-session
+ * mark, added last round, could hold the reaper's candidate window.
+ */
+describe('a session Claude Code still has open', () => {
+  it('does not hold the window against sessions that could be reclaimed', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    for (let index = 0; index < 6; index++) {
+      const id = `dddddddd-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      fs.writeFileSync(
+        path.join(harness.projectDir, `${id}.jsonl`),
+        transcriptLines(id, `Open ${String(index)}`, 'still going'),
+      );
+    }
+    await runSweep(harness.ctx);
+
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const entry of fs.readdirSync(harness.projectDir)) {
+      fs.lutimesSync(path.join(harness.projectDir, entry), old, old);
+    }
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    // The open ones are older, so they sort to the front of the window.
+    const older = new Date(old.getTime() - 10 * DAY_MS);
+    for (let index = 0; index < 6; index++) {
+      const id = `dddddddd-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      fs.lutimesSync(harness.transcriptOf(id), older, older);
+    }
+    harness.ctx.db
+      .prepare("UPDATE sessions SET verified_local_mtime = ? WHERE session_id LIKE 'dddddddd%'")
+      .run(older.getTime());
+    for (let index = 0; index < 6; index++) {
+      const id = `dddddddd-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      kvSetNumber(harness.ctx.db, activeSessionKey(id), harness.clock.now(), harness.clock.now());
+    }
+    harness.clock.advance(40 * DAY_MS);
+
+    // A window narrower than the number of open sessions: on the old code they
+    // filled it on every run and nothing else was ever looked at.
+    for (let pass = 0; pass < 3; pass++) {
+      await reapLocalCopies(harness.ctx, harness.clock.now(), 4);
+      harness.clock.advance(60_000);
+    }
+    assert.equal(
+      fs.existsSync(harness.transcriptOf(SESSION_A)),
+      false,
+      'the idle session is still reclaimed',
+    );
+    for (let index = 0; index < 6; index++) {
+      const id = `dddddddd-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      assert.equal(fs.existsSync(harness.transcriptOf(id)), true, 'and the open ones are kept');
+    }
   });
 });
