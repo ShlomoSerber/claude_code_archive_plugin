@@ -2852,30 +2852,67 @@ describe('an archived bundle that goes bad after its local copy is freed', () =>
   });
 });
 
-describe('something added to a sidecar that carries no bytes', () => {
-  it('still counts as a difference from the archive', async () => {
+describe('an empty directory or a symlink in a sidecar', () => {
+  it('does not stop the session from ever being reclaimed', async () => {
+    // tar stores directory and symlink entries and extraction recreates them,
+    // so they are archived — the manifest simply does not name them, because
+    // it exists to carry content hashes. Treating them as unarchived made an
+    // empty sidecar directory, which Claude Code creates routinely, into a
+    // session that could never be reclaimed and was re-compressed on every
+    // sweep while /archive:status called the archive damaged.
     if (process.platform === 'win32') return;
     const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    fs.mkdirSync(path.join(harness.projectDir, SESSION_B, 'tool-results'), { recursive: true });
+    fs.symlinkSync('/etc/hostname', path.join(harness.projectDir, SESSION_B, 'link'));
     await runSweep(harness.ctx);
 
-    // A symlink and an empty directory are in neither the manifest nor the
-    // byte count, and an mtime-preserving tool hides them from the
-    // fingerprint — so nothing else would notice them.
-    const before = fs.statSync(path.join(harness.projectDir, SESSION_B));
-    fs.symlinkSync('/etc/hostname', path.join(harness.projectDir, SESSION_B, 'link'));
-    fs.utimesSync(path.join(harness.projectDir, SESSION_B), before.atime, before.mtime);
+    // Age the whole session, sidecar included: the idle clock is the newest
+    // mtime anywhere in it.
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    const age = (target: string): void => {
+      for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+        const full = path.join(target, entry.name);
+        if (entry.isDirectory()) age(full);
+        fs.lutimesSync(full, old, old);
+      }
+      fs.utimesSync(target, old, old);
+    };
+    age(harness.projectDir);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * DAY_MS);
 
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 2, 'both sessions are reclaimed');
+    assert.equal(report.unverified, 0, 'and nothing is reported as damaged');
+  });
+});
+
+describe('an archive check that failed once', () => {
+  it('is checked again, and its verification comes back', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
     const old = new Date(harness.clock.now() - 40 * DAY_MS);
     for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
     harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
     harness.clock.advance(40 * DAY_MS);
-
     await reapLocalCopies(harness.ctx, harness.clock.now());
-    assert.equal(
-      fs.existsSync(harness.transcriptOf(SESSION_B)),
-      true,
-      'a session that has something the archive does not is not deleted',
+
+    // Drive answers badly for one sweep, then recovers.
+    harness.drive.options = { ...harness.drive.options, corruptChecksums: true };
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.verifiedAt, null, 'trust withdrawn');
+    assert.ok((kvGetNumber(harness.ctx.db, KV.auditMismatched) ?? 0) > 0);
+
+    harness.drive.options = { ...harness.drive.options, corruptChecksums: false };
+    for (let sweep = 0; sweep < 2; sweep++) {
+      harness.clock.advance(60_000);
+      await runSweep(harness.ctx, { force: true });
+    }
+    assert.ok(
+      getSession(harness.ctx.db, SESSION_A)?.verifiedAt,
+      'a session with no local copy can get its verification back',
     );
-    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), false, 'the guard is not vacuous');
+    assert.equal(kvGetNumber(harness.ctx.db, KV.auditMismatched), 0, 'and the warning clears');
   });
 });

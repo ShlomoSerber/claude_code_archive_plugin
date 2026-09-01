@@ -87,6 +87,14 @@ export function acquireLock(dir: string, options: LockOptions = {}): Lock | null
       if (released) return;
       released = true;
       clearInterval(timer);
+      // Only if it is still the lock we took. A suspended laptop freezes the
+      // heartbeat's mtime, so another worker can call this lock stale and
+      // replace it while we sleep — and removing it then would delete the new
+      // holder's lock and let a third worker in beside it.
+      if (!stillOurs(dir, owner)) {
+        logger.debug('lock.not_ours_on_release', { dir });
+        return;
+      }
       releaseWithRetry(dir, logger);
     },
   };
@@ -163,6 +171,13 @@ function breakLock(dir: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Does the lock on disk still name the owner we wrote? */
+function stillOurs(dir: string, owner: LockOwner): boolean {
+  const current = readOwner(dir);
+  // Unreadable or gone counts as not ours: leave it alone.
+  return current !== null && current.pid === owner.pid && current.startedAt === owner.startedAt;
 }
 
 function releaseWithRetry(dir: string, logger: Logger): void {

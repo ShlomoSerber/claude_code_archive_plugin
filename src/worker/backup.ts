@@ -163,7 +163,11 @@ async function indexSession(
       // handful of prompts where it used to find hundreds. Replacing a good
       // index with a thin one loses the only way to find that session, so a
       // large drop keeps what we have and says so.
-      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      // Any decrease, not a fourfold one: a transcript only grows, so fewer
+      // prompts than last time means the extractor stopped recognising some.
+      // A session that genuinely shrank is refused by the shrink guard before
+      // this ever matters.
+      const collapsed = existingPrompts > 8 && summary.prompts.length < existingPrompts;
       if (collapsed) {
         log.warn('catalog.index_collapse_ignored', {
           found: summary.prompts.length,

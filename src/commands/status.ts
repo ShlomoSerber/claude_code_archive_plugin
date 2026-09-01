@@ -259,11 +259,15 @@ export async function runStatus(
     print(
       `  WARNING:            the catalog copy on Drive is from ${formatRelative(catalogUploadedAt, now)}.`,
     );
-    print(`                      Sessions archived since then would not be findable on a new machine.`);
+    print(
+      `                      Sessions archived since then would not be findable on a new machine.`,
+    );
   }
   if (auditMismatched > 0) {
     print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
-    print(`                      on Drive after their local copy was freed. Run /archive:verify --all.`);
+    print(
+      `                      on Drive after their local copy was freed. Run /archive:verify --all.`,
+    );
   }
   if (statFailed > 0) {
     print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);

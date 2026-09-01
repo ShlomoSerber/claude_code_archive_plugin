@@ -524,14 +524,35 @@ export function listReapable(
  */
 export function listReapedForAudit(db: Db, limit: number): SessionRecord[] {
   const rows = db
+    // Not "verified_at IS NOT NULL": a check that fails clears that, and
+    // requiring it meant one transient bad answer dropped the session out of
+    // the rotation for ever, with nothing able to put it back. What matters is
+    // that there is a Drive copy to ask about and a hash to ask with.
     .prepare(
       `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        WHERE local_present = 0
+          AND remote_file_id IS NOT NULL
+          AND verified_bundle_sha256 IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, COALESCE(verified_at, 0) ASC
         LIMIT ?`,
     )
     .all(limit) as SessionRow[];
   return rows.map(toRecord);
+}
+
+/**
+ * Put back a verification an audit withdrew, when a later audit passes.
+ *
+ * Only for a session with no local copy: there is nothing to re-archive, so
+ * without this the row stayed "pending backup" and the warning stayed on the
+ * status page for ever, however healthy Drive turned out to be.
+ */
+export function restoreVerification(db: Db, sessionId: string, now: number): void {
+  db.prepare(
+    `UPDATE sessions SET verified_at = ?, updated_at = ?
+      WHERE session_id = ? AND verified_at IS NULL AND local_present = 0
+        AND remote_file_id IS NOT NULL AND verified_bundle_sha256 IS NOT NULL`,
+  ).run(now, now, sessionId);
 }
 
 export function markAudited(db: Db, sessionIds: readonly string[], now: number): void {

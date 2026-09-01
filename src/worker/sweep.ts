@@ -6,7 +6,12 @@ import { getSqlite } from '../adapters/sqlite.ts';
 import { removePartials } from '../adapters/atomic.ts';
 import { kvGetNumber, kvGet, kvSet, kvSetNumber } from '../adapters/db.ts';
 import { scanSessions, type ScanSkip } from '../adapters/session-scan.ts';
-import { getSession, markLocalPresent, upsertSession, listReapedForAudit, markAudited } from '../core/catalog.ts';
+import {
+  getSession,
+  markLocalPresent,
+  upsertSession,
+  listReapedForAudit,
+  markAudited, restoreVerification } from '../core/catalog.ts';
 import { circuitBackoffMs, nextAttemptAt } from '../core/backoff.ts';
 import {
   FatalError,
@@ -450,19 +455,27 @@ async function auditReaped(ctx: WorkerContext): Promise<number> {
   const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
   if (records.length === 0) return 0;
   const report = await verifyArchive(ctx, records);
+  const at = ctx.clock.now();
   markAudited(
     ctx.db,
     records.map((record) => record.sessionId),
-    ctx.clock.now(),
+    at,
   );
+  // A session that passes now gets its verification back. Drive answers badly
+  // for all sorts of transient reasons, and a withdrawn verification is
+  // otherwise permanent for a session with no local copy to re-archive.
+  const bad = new Set(report.mismatched.map((item) => item.sessionId));
+  for (const record of records) {
+    if (!bad.has(record.sessionId)) restoreVerification(ctx.db, record.sessionId, at);
+  }
   if (report.mismatched.length > 0) {
     ctx.logger.error('sweep.archive_damaged', {
       count: report.mismatched.length,
       first: report.mismatched[0]?.reason ?? '',
     });
-    const at = ctx.clock.now();
-    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at);
   }
+  // Written every run, including zero: the warning has to be able to clear.
+  kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at);
   return report.checked;
 }
 

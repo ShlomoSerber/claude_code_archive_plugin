@@ -246,7 +246,16 @@ export async function restoreSession(
     // Checked, and retried: every other must-succeed rename here uses
     // renameWithRetry for the Windows EPERM/EBUSY class. Unpacking into a
     // sidecar that is still there would overwrite the files it holds.
-    await renameWithRetry(path.join(targetDir, sessionId), aside);
+    try {
+      await renameWithRetry(path.join(targetDir, sessionId), aside);
+    } catch (err) {
+      throw new FatalError(
+        `the sidecar left at ${path.join(targetDir, sessionId)} could not be moved aside`,
+        'Move or remove that directory yourself, then run /archive:resume again. ' +
+          'Nothing has been unpacked over it.',
+        { cause: err },
+      );
+    }
     ctx.logger.warn('restore.sidecar_moved_aside', { session_id: sessionId, path: aside });
   }
 
@@ -288,10 +297,13 @@ export async function restoreSession(
     const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
     if (problem !== null) {
       const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
-      ctx.logger.error('restore.quarantined', { session_id: sessionId, path: quarantine });
+      ctx.logger.error('restore.quarantined', { session_id: sessionId, path: quarantine ?? '' });
       throw new RetryableError(
-        `the restored session is incomplete: ${problem}. What was unpacked has been ` +
-          `moved to ${quarantine} rather than deleted.`,
+        quarantine === null
+          ? `the restored session is incomplete: ${problem}. It could not be moved aside, ` +
+            `so it is still in ${targetDir} — remove it by hand before archiving runs again.`
+          : `the restored session is incomplete: ${problem}. What was unpacked has been ` +
+            `moved to ${quarantine} rather than deleted.`,
       );
     }
 
@@ -377,15 +389,31 @@ async function removePartialRestore(
   targetDir: string,
   sessionId: string,
   stamp: number,
-): Promise<string> {
+): Promise<string | null> {
   const quarantine = path.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
   await fsp.mkdir(quarantine, { recursive: true });
+  let moved = 0;
   for (const name of [`${sessionId}.jsonl`, sessionId]) {
-    await fsp
-      .rename(path.join(targetDir, name), path.join(quarantine, name))
-      .catch(() => undefined);
+    const from = path.join(targetDir, name);
+    if (!(await exists(from))) continue;
+    try {
+      await renameWithRetry(from, path.join(quarantine, name));
+      moved++;
+    } catch {
+      // Reported, not swallowed: the caller's message used to say the partial
+      // restore had been moved even when it was still sitting in place.
+    }
   }
-  return quarantine;
+  return moved > 0 ? quarantine : null;
+}
+
+async function exists(candidate: string): Promise<boolean> {
+  try {
+    await fsp.lstat(candidate);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function isDirectory(candidate: string): Promise<boolean> {
@@ -464,11 +492,7 @@ export async function verifyRetained(ctx: WorkerContext): Promise<{
         problems.push({ fileId: entry.fileId, reason: 'it is in the Drive wastebasket' });
         continue;
       }
-      if (
-        remote.size !== null &&
-        entry.bundleBytes !== null &&
-        remote.size !== entry.bundleBytes
-      ) {
+      if (remote.size !== null && entry.bundleBytes !== null && remote.size !== entry.bundleBytes) {
         problems.push({
           fileId: entry.fileId,
           reason: `it is ${String(remote.size)} bytes, not ${String(entry.bundleBytes)}`,

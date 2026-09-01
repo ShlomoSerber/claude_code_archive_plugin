@@ -2578,11 +2578,20 @@ function listReapable(db, idleBefore, now, limit = 500) {
 function listReapedForAudit(db, limit) {
   const rows = db.prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        WHERE local_present = 0
+          AND remote_file_id IS NOT NULL
+          AND verified_bundle_sha256 IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, COALESCE(verified_at, 0) ASC
         LIMIT ?`
   ).all(limit);
   return rows.map(toRecord);
+}
+function restoreVerification(db, sessionId, now) {
+  db.prepare(
+    `UPDATE sessions SET verified_at = ?, updated_at = ?
+      WHERE session_id = ? AND verified_at IS NULL AND local_present = 0
+        AND remote_file_id IS NOT NULL AND verified_bundle_sha256 IS NOT NULL`
+  ).run(now, now, sessionId);
 }
 function markAudited(db, sessionIds, now) {
   if (sessionIds.length === 0) return;
@@ -6608,7 +6617,7 @@ async function indexSession(ctx, session, previous, now) {
   if (summary !== null && !shrunk) {
     try {
       const existingPrompts = countPrompts(ctx.db, session.sessionId);
-      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      const collapsed = existingPrompts > 8 && summary.prompts.length < existingPrompts;
       if (collapsed) {
         log.warn("catalog.index_collapse_ignored", {
           found: summary.prompts.length,
@@ -7066,39 +7075,7 @@ async function describeDivergence(ctx, record, onDisk) {
   for (const file of current) {
     if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
   }
-  const extra = await findUnarchivedEntry(onDisk.sidecarDir, onDisk.sessionId, archived);
-  if (extra !== null) return `${extra} is on disk and not in the archive`;
   return null;
-}
-async function findUnarchivedEntry(sidecarDir, sessionId, archived) {
-  const directories = /* @__PURE__ */ new Set();
-  for (const entryPath of archived.keys()) {
-    const parts2 = entryPath.split("/");
-    for (let index = 1; index < parts2.length; index++) {
-      directories.add(parts2.slice(0, index).join("/"));
-    }
-  }
-  const walk = async (dir, prefix) => {
-    let entries;
-    try {
-      entries = await fsp11.readdir(dir, { withFileTypes: true });
-    } catch (err) {
-      if (err.code === "ENOENT") return null;
-      return prefix === "" ? sessionId : prefix;
-    }
-    for (const entry of entries) {
-      const relative = prefix === "" ? `${sessionId}/${entry.name}` : `${prefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        if (!directories.has(relative)) return relative;
-        const deeper = await walk(path13.join(dir, entry.name), relative);
-        if (deeper !== null) return deeper;
-        continue;
-      }
-      if (!archived.has(relative)) return relative;
-    }
-    return null;
-  };
-  return walk(sidecarDir, "");
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
@@ -7358,7 +7335,15 @@ async function restoreSession(ctx, sessionId) {
   }
   if (await isDirectory2(path14.join(targetDir, sessionId))) {
     const aside = path14.join(targetDir, `${sessionId}.superseded-${String(ctx.clock.now())}`);
-    await renameWithRetry(path14.join(targetDir, sessionId), aside);
+    try {
+      await renameWithRetry(path14.join(targetDir, sessionId), aside);
+    } catch (err) {
+      throw new FatalError(
+        `the sidecar left at ${path14.join(targetDir, sessionId)} could not be moved aside`,
+        "Move or remove that directory yourself, then run /archive:resume again. Nothing has been unpacked over it.",
+        { cause: err }
+      );
+    }
     ctx.logger.warn("restore.sidecar_moved_aside", { session_id: sessionId, path: aside });
   }
   const remoteFileId = requireRemote(record);
@@ -7391,9 +7376,9 @@ async function restoreSession(ctx, sessionId) {
     const problem = await describeRestoreProblem(ctx, record, targetDir, sessionId);
     if (problem !== null) {
       const quarantine = await removePartialRestore(targetDir, sessionId, ctx.clock.now());
-      ctx.logger.error("restore.quarantined", { session_id: sessionId, path: quarantine });
+      ctx.logger.error("restore.quarantined", { session_id: sessionId, path: quarantine ?? "" });
       throw new RetryableError(
-        `the restored session is incomplete: ${problem}. What was unpacked has been moved to ${quarantine} rather than deleted.`
+        quarantine === null ? `the restored session is incomplete: ${problem}. It could not be moved aside, so it is still in ${targetDir} \u2014 remove it by hand before archiving runs again.` : `the restored session is incomplete: ${problem}. What was unpacked has been moved to ${quarantine} rather than deleted.`
       );
     }
     const restored = await statSession(ctx.paths, record.encodedDir, sessionId);
@@ -7451,10 +7436,25 @@ async function describeRestoreProblem(ctx, record, targetDir, sessionId) {
 async function removePartialRestore(targetDir, sessionId, stamp) {
   const quarantine = path14.join(targetDir, `${sessionId}.rejected-${String(stamp)}`);
   await fsp12.mkdir(quarantine, { recursive: true });
+  let moved = 0;
   for (const name of [`${sessionId}.jsonl`, sessionId]) {
-    await fsp12.rename(path14.join(targetDir, name), path14.join(quarantine, name)).catch(() => void 0);
+    const from = path14.join(targetDir, name);
+    if (!await exists(from)) continue;
+    try {
+      await renameWithRetry(from, path14.join(quarantine, name));
+      moved++;
+    } catch {
+    }
   }
-  return quarantine;
+  return moved > 0 ? quarantine : null;
+}
+async function exists(candidate) {
+  try {
+    await fsp12.lstat(candidate);
+    return true;
+  } catch {
+    return false;
+  }
 }
 async function isDirectory2(candidate) {
   try {
@@ -7847,19 +7847,23 @@ async function auditReaped(ctx) {
   const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
   if (records.length === 0) return 0;
   const report = await verifyArchive(ctx, records);
+  const at2 = ctx.clock.now();
   markAudited(
     ctx.db,
     records.map((record) => record.sessionId),
-    ctx.clock.now()
+    at2
   );
+  const bad = new Set(report.mismatched.map((item) => item.sessionId));
+  for (const record of records) {
+    if (!bad.has(record.sessionId)) restoreVerification(ctx.db, record.sessionId, at2);
+  }
   if (report.mismatched.length > 0) {
     ctx.logger.error("sweep.archive_damaged", {
       count: report.mismatched.length,
       first: report.mismatched[0]?.reason ?? ""
     });
-    const at2 = ctx.clock.now();
-    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
   }
+  kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
   return report.checked;
 }
 function catalogCopyIsStale(ctx) {
@@ -8009,6 +8013,10 @@ function acquireLock(dir, options = {}) {
       if (released) return;
       released = true;
       clearInterval(timer);
+      if (!stillOurs(dir, owner)) {
+        logger.debug("lock.not_ours_on_release", { dir });
+        return;
+      }
       releaseWithRetry(dir, logger);
     }
   };
@@ -8073,6 +8081,10 @@ function breakLock(dir) {
   } catch {
     return false;
   }
+}
+function stillOurs(dir, owner) {
+  const current = readOwner(dir);
+  return current !== null && current.pid === owner.pid && current.startedAt === owner.startedAt;
 }
 function releaseWithRetry(dir, logger) {
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -9110,11 +9122,15 @@ async function runStatus(runtime, options) {
     print(
       `  WARNING:            the catalog copy on Drive is from ${formatRelative(catalogUploadedAt, now)}.`
     );
-    print(`                      Sessions archived since then would not be findable on a new machine.`);
+    print(
+      `                      Sessions archived since then would not be findable on a new machine.`
+    );
   }
   if (auditMismatched > 0) {
     print(`  WARNING:            ${String(auditMismatched)} archived session(s) failed a re-check`);
-    print(`                      on Drive after their local copy was freed. Run /archive:verify --all.`);
+    print(
+      `                      on Drive after their local copy was freed. Run /archive:verify --all.`
+    );
   }
   if (statFailed > 0) {
     print(`  ${String(statFailed)} session(s) could not be looked at on disk, so they are`);

@@ -101,6 +101,10 @@ function acquireLock(dir, options = {}) {
       if (released) return;
       released = true;
       clearInterval(timer);
+      if (!stillOurs(dir, owner)) {
+        logger.debug("lock.not_ours_on_release", { dir });
+        return;
+      }
       releaseWithRetry(dir, logger);
     }
   };
@@ -165,6 +169,10 @@ function breakLock(dir) {
   } catch {
     return false;
   }
+}
+function stillOurs(dir, owner) {
+  const current = readOwner(dir);
+  return current !== null && current.pid === owner.pid && current.startedAt === owner.startedAt;
 }
 function releaseWithRetry(dir, logger) {
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -2453,11 +2461,20 @@ function listReapable(db, idleBefore, now, limit = 500) {
 function listReapedForAudit(db, limit) {
   const rows = db.prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
-        WHERE local_present = 0 AND verified_at IS NOT NULL AND remote_file_id IS NOT NULL
-        ORDER BY COALESCE(audited_at, 0) ASC, verified_at ASC
+        WHERE local_present = 0
+          AND remote_file_id IS NOT NULL
+          AND verified_bundle_sha256 IS NOT NULL
+        ORDER BY COALESCE(audited_at, 0) ASC, COALESCE(verified_at, 0) ASC
         LIMIT ?`
   ).all(limit);
   return rows.map(toRecord);
+}
+function restoreVerification(db, sessionId, now) {
+  db.prepare(
+    `UPDATE sessions SET verified_at = ?, updated_at = ?
+      WHERE session_id = ? AND verified_at IS NULL AND local_present = 0
+        AND remote_file_id IS NOT NULL AND verified_bundle_sha256 IS NOT NULL`
+  ).run(now, now, sessionId);
 }
 function markAudited(db, sessionIds, now) {
   if (sessionIds.length === 0) return;
@@ -6405,7 +6422,7 @@ async function indexSession(ctx, session, previous, now) {
   if (summary !== null && !shrunk) {
     try {
       const existingPrompts = countPrompts(ctx.db, session.sessionId);
-      const collapsed = existingPrompts > 8 && summary.prompts.length * 4 < existingPrompts;
+      const collapsed = existingPrompts > 8 && summary.prompts.length < existingPrompts;
       if (collapsed) {
         log.warn("catalog.index_collapse_ignored", {
           found: summary.prompts.length,
@@ -6863,39 +6880,7 @@ async function describeDivergence(ctx, record, onDisk) {
   for (const file of current) {
     if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
   }
-  const extra = await findUnarchivedEntry(onDisk.sidecarDir, onDisk.sessionId, archived);
-  if (extra !== null) return `${extra} is on disk and not in the archive`;
   return null;
-}
-async function findUnarchivedEntry(sidecarDir, sessionId, archived) {
-  const directories = /* @__PURE__ */ new Set();
-  for (const entryPath of archived.keys()) {
-    const parts2 = entryPath.split("/");
-    for (let index = 1; index < parts2.length; index++) {
-      directories.add(parts2.slice(0, index).join("/"));
-    }
-  }
-  const walk = async (dir, prefix) => {
-    let entries;
-    try {
-      entries = await fsp11.readdir(dir, { withFileTypes: true });
-    } catch (err) {
-      if (err.code === "ENOENT") return null;
-      return prefix === "" ? sessionId : prefix;
-    }
-    for (const entry of entries) {
-      const relative = prefix === "" ? `${sessionId}/${entry.name}` : `${prefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        if (!directories.has(relative)) return relative;
-        const deeper = await walk(path14.join(dir, entry.name), relative);
-        if (deeper !== null) return deeper;
-        continue;
-      }
-      if (!archived.has(relative)) return relative;
-    }
-    return null;
-  };
-  return walk(sidecarDir, "");
 }
 function isSessionActive(ctx, sessionId, now) {
   const seen = kvGetNumber(ctx.db, activeSessionKey(sessionId));
@@ -7324,19 +7309,23 @@ async function auditReaped(ctx) {
   const records = listReapedForAudit(ctx.db, AUDIT_BATCH);
   if (records.length === 0) return 0;
   const report = await verifyArchive(ctx, records);
+  const at2 = ctx.clock.now();
   markAudited(
     ctx.db,
     records.map((record) => record.sessionId),
-    ctx.clock.now()
+    at2
   );
+  const bad = new Set(report.mismatched.map((item) => item.sessionId));
+  for (const record of records) {
+    if (!bad.has(record.sessionId)) restoreVerification(ctx.db, record.sessionId, at2);
+  }
   if (report.mismatched.length > 0) {
     ctx.logger.error("sweep.archive_damaged", {
       count: report.mismatched.length,
       first: report.mismatched[0]?.reason ?? ""
     });
-    const at2 = ctx.clock.now();
-    kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
   }
+  kvSetNumber(ctx.db, KV.auditMismatched, report.mismatched.length, at2);
   return report.checked;
 }
 function catalogCopyIsStale(ctx) {

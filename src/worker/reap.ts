@@ -320,49 +320,13 @@ async function describeDivergence(
   for (const file of current) {
     if (!archived.has(file.path)) return `${file.path} was added after the archive was made`;
   }
-  // describeSessionFiles records regular files only, so a symlink or an empty
-  // directory added after the archive was made is in neither set — and an
-  // mtime-preserving tool hides it from the fingerprint too. Walk the raw
-  // entries as well: anything that is not a file the manifest names, or a
-  // directory on the way to one, means the disk is no longer what was archived.
-  const extra = await findUnarchivedEntry(onDisk.sidecarDir, onDisk.sessionId, archived);
-  if (extra !== null) return `${extra} is on disk and not in the archive`;
+  // Regular files only, deliberately. tar stores directory and symlink entries
+  // and extraction recreates them, so they are archived even though the
+  // manifest — which exists to carry content hashes — does not name them.
+  // Treating them as unarchived made an empty sidecar directory, which Claude
+  // Code creates routinely, into a session that could never be reclaimed and
+  // was re-compressed on every single sweep.
   return null;
-}
-
-async function findUnarchivedEntry(
-  sidecarDir: string,
-  sessionId: string,
-  archived: Map<string, string>,
-): Promise<string | null> {
-  const directories = new Set<string>();
-  for (const entryPath of archived.keys()) {
-    const parts = entryPath.split('/');
-    for (let index = 1; index < parts.length; index++) {
-      directories.add(parts.slice(0, index).join('/'));
-    }
-  }
-  const walk = async (dir: string, prefix: string): Promise<string | null> => {
-    let entries;
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch (err) {
-      if ((err as { code?: string }).code === 'ENOENT') return null;
-      return prefix === '' ? sessionId : prefix;
-    }
-    for (const entry of entries) {
-      const relative = prefix === '' ? `${sessionId}/${entry.name}` : `${prefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        if (!directories.has(relative)) return relative;
-        const deeper = await walk(path.join(dir, entry.name), relative);
-        if (deeper !== null) return deeper;
-        continue;
-      }
-      if (!archived.has(relative)) return relative;
-    }
-    return null;
-  };
-  return walk(sidecarDir, '');
 }
 
 /** Hooks record a heartbeat while a session is open; this reads it back. */

@@ -118,3 +118,21 @@ describe('isPidAlive', () => {
     assert.equal(isPidAlive(-1), false);
   });
 });
+
+describe('releasing a lock that was taken over', () => {
+  it('leaves the new holder alone', () => {
+    // A suspended laptop freezes the heartbeat's mtime, so another worker can
+    // call the lock stale and replace it. Removing it then would delete the
+    // new holder's lock and let a third worker in beside it.
+    const dir = path.join(tempDir(), 'worker.lock');
+    const first = acquireLock(dir, { clock: fakeClock() });
+    assert.ok(first);
+    fs.writeFileSync(
+      path.join(dir, 'owner.json'),
+      JSON.stringify({ pid: process.pid + 1, hostname: 'other', startedAt: 42 }),
+    );
+
+    first.release();
+    assert.equal(fs.existsSync(dir), true, "the other worker's lock survives");
+  });
+});
