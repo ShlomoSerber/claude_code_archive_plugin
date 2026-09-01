@@ -45,10 +45,25 @@ export type ReapReport = {
   skipped: number;
   /** Rows whose Drive copy has gone missing or changed since it was verified. */
   unverified: number;
+  /**
+   * Rows Drive would not answer for, so nothing could be reclaimed.
+   *
+   * Counted separately from `skipped` because it is the shape of a plugin that
+   * has quietly stopped doing the one thing it exists for: everything reports
+   * verified, nothing is ever freed, and no message says why.
+   */
+  unconfirmable: number;
 };
 
 export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<ReapReport> {
-  const report: ReapReport = { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 };
+  const report: ReapReport = {
+    deleted: 0,
+    bytesFreed: 0,
+    requeued: 0,
+    skipped: 0,
+    unverified: 0,
+    unconfirmable: 0,
+  };
   // `enabled: false` has to stop deletion, not merely stop the hooks, or
   // "turn it off" is a promise the plugin does not keep.
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
@@ -145,6 +160,7 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
     }
     if (remote === 'unavailable') {
       report.skipped++;
+      report.unconfirmable++;
       continue;
     }
 
@@ -262,18 +278,27 @@ async function confirmRemote(
     if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return 'gone';
     }
-    // Deletion is irreversible, so the strong hash is required here even though
-    // the upload path is willing to fall back to md5.
-    // No checksum means Drive could not answer the question, not that the
-    // answer was bad. Skip this session for now rather than withdrawing a good
-    // verification and scheduling a re-archive that could overwrite the archive.
-    if (remote.sha256 === null) return 'unavailable';
     // Compared against the hash verification actually passed on, not against
     // bundle_sha256, which a later failed rebuild overwrites with bytes Drive
     // never received.
-    return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase()
-      ? 'ok'
-      : 'gone';
+    if (remote.sha256 !== null) {
+      return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase()
+        ? 'ok'
+        : 'gone';
+    }
+    // Drive returns sha256Checksum only "if available". Requiring it meant a
+    // Drive that answers with md5 alone never let a single session be reaped —
+    // the plugin's entire purpose, silently never happening while /archive:status
+    // reported everything verified. md5 is weaker, but it is answering the only
+    // question left here: is this still the file we uploaded? What the bundle
+    // contains was settled earlier, by sha256 against the disk.
+    if (remote.md5 !== null && record.verifiedBundleMd5 !== null) {
+      return remote.md5.toLowerCase() === record.verifiedBundleMd5.toLowerCase() ? 'ok' : 'gone';
+    }
+    // No checksum at all means Drive could not answer the question, not that
+    // the answer was bad. Skip this session for now rather than withdrawing a
+    // good verification and scheduling a re-archive.
+    return 'unavailable';
   } catch (err) {
     // A 4xx is Drive saying the file is not there. Anything else is this run's
     // problem, not the archive's, so leave the row alone and try next time.

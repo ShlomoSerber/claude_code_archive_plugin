@@ -22,6 +22,8 @@ export type UploadArgs = {
   mimeType: string;
   totalBytes: number;
   sha256: string;
+  /** Fallback hash, for a Drive that answers with md5 and nothing else. */
+  md5?: string;
   appProperties?: Record<string, string>;
   chunkSize?: number;
 };
@@ -52,7 +54,9 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else if (progress.done && progress.file !== null) {
       // "Complete" only counts if what landed is what we are uploading.
-      if (matchesLocal(progress.file, args)) {
+      // Our own resumable URI is tagged with this bundle's hash, so a
+      // completed upload at it is ours even when Drive cannot yet say so.
+      if (matchesLocal(progress.file, args) !== 'mismatch') {
         log.info('upload.already_complete');
         setUploadUri(ctx.db, args.job, null, ctx.clock.now());
         return progress.file;
@@ -73,9 +77,18 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       { name: args.name, parentId: args.parentId },
       ctx.signal,
     );
-    if (existing !== null && matchesLocal(existing, args)) {
+    const verdict = existing === null ? 'mismatch' : matchesLocal(existing, args);
+    if (existing !== null && verdict === 'match') {
       log.info('upload.found_existing', { file_id: existing.id });
       return existing;
+    }
+    if (existing !== null && verdict === 'unknown') {
+      // Leave it alone. Drive has not answered the question yet, and the only
+      // destructive options here — trash it, or overwrite it — are both wrong
+      // if the answer turns out to be "that is your archive".
+      throw new RetryableError(
+        `Drive has not reported a checksum for the existing ${args.name}; leaving it alone`,
+      );
     }
     if (existing !== null) {
       // A name carries a hash of its contents, so a same-name mismatch means
@@ -172,11 +185,25 @@ export function parseUploadUri(stored: string | null): { sha256: string; uri: st
   return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
 }
 
+/**
+ * Is the file on Drive the one we are about to upload?
+ *
+ * Three answers, not two. 'unknown' is the whole point: Drive computes
+ * checksums asynchronously and documents sha256Checksum as present only "if
+ * available", so a read can legitimately come back with neither hash. Folding
+ * that into 'mismatch' meant a transient metadata glitch was read as bit rot,
+ * and the caller trashed a good, verified archive on the strength of it.
+ */
 export function matchesLocal(
   remote: RemoteFile,
-  args: { totalBytes: number; sha256: string },
-): boolean {
-  if (remote.size !== null && remote.size !== args.totalBytes) return false;
-  if (remote.sha256 !== null) return remote.sha256.toLowerCase() === args.sha256.toLowerCase();
-  return false;
+  args: { totalBytes: number; sha256: string; md5?: string },
+): 'match' | 'mismatch' | 'unknown' {
+  if (remote.size !== null && remote.size !== args.totalBytes) return 'mismatch';
+  if (remote.sha256 !== null) {
+    return remote.sha256.toLowerCase() === args.sha256.toLowerCase() ? 'match' : 'mismatch';
+  }
+  if (remote.md5 !== null && args.md5 !== undefined) {
+    return remote.md5.toLowerCase() === args.md5.toLowerCase() ? 'match' : 'mismatch';
+  }
+  return 'unknown';
 }

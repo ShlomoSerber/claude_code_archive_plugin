@@ -305,6 +305,34 @@ var MIGRATIONS = [
   // prove the old bundle's contents are still present in the new one.
   `
   ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
+  `,
+  // 7 — the weaker hash of the archived copy, and the bundles we chose to keep.
+  //
+  // Drive returns sha256Checksum "if available" and computes it asynchronously,
+  // so a Drive that only ever answers with md5 left every session unreapable
+  // for ever while the plugin reported itself healthy. md5 is enough to confirm
+  // the file Drive holds is the one we uploaded, once sha256 has proved the
+  // bundle matches the disk.
+  //
+  // retained_bundles remembers a superseded bundle that was NOT retired because
+  // the replacement did not contain it. Nothing pointed at those, so their
+  // unique contents were reachable only by browsing Drive by hand.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_bundle_md5 TEXT;
+
+  CREATE TABLE retained_bundles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    file_id     TEXT NOT NULL,
+    remote_path TEXT,
+    bundle_sha256 TEXT,
+    manifest    TEXT,
+    reason      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (file_id)
+  ) STRICT;
+
+  CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -315,11 +343,20 @@ function openDatabase(file, options = {}) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
   }
   const db = new (getSqlite()).DatabaseSync(file, { readOnly: options.readOnly ?? false });
+  if (file !== ":memory:" && options.readOnly !== true) restrictToOwner(file);
   applyPragmas(db, options);
   if (options.skipMigrations !== true && options.readOnly !== true) {
     migrate(db);
   }
   return db;
+}
+function restrictToOwner(file) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      fs.chmodSync(`${file}${suffix}`, 384);
+    } catch {
+    }
+  }
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
@@ -1563,6 +1600,8 @@ var KV = {
   unreadableCount: "scan.unreadable_count",
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
+  /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
+  unconfirmableCount: "reap.unconfirmable_count",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };

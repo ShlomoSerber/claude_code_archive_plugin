@@ -51,6 +51,8 @@ export type SessionRecord = {
   verifiedBundleBytes: number | null;
   /** JSON `[[path, sha256], …]` of the archived bundle. Only markVerified writes it. */
   verifiedManifest: string | null;
+  /** Weaker hash of the same bundle, for a Drive that reports no sha256. */
+  verifiedBundleMd5: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -87,6 +89,7 @@ type SessionRow = {
   verified_sidecar_bytes: number | null;
   verified_bundle_bytes: number | null;
   verified_manifest: string | null;
+  verified_bundle_md5: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -97,7 +100,7 @@ const SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, g
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
   verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
-  verified_bundle_bytes, verified_manifest, created_at, updated_at`;
+  verified_bundle_bytes, verified_manifest, verified_bundle_md5, created_at, updated_at`;
 
 /** The fields extraction knows about. Backup and verification fill the rest. */
 export type SessionUpsert = {
@@ -234,6 +237,80 @@ export function markBundled(db: Db, sessionId: string, backup: BackupRecord, now
   );
 }
 
+export type RetainedBundle = {
+  id: number;
+  sessionId: string;
+  fileId: string;
+  remotePath: string | null;
+  bundleSha256: string | null;
+  manifest: string | null;
+  reason: string;
+  createdAt: number;
+};
+
+/**
+ * Remember a superseded bundle that was deliberately not retired.
+ *
+ * When the replacement does not provably contain the old bundle, the old one
+ * stays on Drive — but `remote_file_id` has already moved on, so nothing
+ * pointed at it and its unique contents were reachable only by browsing Drive
+ * by hand. This row is that pointer.
+ */
+export function recordRetainedBundle(
+  db: Db,
+  entry: {
+    sessionId: string;
+    fileId: string;
+    remotePath: string | null;
+    bundleSha256: string | null;
+    manifest: string | null;
+    reason: string;
+  },
+  now: number,
+): void {
+  db.prepare(
+    `INSERT INTO retained_bundles
+       (session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (file_id) DO UPDATE SET reason = excluded.reason`,
+  ).run(
+    entry.sessionId,
+    entry.fileId,
+    entry.remotePath,
+    entry.bundleSha256,
+    entry.manifest,
+    entry.reason,
+    now,
+  );
+}
+
+export function listRetainedBundles(db: Db, sessionId?: string): RetainedBundle[] {
+  const rows = (
+    sessionId === undefined
+      ? db.prepare('SELECT * FROM retained_bundles ORDER BY id').all()
+      : db.prepare('SELECT * FROM retained_bundles WHERE session_id = ? ORDER BY id').all(sessionId)
+  ) as {
+    id: number;
+    session_id: string;
+    file_id: string;
+    remote_path: string | null;
+    bundle_sha256: string | null;
+    manifest: string | null;
+    reason: string;
+    created_at: number;
+  }[];
+  return rows.map((row) => ({
+    id: row.id,
+    sessionId: row.session_id,
+    fileId: row.file_id,
+    remotePath: row.remote_path,
+    bundleSha256: row.bundle_sha256,
+    manifest: row.manifest,
+    reason: row.reason,
+    createdAt: row.created_at,
+  }));
+}
+
 /**
  * The remote copy exists and its hash matched ours.
  *
@@ -259,6 +336,8 @@ export function markVerified(
     bundleBytes: number | null;
     /** Compact file list of the archived bundle. */
     manifest: string | null;
+    /** md5 of the same bundle. Used only when Drive reports no sha256. */
+    bundleMd5: string | null;
   },
   now: number,
 ): void {
@@ -268,7 +347,7 @@ export function markVerified(
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
             verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
             verified_sidecar_bytes = ?, verified_bundle_bytes = ?, verified_manifest = ?,
-            updated_at = ?
+            verified_bundle_md5 = ?, updated_at = ?
       WHERE session_id = ?`,
   ).run(
     remote.fileId,
@@ -283,6 +362,7 @@ export function markVerified(
     remote.sidecarBytes,
     remote.bundleBytes,
     remote.manifest,
+    remote.bundleMd5,
     now,
     sessionId,
   );
@@ -456,6 +536,7 @@ export function toRecord(row: SessionRow): SessionRecord {
     verifiedSidecarBytes: row.verified_sidecar_bytes,
     verifiedBundleBytes: row.verified_bundle_bytes,
     verifiedManifest: row.verified_manifest,
+    verifiedBundleMd5: row.verified_bundle_md5,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

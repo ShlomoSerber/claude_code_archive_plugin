@@ -247,7 +247,14 @@ function parseTimestamp(value: unknown): number | null {
   // Rounded, not merely finite: these land in STRICT INTEGER columns, and a
   // fractional value makes the insert throw, which fails the whole backup for
   // that session silently and permanently.
-  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  // Safe-integer, not merely finite: 1e300 truncates to itself, and a value
+  // SQLite's STRICT INTEGER column cannot hold throws out of the *insert*,
+  // which is outside the fail-soft boundary around parsing — so one absurd
+  // timestamp made a session permanently unarchivable.
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const truncated = Math.trunc(value);
+    return Number.isSafeInteger(truncated) ? truncated : null;
+  }
   if (typeof value !== 'string') return null;
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : Math.trunc(parsed);

@@ -5,7 +5,13 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { openDatabase } from '../src/adapters/db.ts';
 import { sha256File } from '../src/adapters/hashing.ts';
-import { catalogStats, clearVerification, getSession, upsertSession } from '../src/core/catalog.ts';
+import {
+  catalogStats,
+  clearVerification,
+  getSession,
+  listRetainedBundles,
+  upsertSession,
+} from '../src/core/catalog.ts';
 import {
   DEFAULT_CONFIG,
   resolveConfig,
@@ -1856,5 +1862,165 @@ describe('a bundle is retired only when the new one contains it', () => {
     enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 2000);
     assert.ok(claim(db, 2000, 60_000), 'the retry runs now, not after the visibility timeout');
     assert.equal(getJob(db, id)?.blocked, false);
+  });
+});
+
+/**
+ * Fourteenth round. Objective 1 held again under 80 seeds × 70 steps of fuzzing
+ * with the strong property "every version ever archived stays retrievable".
+ * The break was the plugin reading Drive's silence as Drive's answer: a
+ * metadata read that came back without a checksum was treated as proof the
+ * remote was wrong, and the response to that is to trash it.
+ */
+describe('Drive not answering is not Drive saying no', () => {
+  it('keeps the archived bundle when Drive reports no checksum at all', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    assert.ok(original);
+
+    // Drive goes quiet: the file is there, the metadata is not.
+    harness.drive.options = { ...harness.drive.options, omitSha256: true };
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), later, later);
+    harness.clock.advance(60_000);
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await runSweep(harness.ctx, { force: true });
+      harness.clock.advance(15 * 60_000);
+    }
+
+    assert.equal(
+      harness.drive.trashedIds.has(original),
+      false,
+      'a good archive is not trashed because Drive would not answer',
+    );
+    const live = [...harness.drive.files.values()].filter(
+      (file) => !harness.drive.trashedIds.has(file.id) && file.name.includes('.tar.zst'),
+    );
+    assert.ok(live.length > 0, 'at least one live bundle remains on Drive');
+    assert.equal(fs.existsSync(harness.transcriptOf(SESSION_A)), true);
+  });
+
+  it('archives, verifies and reclaims on a Drive that only reports md5', async () => {
+    // sha256Checksum is documented as present "if available". Requiring it made
+    // the plugin verify everything and reclaim nothing, for ever, in silence.
+    const harness = makeHarness(
+      { retentionDays: 30, archiveGraceDays: 0 },
+      new FakeDrive({ md5Only: true }),
+    );
+    await runSweep(harness.ctx);
+    const record = getSession(harness.ctx.db, SESSION_A);
+    assert.ok(record?.verifiedAt, 'md5 is enough to confirm the transfer');
+    assert.ok(record.verifiedBundleMd5, 'and it is recorded for the reaper');
+
+    const old = new Date(harness.clock.now() - 40 * 24 * 60 * 60 * 1000);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * 24 * 60 * 60 * 1000);
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.ok(report.deleted > 0, 'space is actually reclaimed');
+    assert.equal(report.unconfirmable, 0);
+  });
+
+  it('re-archiving on an md5-only Drive does not churn through bundles', async () => {
+    const harness = makeHarness({}, new FakeDrive({ md5Only: true }));
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+
+    clearVerification(harness.ctx.db, SESSION_A, harness.clock.now());
+    harness.ctx.db
+      .prepare('UPDATE sessions SET verified_local_mtime = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx, { force: true });
+
+    assert.equal(
+      harness.drive.trashedIds.has(original),
+      false,
+      'the identical bundle already on Drive is recognised, not replaced',
+    );
+    assert.equal(getSession(harness.ctx.db, SESSION_A)?.remoteFileId, original);
+  });
+
+  it('counts sessions Drive would not confirm, so a stalled reaper is visible', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    await runSweep(harness.ctx);
+    harness.drive.options = { ...harness.drive.options, omitSha256: true };
+
+    const old = new Date(harness.clock.now() - 40 * 24 * 60 * 60 * 1000);
+    for (const id of [SESSION_A, SESSION_B]) fs.utimesSync(harness.transcriptOf(id), old, old);
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    harness.clock.advance(40 * 24 * 60 * 60 * 1000);
+
+    const report = await reapLocalCopies(harness.ctx, harness.clock.now());
+    assert.equal(report.deleted, 0, 'nothing is deleted on an unverifiable remote');
+    assert.ok(report.unconfirmable > 0, 'and the reason is counted, not swallowed');
+  });
+});
+
+describe('a bundle kept on Drive stays findable', () => {
+  it('records the superseded bundle the plugin refused to retire', async () => {
+    const harness = makeHarness();
+    fs.writeFileSync(
+      path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'),
+      '{"type":"assistant","subagent":true}\n'.repeat(40),
+    );
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '';
+
+    // The archived subagent transcript is replaced by a larger, different one.
+    fs.rmSync(path.join(harness.projectDir, SESSION_B, 'agent-1.jsonl'));
+    fs.writeFileSync(path.join(harness.projectDir, SESSION_B, 'tool-9.json'), 'x'.repeat(9000));
+    fs.appendFileSync(harness.transcriptOf(SESSION_B), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const kept = listRetainedBundles(harness.ctx.db);
+    assert.equal(kept.length, 1, 'the kept bundle is recorded');
+    assert.equal(kept[0]?.fileId, original);
+    assert.ok(kept[0]?.remotePath, 'with a path a person can find on Drive');
+    assert.match(kept[0]?.reason ?? '', /agent-1\.jsonl/);
+    assert.equal(harness.drive.trashedIds.has(original), false);
+  });
+});
+
+describe('a session that cannot be indexed is still archived', () => {
+  it('survives a timestamp SQLite cannot store', async () => {
+    const harness = makeHarness();
+    const line = JSON.stringify({
+      type: 'user',
+      userType: 'external',
+      sessionId: SESSION_A,
+      timestamp: 1e300,
+      cwd: '/home/u/app',
+      message: { role: 'user', content: 'why is this number here' },
+    });
+    fs.writeFileSync(harness.transcriptOf(SESSION_A), `${line}\n`);
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.failed, 0, 'a number the catalog cannot hold does not fail the backup');
+    assert.ok(getSession(harness.ctx.db, SESSION_A)?.verifiedAt);
+  });
+
+  it('archives a sidecar that contains two hardlinks to one inode', async () => {
+    // tar deduplicates these into a zero-byte Link entry, which could never
+    // agree with a manifest that lstats each path — blocking the session for ever.
+    const harness = makeHarness();
+    const first = path.join(harness.projectDir, SESSION_B, 'a.json');
+    fs.writeFileSync(first, 'y'.repeat(500));
+    try {
+      fs.linkSync(first, path.join(harness.projectDir, SESSION_B, 'b.json'));
+    } catch {
+      return; // A filesystem without hardlinks has nothing to prove here.
+    }
+
+    const report = await runSweep(harness.ctx);
+    assert.equal(report.failed, 0);
+    assert.ok(getSession(harness.ctx.db, SESSION_B)?.verifiedAt, 'the session is archived');
   });
 });

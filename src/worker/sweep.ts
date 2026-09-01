@@ -84,7 +84,7 @@ export async function runSweep(
     verified: 0,
     failed: 0,
     blocked: 0,
-    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 },
+    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0, unconfirmable: 0 },
     catalogUploaded: false,
     cooledDown: false,
     budgetExhausted: false,
@@ -119,6 +119,8 @@ export async function runSweep(
 
   if (!drained.budgetExhausted && clockLooksSane(ctx, startedAt)) {
     report.reap = await reapLocalCopies(ctx, ctx.clock.now());
+    const at = ctx.clock.now();
+    kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at);
   }
 
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {

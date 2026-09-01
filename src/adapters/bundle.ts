@@ -65,6 +65,12 @@ export async function createBundle(input: BundleInput): Promise<BundleResult> {
         // same bytes on macOS, Windows and Linux.
         portable: true,
         follow: false,
+        // node-tar dedupes files that share an inode: the second one becomes a
+        // zero-byte Link entry pointing at the first. The manifest lstats each
+        // file independently and records its real size, so the bundle could
+        // never agree with it and the session was blocked for ever. Storing
+        // both copies in full costs bytes and always agrees.
+        linkCache: new NoLinkCache(),
         noDirRecurse: false,
       },
       input.entries,
@@ -150,6 +156,11 @@ export async function extractBundle(args: {
 /** `<id>.jsonl`, `<id>` or anything beneath `<id>/`, and nothing else. */
 export function belongsToSession(entryPath: string, sessionId: string): boolean {
   const normalized = toPosix(entryPath).replace(/^\.\//, '').replace(/\/$/, '');
+  // node-tar refuses these itself, and did in testing. Depending on a library's
+  // defaults for the only thing standing between a bundle and the rest of the
+  // filesystem is not a position worth being in.
+  if (normalized.split('/').includes('..')) return false;
+  if (normalized.startsWith('/') || /^[a-zA-Z]:/.test(normalized)) return false;
   return (
     normalized === `${sessionId}.jsonl` ||
     normalized === sessionId ||
@@ -226,6 +237,13 @@ async function describeInto(
   const children = await fsp.readdir(absolute);
   for (const child of children) {
     await describeInto(out, cwd, path.join(relative, child), signal);
+  }
+}
+
+/** A link cache that forgets, so every hardlink is written out in full. */
+class NoLinkCache extends Map<`${number}:${number}`, string> {
+  override set(): this {
+    return this;
   }
 }
 

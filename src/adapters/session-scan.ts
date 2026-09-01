@@ -45,9 +45,12 @@ export async function statSession(
   const transcriptPath = path.join(dir, `${sessionId}.jsonl`);
   const sidecarDir = path.join(dir, sessionId);
 
-  let transcript: Awaited<ReturnType<typeof fsp.stat>>;
+  let transcript: Awaited<ReturnType<typeof fsp.lstat>>;
   try {
-    transcript = await fsp.stat(transcriptPath);
+    // lstat, to match the manifest walk. stat here followed a symlinked
+    // transcript and measured its target, while the manifest walk skipped the
+    // link — so the two could never agree and the session blocked for ever.
+    transcript = await fsp.lstat(transcriptPath);
   } catch (err) {
     // Only absence is absence. Swallowing a permission error here made the
     // reaper record a session as locally deleted while its files sat on disk,
@@ -123,7 +126,14 @@ export async function* scanSessions(
         skipped?.push({ kind: 'session', name: entry, reason: 'unreadable' });
         continue;
       }
-      if (session !== null) yield session;
+      if (session !== null) {
+        yield session;
+      } else {
+        // The entry is listed but is not a session we can archive: a symlink,
+        // a directory named `<id>.jsonl`, a file that vanished. Recorded, so a
+        // session that is never backed up is never silent.
+        skipped?.push({ kind: 'session', name: entry, reason: 'unreadable' });
+      }
     }
   }
 }

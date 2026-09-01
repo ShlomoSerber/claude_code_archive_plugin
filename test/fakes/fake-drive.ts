@@ -45,6 +45,8 @@ export type FakeDriveOptions = {
   trashed?: boolean;
   /** Return no checksum at all, as Drive does for some files. */
   omitSha256?: boolean;
+  /** Report md5 but never sha256, which Drive documents as "if available". */
+  md5Only?: boolean;
   /** Start failing uploads once this many have succeeded, to model a bad day. */
   failUploadsAfter?: number;
 };
@@ -259,7 +261,7 @@ export class FakeDrive implements DriveTransport {
       name: file.name,
       size: file.content.length,
       sha256:
-        this.options.omitSha256 === true
+        this.options.omitSha256 === true || this.options.md5Only === true
           ? null
           : this.options.corruptChecksums === true
             ? 'f'.repeat(64)

@@ -140,6 +140,35 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
   `,
+
+  // 7 — the weaker hash of the archived copy, and the bundles we chose to keep.
+  //
+  // Drive returns sha256Checksum "if available" and computes it asynchronously,
+  // so a Drive that only ever answers with md5 left every session unreapable
+  // for ever while the plugin reported itself healthy. md5 is enough to confirm
+  // the file Drive holds is the one we uploaded, once sha256 has proved the
+  // bundle matches the disk.
+  //
+  // retained_bundles remembers a superseded bundle that was NOT retired because
+  // the replacement did not contain it. Nothing pointed at those, so their
+  // unique contents were reachable only by browsing Drive by hand.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_bundle_md5 TEXT;
+
+  CREATE TABLE retained_bundles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    file_id     TEXT NOT NULL,
+    remote_path TEXT,
+    bundle_sha256 TEXT,
+    manifest    TEXT,
+    reason      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (file_id)
+  ) STRICT;
+
+  CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

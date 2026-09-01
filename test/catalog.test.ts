@@ -135,6 +135,7 @@ describe('the backup lifecycle', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       3000,
     );
@@ -165,6 +166,7 @@ describe('the backup lifecycle', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       3000,
     );
@@ -222,6 +224,7 @@ describe('listReapable', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       1,
     );
@@ -252,6 +255,7 @@ describe('listReapable', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       1,
     );
@@ -310,6 +314,7 @@ describe('listUnverified', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       1,
     );
@@ -357,6 +362,7 @@ describe('catalogStats', () => {
         sidecarBytes: 100,
         bundleBytes: 120,
         manifest: null,
+        bundleMd5: null,
       },
       1,
     );

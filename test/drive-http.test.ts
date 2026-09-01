@@ -99,7 +99,7 @@ describe('interpretUploadResponse', () => {
 });
 
 describe('matchesLocal', () => {
-  const bundle = { totalBytes: 100, sha256: 'abc' };
+  const bundle = { totalBytes: 100, sha256: 'abc', md5: 'def' };
 
   it('accepts a remote file with the same size and hash', () => {
     assert.equal(
@@ -107,7 +107,7 @@ describe('matchesLocal', () => {
         { id: 'x', name: 'n', size: 100, sha256: 'ABC', md5: null, trashed: false },
         bundle,
       ),
-      true,
+      'match',
     );
   });
 
@@ -117,17 +117,36 @@ describe('matchesLocal', () => {
         { id: 'x', name: 'n', size: 99, sha256: 'abc', md5: null, trashed: false },
         bundle,
       ),
-      false,
+      'mismatch',
     );
   });
 
-  it('rejects a remote file whose hash Drive will not tell us', () => {
+  it('falls back to md5 when Drive reports no sha256', () => {
     assert.equal(
       matchesLocal(
-        { id: 'x', name: 'n', size: 100, sha256: null, md5: 'x', trashed: false },
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: 'DEF', trashed: false },
         bundle,
       ),
-      false,
+      'match',
+    );
+    assert.equal(
+      matchesLocal(
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: 'other', trashed: false },
+        bundle,
+      ),
+      'mismatch',
+    );
+  });
+
+  it('says unknown, not mismatch, when Drive reports no hash at all', () => {
+    // The caller trashes on a mismatch. Drive computes checksums
+    // asynchronously, so "not yet" must never read as "wrong".
+    assert.equal(
+      matchesLocal(
+        { id: 'x', name: 'n', size: 100, sha256: null, md5: null, trashed: false },
+        bundle,
+      ),
+      'unknown',
     );
   });
 });

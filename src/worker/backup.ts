@@ -9,6 +9,7 @@ import {
   getSession,
   markVerified,
   clearVerification,
+  recordRetainedBundle,
   replaceFiles,
   replacePrompts,
   upsertSession,
@@ -297,6 +298,7 @@ async function publish(
     mimeType: 'application/zstd',
     totalBytes: bundle.bytes,
     sha256: bundle.sha256,
+    md5: bundle.md5,
     appProperties: { sessionId: session.sessionId, archiver: ctx.version },
   });
 
@@ -348,6 +350,7 @@ async function publish(
       sidecarBytes: archivedSidecar,
       bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
+      bundleMd5: bundle.md5,
       manifest: encodeManifest(files),
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
@@ -371,12 +374,27 @@ async function publish(
   // comparisons let one sidecar file be swapped for a larger one, and the
   // archived subagent transcript then existed nowhere.
   const contains = await describeContainment(ctx, session, previous, files);
-  if (contains !== null) {
+  if (contains !== null && supersededId !== null && supersededId !== remote.id) {
     ctx.logger.warn('backup.superseded_kept', {
       session_id: session.sessionId,
-      file_id: supersededId ?? '',
+      file_id: supersededId,
       reason: contains,
     });
+    // remote_file_id has already moved to the replacement, so without this row
+    // the kept bundle is unreferenced: its unique contents survive on Drive but
+    // the plugin can no longer find, restore, or even mention them.
+    recordRetainedBundle(
+      ctx.db,
+      {
+        sessionId: session.sessionId,
+        fileId: supersededId,
+        remotePath: previous?.remotePath ?? null,
+        bundleSha256: previous?.verifiedBundleSha256 ?? null,
+        manifest: previous?.verifiedManifest ?? null,
+        reason: contains,
+      },
+      ctx.clock.now(),
+    );
   }
   if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
     try {
@@ -420,6 +438,12 @@ export async function verifyRemote(
 
   ctx.logger.error('backup.verification_failed', { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
+  if (meta.sha256 === null && meta.md5 === null) {
+    // Drive did not answer, twice. That is not evidence the file is wrong, and
+    // trashing it on that basis destroyed a good archive — and then destroyed
+    // its replacement on the next attempt, and the one after that.
+    throw new RetryableError(`Drive has not reported a checksum for ${uploaded.id} yet`);
+  }
   // Trashed, not deleted. uploadWithResume can hand back a *pre-existing*
   // file it found by name, so "the file this run just created" is not always
   // true, and a permanent delete would be unrecoverable if it were the copy

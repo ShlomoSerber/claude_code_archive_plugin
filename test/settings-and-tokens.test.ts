@@ -9,6 +9,7 @@ import {
   setCleanupPeriodDays,
 } from '../src/adapters/claude-settings.ts';
 import { createFileTokenStore, createMemoryTokenStore } from '../src/adapters/token-file.ts';
+import { openDatabase } from '../src/adapters/db.ts';
 import { CLEANUP_PERIOD_DAYS } from '../src/core/config.ts';
 import { FatalError } from '../src/core/errors.ts';
 import { buildManifest, parseManifest, MANIFEST_VERSION } from '../src/core/manifest.ts';
@@ -257,5 +258,18 @@ describe('parseManifest', () => {
     assert.equal(parseManifest('{}'), null);
     assert.equal(parseManifest('not json'), null);
     assert.equal(parseManifest('{"sessionId":"s"}'), null);
+  });
+});
+
+describe('the catalog file', () => {
+  it('is readable only by its owner', () => {
+    // It holds every user prompt verbatim, which is more sensitive than the
+    // drive.file-scoped token stored next to it at 0600.
+    if (process.platform === 'win32') return;
+    const file = path.join(tempDir(), 'archive.sqlite');
+    const db = openDatabase(file);
+    db.exec('CREATE TABLE t (a INTEGER)');
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    db.close();
   });
 });

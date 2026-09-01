@@ -29,11 +29,30 @@ export function openDatabase(file: string, options: OpenOptions = {}): Db {
     fs.mkdirSync(path.dirname(file), { recursive: true });
   }
   const db = new (getSqlite().DatabaseSync)(file, { readOnly: options.readOnly ?? false });
+  if (file !== ':memory:' && options.readOnly !== true) restrictToOwner(file);
   applyPragmas(db, options);
   if (options.skipMigrations !== true && options.readOnly !== true) {
     migrate(db);
   }
   return db;
+}
+
+/**
+ * Owner-only permissions on the catalog and its WAL sidecars.
+ *
+ * tokens.json and the log are already 0600; the catalog was left at the umask
+ * while holding every user prompt verbatim, which is the more sensitive of the
+ * two. A no-op on Windows, where the user-profile directory is already ACL'd.
+ */
+function restrictToOwner(file: string): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      fs.chmodSync(`${file}${suffix}`, 0o600);
+    } catch {
+      // The sidecars exist only while a connection is open, and a filesystem
+      // without POSIX modes is not a reason to fail to open the catalog.
+    }
+  }
 }
 
 function applyPragmas(db: Db, options: OpenOptions): void {

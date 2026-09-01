@@ -1,4 +1,4 @@
-import { catalogStats } from '../core/catalog.ts';
+import { catalogStats, listRetainedBundles } from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
@@ -29,6 +29,8 @@ export async function runStatus(
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
+  const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
+  const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore
     .read()
     .then((tokens) => tokens !== null)
@@ -55,6 +57,13 @@ export async function runStatus(
       competingCleanupSettings: competing,
       unarchivable: skipped,
       unreadable,
+      unconfirmable,
+      retainedBundles: retained.map((entry) => ({
+        sessionId: entry.sessionId,
+        fileId: entry.fileId,
+        remotePath: entry.remotePath,
+        reason: entry.reason,
+      })),
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -108,6 +117,23 @@ export async function runStatus(
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
     print(`                      That file outranks the one this plugin wrote.`);
+  }
+  if (unconfirmable > 0) {
+    // Everything says verified and nothing is ever reclaimed: without this line
+    // the plugin looks healthy while its whole purpose has quietly stopped.
+    print(`  WARNING:            ${String(unconfirmable)} archived session(s) could not be`);
+    print(`                      re-confirmed on Drive, so no space was reclaimed. See the log.`);
+  }
+  if (retained.length > 0) {
+    print();
+    print(
+      `  ${String(retained.length)} older bundle(s) kept on Drive alongside their replacement:`,
+    );
+    for (const entry of retained.slice(0, 5)) {
+      print(`    ${entry.sessionId}: ${entry.reason}`);
+      print(`      ${entry.remotePath ?? entry.fileId}`);
+    }
+    print(`  They hold data the newer bundle does not. Nothing deletes them.`);
   }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);

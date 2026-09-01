@@ -204,6 +204,7 @@ export async function restoreSession(
           sidecarBytes: restored.sidecarBytes,
           bundleBytes: record.verifiedBundleBytes,
           manifest: record.verifiedManifest,
+          bundleMd5: record.verifiedBundleMd5,
           bundleSha256: record.verifiedBundleSha256,
           transcriptSha256: record.verifiedTranscriptSha256,
         },

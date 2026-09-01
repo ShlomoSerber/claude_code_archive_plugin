@@ -304,6 +304,34 @@ var MIGRATIONS = [
   // prove the old bundle's contents are still present in the new one.
   `
   ALTER TABLE sessions ADD COLUMN verified_manifest TEXT;
+  `,
+  // 7 — the weaker hash of the archived copy, and the bundles we chose to keep.
+  //
+  // Drive returns sha256Checksum "if available" and computes it asynchronously,
+  // so a Drive that only ever answers with md5 left every session unreapable
+  // for ever while the plugin reported itself healthy. md5 is enough to confirm
+  // the file Drive holds is the one we uploaded, once sha256 has proved the
+  // bundle matches the disk.
+  //
+  // retained_bundles remembers a superseded bundle that was NOT retired because
+  // the replacement did not contain it. Nothing pointed at those, so their
+  // unique contents were reachable only by browsing Drive by hand.
+  `
+  ALTER TABLE sessions ADD COLUMN verified_bundle_md5 TEXT;
+
+  CREATE TABLE retained_bundles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    file_id     TEXT NOT NULL,
+    remote_path TEXT,
+    bundle_sha256 TEXT,
+    manifest    TEXT,
+    reason      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (file_id)
+  ) STRICT;
+
+  CREATE INDEX retained_bundles_session ON retained_bundles (session_id);
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -314,11 +342,20 @@ function openDatabase(file, options = {}) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
   }
   const db = new (getSqlite()).DatabaseSync(file, { readOnly: options.readOnly ?? false });
+  if (file !== ":memory:" && options.readOnly !== true) restrictToOwner(file);
   applyPragmas(db, options);
   if (options.skipMigrations !== true && options.readOnly !== true) {
     migrate(db);
   }
   return db;
+}
+function restrictToOwner(file) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      fs.chmodSync(`${file}${suffix}`, 384);
+    } catch {
+    }
+  }
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
@@ -2050,7 +2087,7 @@ async function statSession(paths, encodedDir, sessionId) {
   const sidecarDir = path10.join(dir, sessionId);
   let transcript;
   try {
-    transcript = await fsp6.stat(transcriptPath);
+    transcript = await fsp6.lstat(transcriptPath);
   } catch (err) {
     if (err.code === "ENOENT") return null;
     throw err;
@@ -2104,7 +2141,11 @@ async function* scanSessions(paths, skipped) {
         skipped?.push({ kind: "session", name: entry, reason: "unreadable" });
         continue;
       }
-      if (session !== null) yield session;
+      if (session !== null) {
+        yield session;
+      } else {
+        skipped?.push({ kind: "session", name: entry, reason: "unreadable" });
+      }
     }
   }
 }
@@ -2156,7 +2197,7 @@ var SESSION_COLUMNS = `session_id, encoded_dir, project_cwd, title, summary, git
   verified_at, archiver_version, local_present, local_deleted_at, last_local_mtime,
   verified_local_mtime, verified_local_bytes, verified_bundle_sha256,
   verified_transcript_sha256, verified_transcript_bytes, verified_sidecar_bytes,
-  verified_bundle_bytes, verified_manifest, created_at, updated_at`;
+  verified_bundle_bytes, verified_manifest, verified_bundle_md5, created_at, updated_at`;
 function upsertSession(db, session, now) {
   db.prepare(
     `INSERT INTO sessions (
@@ -2248,6 +2289,35 @@ function markBundled(db, sessionId, backup, now) {
     sessionId
   );
 }
+function recordRetainedBundle(db, entry, now) {
+  db.prepare(
+    `INSERT INTO retained_bundles
+       (session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (file_id) DO UPDATE SET reason = excluded.reason`
+  ).run(
+    entry.sessionId,
+    entry.fileId,
+    entry.remotePath,
+    entry.bundleSha256,
+    entry.manifest,
+    entry.reason,
+    now
+  );
+}
+function listRetainedBundles(db, sessionId) {
+  const rows = sessionId === void 0 ? db.prepare("SELECT * FROM retained_bundles ORDER BY id").all() : db.prepare("SELECT * FROM retained_bundles WHERE session_id = ? ORDER BY id").all(sessionId);
+  return rows.map((row) => ({
+    id: row.id,
+    sessionId: row.session_id,
+    fileId: row.file_id,
+    remotePath: row.remote_path,
+    bundleSha256: row.bundle_sha256,
+    manifest: row.manifest,
+    reason: row.reason,
+    createdAt: row.created_at
+  }));
+}
 function markVerified(db, sessionId, remote, now) {
   db.prepare(
     `UPDATE sessions
@@ -2255,7 +2325,7 @@ function markVerified(db, sessionId, remote, now) {
             verified_local_mtime = ?, verified_local_bytes = ?, verified_bundle_sha256 = ?,
             verified_transcript_sha256 = ?, verified_transcript_bytes = ?,
             verified_sidecar_bytes = ?, verified_bundle_bytes = ?, verified_manifest = ?,
-            updated_at = ?
+            verified_bundle_md5 = ?, updated_at = ?
       WHERE session_id = ?`
   ).run(
     remote.fileId,
@@ -2270,6 +2340,7 @@ function markVerified(db, sessionId, remote, now) {
     remote.sidecarBytes,
     remote.bundleBytes,
     remote.manifest,
+    remote.bundleMd5,
     now,
     sessionId
   );
@@ -2386,6 +2457,7 @@ function toRecord(row) {
     verifiedSidecarBytes: row.verified_sidecar_bytes,
     verifiedBundleBytes: row.verified_bundle_bytes,
     verifiedManifest: row.verified_manifest,
+    verifiedBundleMd5: row.verified_bundle_md5,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -2555,6 +2627,8 @@ var KV = {
   unreadableCount: "scan.unreadable_count",
   /** Stable id for this installation, so two machines never share a catalog file. */
   machineId: "machine.id",
+  /** Sessions the last reap could not confirm on Drive, so nothing was freed. */
+  unconfirmableCount: "reap.unconfirmable_count",
   /** Set once the initial backfill has enqueued every existing session. */
   backfillDoneAt: "backfill.done_at"
 };
@@ -5612,6 +5686,12 @@ async function createBundle(input) {
         // same bytes on macOS, Windows and Linux.
         portable: true,
         follow: false,
+        // node-tar dedupes files that share an inode: the second one becomes a
+        // zero-byte Link entry pointing at the first. The manifest lstats each
+        // file independently and records its real size, so the bundle could
+        // never agree with it and the session was blocked for ever. Storing
+        // both copies in full costs bytes and always agrees.
+        linkCache: new NoLinkCache(),
         noDirRecurse: false
       },
       input.entries
@@ -5667,6 +5747,8 @@ async function extractBundle(args) {
 }
 function belongsToSession(entryPath, sessionId) {
   const normalized = toPosix(entryPath).replace(/^\.\//, "").replace(/\/$/, "");
+  if (normalized.split("/").includes("..")) return false;
+  if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) return false;
   return normalized === `${sessionId}.jsonl` || normalized === sessionId || normalized.startsWith(`${sessionId}/`);
 }
 async function describeSessionFiles(args) {
@@ -5700,6 +5782,11 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
     await describeInto(out, cwd, path11.join(relative, child), signal);
   }
 }
+var NoLinkCache = class extends Map {
+  set() {
+    return this;
+  }
+};
 function toPosix(relative) {
   return relative.split(path11.sep).join("/");
 }
@@ -5909,7 +5996,10 @@ function asString3(value) {
   return typeof value === "string" ? value : null;
 }
 function parseTimestamp(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const truncated = Math.trunc(value);
+    return Number.isSafeInteger(truncated) ? truncated : null;
+  }
   if (typeof value !== "string") return null;
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : Math.trunc(parsed);
@@ -6064,7 +6154,7 @@ async function uploadWithResume(ctx, args) {
       uploadUri = null;
       setUploadUri(ctx.db, args.job, null, ctx.clock.now());
     } else if (progress.done && progress.file !== null) {
-      if (matchesLocal(progress.file, args)) {
+      if (matchesLocal(progress.file, args) !== "mismatch") {
         log.info("upload.already_complete");
         setUploadUri(ctx.db, args.job, null, ctx.clock.now());
         return progress.file;
@@ -6082,9 +6172,15 @@ async function uploadWithResume(ctx, args) {
       { name: args.name, parentId: args.parentId },
       ctx.signal
     );
-    if (existing !== null && matchesLocal(existing, args)) {
+    const verdict = existing === null ? "mismatch" : matchesLocal(existing, args);
+    if (existing !== null && verdict === "match") {
       log.info("upload.found_existing", { file_id: existing.id });
       return existing;
+    }
+    if (existing !== null && verdict === "unknown") {
+      throw new RetryableError(
+        `Drive has not reported a checksum for the existing ${args.name}; leaving it alone`
+      );
     }
     if (existing !== null) {
       log.warn("upload.trashing_mismatched_remote", { file_id: existing.id });
@@ -6156,9 +6252,14 @@ function parseUploadUri(stored) {
   return { sha256: stored.slice(0, separator), uri: stored.slice(separator + 1) };
 }
 function matchesLocal(remote, args) {
-  if (remote.size !== null && remote.size !== args.totalBytes) return false;
-  if (remote.sha256 !== null) return remote.sha256.toLowerCase() === args.sha256.toLowerCase();
-  return false;
+  if (remote.size !== null && remote.size !== args.totalBytes) return "mismatch";
+  if (remote.sha256 !== null) {
+    return remote.sha256.toLowerCase() === args.sha256.toLowerCase() ? "match" : "mismatch";
+  }
+  if (remote.md5 !== null && args.md5 !== void 0) {
+    return remote.md5.toLowerCase() === args.md5.toLowerCase() ? "match" : "mismatch";
+  }
+  return "unknown";
 }
 
 // src/worker/backup.ts
@@ -6312,6 +6413,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     mimeType: "application/zstd",
     totalBytes: bundle.bytes,
     sha256: bundle.sha256,
+    md5: bundle.md5,
     appProperties: { sessionId: session.sessionId, archiver: ctx.version }
   });
   await verifyRemote(ctx, session.sessionId, remote, bundle);
@@ -6357,6 +6459,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
       sidecarBytes: archivedSidecar,
       bundleBytes: bundle.bytes,
       bundleSha256: bundle.sha256,
+      bundleMd5: bundle.md5,
       manifest: encodeManifest(files),
       // From the same hashing pass that verifyBundleContents checked the
       // bundle against, so it describes the archived bytes. Hashing the file
@@ -6368,12 +6471,24 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
   const contains = await describeContainment(ctx, session, previous, files);
-  if (contains !== null) {
+  if (contains !== null && supersededId !== null && supersededId !== remote.id) {
     ctx.logger.warn("backup.superseded_kept", {
       session_id: session.sessionId,
-      file_id: supersededId ?? "",
+      file_id: supersededId,
       reason: contains
     });
+    recordRetainedBundle(
+      ctx.db,
+      {
+        sessionId: session.sessionId,
+        fileId: supersededId,
+        remotePath: previous?.remotePath ?? null,
+        bundleSha256: previous?.verifiedBundleSha256 ?? null,
+        manifest: previous?.verifiedManifest ?? null,
+        reason: contains
+      },
+      ctx.clock.now()
+    );
   }
   if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
     try {
@@ -6396,6 +6511,9 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   }
   ctx.logger.error("backup.verification_failed", { session_id: sessionId, reason: problem });
   clearVerification(ctx.db, sessionId, ctx.clock.now());
+  if (meta.sha256 === null && meta.md5 === null) {
+    throw new RetryableError(`Drive has not reported a checksum for ${uploaded.id} yet`);
+  }
   await ctx.drive.trashFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
 }
@@ -6471,7 +6589,14 @@ function compareChecksums(remote, bundle) {
 import fsp11 from "node:fs/promises";
 import path13 from "node:path";
 async function reapLocalCopies(ctx, now) {
-  const report = { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 };
+  const report = {
+    deleted: 0,
+    bytesFreed: 0,
+    requeued: 0,
+    skipped: 0,
+    unverified: 0,
+    unconfirmable: 0
+  };
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
   const cutoff = reapCutoff(now, ctx.config.retentionDays);
   for (const record of listReapable(ctx.db, cutoff)) {
@@ -6544,6 +6669,7 @@ async function reapLocalCopies(ctx, now) {
     }
     if (remote === "unavailable") {
       report.skipped++;
+      report.unconfirmable++;
       continue;
     }
     const settled = await statSession(ctx.paths, record.encodedDir, record.sessionId);
@@ -6601,8 +6727,13 @@ async function confirmRemote(ctx, record) {
     if (remote.size !== null && expectedBytes !== null && remote.size !== expectedBytes) {
       return "gone";
     }
-    if (remote.sha256 === null) return "unavailable";
-    return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase() ? "ok" : "gone";
+    if (remote.sha256 !== null) {
+      return remote.sha256.toLowerCase() === record.verifiedBundleSha256?.toLowerCase() ? "ok" : "gone";
+    }
+    if (remote.md5 !== null && record.verifiedBundleMd5 !== null) {
+      return remote.md5.toLowerCase() === record.verifiedBundleMd5.toLowerCase() ? "ok" : "gone";
+    }
+    return "unavailable";
   } catch (err) {
     if (err instanceof FatalError) return "gone";
     ctx.logger.warn("reap.remote_check_failed", { session_id: record.sessionId }, err);
@@ -6647,7 +6778,7 @@ async function runSweep(ctx, options = {}) {
     verified: 0,
     failed: 0,
     blocked: 0,
-    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0 },
+    reap: { deleted: 0, bytesFreed: 0, requeued: 0, skipped: 0, unverified: 0, unconfirmable: 0 },
     catalogUploaded: false,
     cooledDown: false,
     budgetExhausted: false,
@@ -6675,6 +6806,8 @@ async function runSweep(ctx, options = {}) {
   report.budgetExhausted = drained.budgetExhausted;
   if (!drained.budgetExhausted && clockLooksSane(ctx, startedAt)) {
     report.reap = await reapLocalCopies(ctx, ctx.clock.now());
+    const at2 = ctx.clock.now();
+    kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at2);
   }
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
     report.catalogUploaded = await uploadCatalogCopy(ctx);
@@ -7572,6 +7705,7 @@ async function restoreSession(ctx, sessionId) {
           sidecarBytes: restored.sidecarBytes,
           bundleBytes: record.verifiedBundleBytes,
           manifest: record.verifiedManifest,
+          bundleMd5: record.verifiedBundleMd5,
           bundleSha256: record.verifiedBundleSha256,
           transcriptSha256: record.verifiedTranscriptSha256
         },
@@ -8031,6 +8165,8 @@ async function runStatus(runtime, options) {
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
+  const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
+  const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
   const persisted = await readStatusFile(runtime.paths.statusFile);
   let quota = null;
@@ -8051,6 +8187,13 @@ async function runStatus(runtime, options) {
       competingCleanupSettings: competing,
       unarchivable: skipped,
       unreadable,
+      unconfirmable,
+      retainedBundles: retained.map((entry) => ({
+        sessionId: entry.sessionId,
+        fileId: entry.fileId,
+        remotePath: entry.remotePath,
+        reason: entry.reason
+      })),
       catalog: stats,
       queue,
       blocked: blocked.map((job) => ({ sessionId: job.sessionId, error: job.lastError })),
@@ -8099,6 +8242,21 @@ async function runStatus(runtime, options) {
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);
     print(`                      That file outranks the one this plugin wrote.`);
+  }
+  if (unconfirmable > 0) {
+    print(`  WARNING:            ${String(unconfirmable)} archived session(s) could not be`);
+    print(`                      re-confirmed on Drive, so no space was reclaimed. See the log.`);
+  }
+  if (retained.length > 0) {
+    print();
+    print(
+      `  ${String(retained.length)} older bundle(s) kept on Drive alongside their replacement:`
+    );
+    for (const entry of retained.slice(0, 5)) {
+      print(`    ${entry.sessionId}: ${entry.reason}`);
+      print(`      ${entry.remotePath ?? entry.fileId}`);
+    }
+    print(`  They hold data the newer bundle does not. Nothing deletes them.`);
   }
   if (circuitUntil !== null && circuitUntil > now) {
     print(`  Backing off until:  ${formatDate(circuitUntil)} after repeated failures`);

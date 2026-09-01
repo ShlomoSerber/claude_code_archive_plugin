@@ -9,6 +9,7 @@ import {
   extractBundle,
   listBundle,
   toPosix,
+  belongsToSession,
 } from '../src/adapters/bundle.ts';
 import { sha256File, sha256OfBuffer } from '../src/adapters/hashing.ts';
 import { tempDir } from './helpers.ts';
@@ -150,5 +151,26 @@ describe('describeSessionFiles', () => {
 describe('toPosix', () => {
   it('leaves an already-posix path alone', () => {
     assert.equal(toPosix('sess-1/tool.json'), 'sess-1/tool.json');
+  });
+});
+
+describe('belongsToSession', () => {
+  const sid = '11111111-2222-3333-4444-555555555555';
+
+  it('accepts the transcript and anything under the sidecar', () => {
+    assert.equal(belongsToSession(`${sid}.jsonl`, sid), true);
+    assert.equal(belongsToSession(`${sid}/tool-1.json`, sid), true);
+    assert.equal(belongsToSession(`./${sid}/`, sid), true);
+  });
+
+  it('refuses a traversal without leaning on node-tar to catch it', () => {
+    // node-tar does refuse these. Depending on a library's defaults for the
+    // only thing between a bundle and the rest of the filesystem is not a
+    // position worth being in.
+    assert.equal(belongsToSession(`${sid}/../../evil.txt`, sid), false);
+    assert.equal(belongsToSession(`${sid}/../other.jsonl`, sid), false);
+    assert.equal(belongsToSession(`/etc/passwd`, sid), false);
+    assert.equal(belongsToSession(`C:/Windows/evil`, sid), false);
+    assert.equal(belongsToSession('other-session.jsonl', sid), false);
   });
 });
