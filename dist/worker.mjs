@@ -194,9 +194,90 @@ function sleepSync(ms2) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms2);
 }
 
-// src/adapters/db.ts
+// src/hooks/last-resort.ts
 import fs2 from "node:fs";
+import path3 from "node:path";
+
+// src/core/paths.ts
 import path2 from "node:path";
+import { existsSync } from "node:fs";
+import os2 from "node:os";
+function resolveClaudeDir(env, homedir = os2.homedir) {
+  const configured = trimmed(env["CLAUDE_CONFIG_DIR"]);
+  if (configured !== void 0) return path2.resolve(configured);
+  return path2.join(homedir(), ".claude");
+}
+function resolveDataDir(env, claudeDir) {
+  const override = trimmed(env["ARCHIVE_DATA_DIR"]);
+  if (override !== void 0) return path2.resolve(override);
+  const provided = trimmed(env["CLAUDE_PLUGIN_DATA"]);
+  if (provided !== void 0) return path2.resolve(provided);
+  const root = path2.join(claudeDir, "plugins", "data");
+  const canonical = path2.join(root, PLUGIN_DATA_SLUG);
+  if (existsSync(canonical)) return canonical;
+  const legacy = path2.join(root, LEGACY_PLUGIN_SLUG);
+  if (existsSync(legacy)) return legacy;
+  return canonical;
+}
+var PLUGIN_DATA_SLUG = "archive-claude-code-archive";
+var LEGACY_PLUGIN_SLUG = "claude-code-archive-plugin";
+function resolvePaths(env, homedir = os2.homedir) {
+  const claudeDir = resolveClaudeDir(env, homedir);
+  const dataDir = resolveDataDir(env, claudeDir);
+  return {
+    claudeDir,
+    projectsDir: path2.join(claudeDir, "projects"),
+    settingsFile: path2.join(claudeDir, "settings.json"),
+    dataDir,
+    dbFile: path2.join(dataDir, "archive.sqlite"),
+    logFile: path2.join(dataDir, "archive.log"),
+    tokenFile: path2.join(dataDir, "tokens.json"),
+    statusFile: path2.join(dataDir, "status.json"),
+    lockDir: path2.join(dataDir, "worker.lock"),
+    runtimeCacheFile: path2.join(dataDir, "runtime.json"),
+    stagingDir: path2.join(dataDir, "staging"),
+    restoreDir: path2.join(dataDir, "restoring")
+  };
+}
+function trimmed(value) {
+  if (value === void 0) return void 0;
+  const out = value.trim();
+  return out.length > 0 ? out : void 0;
+}
+
+// src/hooks/last-resort.ts
+function markerName(event) {
+  if (event.startsWith("worker.")) return "worker-error.json";
+  return event.startsWith("hook.session_start") ? "hook-error-start.json" : "hook-error-end.json";
+}
+function logLastResort(event, err) {
+  try {
+    const paths = resolvePaths(process.env);
+    fs2.mkdirSync(paths.dataDir, { recursive: true });
+    const line = JSON.stringify({
+      ts: (/* @__PURE__ */ new Date()).toISOString(),
+      level: "error",
+      event,
+      err: {
+        name: err instanceof Error ? err.name : "Error",
+        message: err instanceof Error ? err.message : String(err)
+      }
+    });
+    fs2.appendFileSync(paths.logFile, `${line}
+`, { mode: 384 });
+    fs2.writeFileSync(
+      path3.join(paths.dataDir, markerName(event)),
+      `${JSON.stringify({ at: Date.now(), event, message: line })}
+`,
+      { mode: 384 }
+    );
+  } catch {
+  }
+}
+
+// src/adapters/db.ts
+import fs3 from "node:fs";
+import path4 from "node:path";
 
 // src/adapters/sqlite.ts
 import { createRequire } from "node:module";
@@ -550,7 +631,7 @@ var SCHEMA_VERSION = MIGRATIONS.length;
 // src/adapters/db.ts
 function openDatabase(file, options = {}) {
   if (file !== ":memory:") {
-    fs2.mkdirSync(path2.dirname(file), { recursive: true });
+    fs3.mkdirSync(path4.dirname(file), { recursive: true });
   }
   const db = new (getSqlite()).DatabaseSync(file, { readOnly: options.readOnly ?? false });
   if (file !== ":memory:" && options.readOnly !== true) restrictToOwner(file);
@@ -563,17 +644,17 @@ function openDatabase(file, options = {}) {
 function restrictToOwner(file) {
   for (const suffix of ["", "-wal", "-shm"]) {
     try {
-      fs2.chmodSync(`${file}${suffix}`, 384);
+      fs3.chmodSync(`${file}${suffix}`, 384);
     } catch {
     }
   }
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
+  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   if (options.readOnly !== true) {
     db.exec("PRAGMA journal_mode = WAL");
   }
-  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
 }
@@ -669,6 +750,8 @@ var KV = {
   orphanSidecars: "reap.orphan_sidecars",
   /** Reaped sessions whose Drive copy failed a re-check. */
   auditMismatched: "audit.mismatched",
+  /** Last time a session was told the plugin is installed but not set up. */
+  setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -681,15 +764,15 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1e3;
 
 // src/composition.ts
 import fsp5 from "node:fs/promises";
-import path8 from "node:path";
+import path9 from "node:path";
 
 // src/adapters/ndjson-logger.ts
-import fs3 from "node:fs";
-import path3 from "node:path";
+import fs4 from "node:fs";
+import path5 from "node:path";
 var LEVEL_ORDER = { debug: 10, info: 20, warn: 30, error: 40 };
 var DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 function createNdjsonLogger(options) {
@@ -741,14 +824,14 @@ function serialize(level, event, fields, err) {
 function write(state, line) {
   try {
     if (!state.ready) {
-      fs3.mkdirSync(path3.dirname(state.file), { recursive: true });
+      fs4.mkdirSync(path5.dirname(state.file), { recursive: true });
       state.ready = true;
     }
     if (state.bytesSinceCheck > 64 * 1024) {
       rotateIfLarge(state);
       state.bytesSinceCheck = 0;
     }
-    fs3.appendFileSync(state.file, line, { encoding: "utf8", mode: 384 });
+    fs4.appendFileSync(state.file, line, { encoding: "utf8", mode: 384 });
     state.bytesSinceCheck += line.length;
   } catch {
   }
@@ -756,31 +839,31 @@ function write(state, line) {
 function rotateIfLarge(state) {
   let size;
   try {
-    size = fs3.statSync(state.file).size;
+    size = fs4.statSync(state.file).size;
   } catch {
     return;
   }
   if (size <= state.maxBytes) return;
   try {
-    fs3.renameSync(state.file, `${state.file}.1`);
+    fs4.renameSync(state.file, `${state.file}.1`);
   } catch (err) {
     const code = err.code;
     if (code === "ENOENT") return;
     try {
-      fs3.rmSync(`${state.file}.1`, { force: true });
-      fs3.renameSync(state.file, `${state.file}.1`);
+      fs4.rmSync(`${state.file}.1`, { force: true });
+      fs4.renameSync(state.file, `${state.file}.1`);
     } catch {
     }
   }
 }
 
 // src/adapters/token-file.ts
-import fs4 from "node:fs";
+import fs5 from "node:fs";
 import fsp2 from "node:fs/promises";
 
 // src/adapters/atomic.ts
 import fsp from "node:fs/promises";
-import path4 from "node:path";
+import path6 from "node:path";
 import { randomBytes } from "node:crypto";
 var RENAME_ATTEMPTS = 6;
 var defaultSleep = (ms2) => new Promise((resolve) => setTimeout(resolve, ms2));
@@ -805,9 +888,9 @@ async function renameWithRetry(from, to2, options = {}) {
   }
 }
 function siblingTempPath(finalPath, suffix = ".partial") {
-  const dir = path4.dirname(finalPath);
-  const base = path4.basename(finalPath);
-  return path4.join(dir, `${base}.${randomBytes(6).toString("hex")}${suffix}`);
+  const dir = path6.dirname(finalPath);
+  const base = path6.basename(finalPath);
+  return path6.join(dir, `${base}.${randomBytes(6).toString("hex")}${suffix}`);
 }
 async function fsyncFile(handle) {
   await handle.sync();
@@ -824,7 +907,7 @@ async function fsyncDir(dir) {
   }
 }
 async function writeFileAtomic(finalPath, data, options = {}) {
-  await fsp.mkdir(path4.dirname(finalPath), { recursive: true });
+  await fsp.mkdir(path6.dirname(finalPath), { recursive: true });
   const temp = siblingTempPath(finalPath);
   let handle;
   try {
@@ -834,7 +917,7 @@ async function writeFileAtomic(finalPath, data, options = {}) {
     await handle.close();
     handle = void 0;
     await renameWithRetry(temp, finalPath);
-    await fsyncDir(path4.dirname(finalPath));
+    await fsyncDir(path6.dirname(finalPath));
   } catch (err) {
     await handle?.close().catch(() => void 0);
     await fsp.rm(temp, { force: true }).catch(() => void 0);
@@ -849,6 +932,7 @@ var DISPOSABLE = [
   ".recover.tar.zst",
   ".retained.tar.zst"
 ];
+var RESTORE_GRACE_MS = 60 * 6e4;
 async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
@@ -859,10 +943,11 @@ async function removePartials(dir, now = Date.now()) {
   const removed = [];
   for (const entry of entries) {
     if (!DISPOSABLE.some((suffix) => entry.endsWith(suffix))) continue;
-    const full = path4.join(dir, entry);
+    const full = path6.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
-      if (now - stat.mtimeMs < PARTIAL_GRACE_MS) continue;
+      const grace = entry.endsWith(".partial") || entry.endsWith(".building.tar.zst") ? PARTIAL_GRACE_MS : RESTORE_GRACE_MS;
+      if (now - stat.mtimeMs < grace) continue;
     } catch {
       continue;
     }
@@ -909,10 +994,10 @@ function createFileTokenStore(file, logger = nullLogger) {
 function warnIfWorldReadable(file, logger) {
   if (process.platform === "win32") return;
   try {
-    const mode = fs4.statSync(file).mode & 511;
+    const mode = fs5.statSync(file).mode & 511;
     if ((mode & 63) !== 0) {
       logger.warn("tokens.permissions_too_open", { file, mode: mode.toString(8) });
-      fs4.chmodSync(file, 384);
+      fs5.chmodSync(file, 384);
     }
   } catch {
   }
@@ -1086,7 +1171,7 @@ function describeApiError(status, body) {
 
 // src/adapters/google-auth.ts
 import fsp3 from "node:fs/promises";
-import path5 from "node:path";
+import path7 from "node:path";
 
 // src/core/oauth.ts
 var DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
@@ -1202,12 +1287,12 @@ async function resolveOAuthClient(env, dataDir) {
   if (envId !== void 0 && envId.length > 0) {
     return { clientId: envId, clientSecret: envSecret ?? "" };
   }
-  const fromFile = await readClientFile(path5.join(dataDir, "oauth-client.json"));
+  const fromFile = await readClientFile(path7.join(dataDir, "oauth-client.json"));
   if (fromFile !== null) return fromFile;
   if (BUNDLED_CLIENT.clientId.length > 0) return BUNDLED_CLIENT;
   throw new FatalError(
     "no Google OAuth client is configured",
-    `Create a Desktop-app OAuth client in Google Cloud Console, then save it as ${path5.join(dataDir, "oauth-client.json")} with {"clientId":"...","clientSecret":"..."}, or set ARCHIVE_GOOGLE_CLIENT_ID and ARCHIVE_GOOGLE_CLIENT_SECRET.`
+    `Create a Desktop-app OAuth client in Google Cloud Console, then save it as ${path7.join(dataDir, "oauth-client.json")} with {"clientId":"...","clientSecret":"..."}, or set ARCHIVE_GOOGLE_CLIENT_ID and ARCHIVE_GOOGLE_CLIENT_SECRET.`
   );
 }
 var BUNDLED_CLIENT = {
@@ -1241,9 +1326,9 @@ function asString(value) {
 }
 
 // src/adapters/drive-http.ts
-import fs5 from "node:fs";
+import fs6 from "node:fs";
 import fsp4 from "node:fs/promises";
-import path6 from "node:path";
+import path8 from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 var API = "https://www.googleapis.com/drive/v3";
@@ -1475,13 +1560,13 @@ function createDriveTransport(deps) {
       const response = await authorized(url.toString(), signal === void 0 ? {} : { signal });
       if (!response.ok) await failIfNotOk(response, "downloading from Drive");
       if (response.body === null) throw new RetryableError("Drive returned an empty body");
-      await fsp4.mkdir(path6.dirname(args.destination), { recursive: true });
+      await fsp4.mkdir(path8.dirname(args.destination), { recursive: true });
       const temp = siblingTempPath(args.destination);
       const declared = asNumber(response.headers.get("content-length"));
       try {
         await pipeline(
           Readable.fromWeb(response.body),
-          fs5.createWriteStream(temp, { flags: "wx", mode: 384 })
+          fs6.createWriteStream(temp, { flags: "wx", mode: 384 })
         );
         const written = (await fsp4.stat(temp)).size;
         if (declared !== null && written !== declared) {
@@ -1781,53 +1866,6 @@ function reapCutoff(now, retentionDays) {
   return now - retentionDays * DAY_MS;
 }
 
-// src/core/paths.ts
-import path7 from "node:path";
-import { existsSync } from "node:fs";
-import os2 from "node:os";
-function resolveClaudeDir(env, homedir = os2.homedir) {
-  const configured = trimmed(env["CLAUDE_CONFIG_DIR"]);
-  if (configured !== void 0) return path7.resolve(configured);
-  return path7.join(homedir(), ".claude");
-}
-function resolveDataDir(env, claudeDir) {
-  const override = trimmed(env["ARCHIVE_DATA_DIR"]);
-  if (override !== void 0) return path7.resolve(override);
-  const provided = trimmed(env["CLAUDE_PLUGIN_DATA"]);
-  if (provided !== void 0) return path7.resolve(provided);
-  const root = path7.join(claudeDir, "plugins", "data");
-  const canonical = path7.join(root, PLUGIN_DATA_SLUG);
-  if (existsSync(canonical)) return canonical;
-  const legacy = path7.join(root, LEGACY_PLUGIN_SLUG);
-  if (existsSync(legacy)) return legacy;
-  return canonical;
-}
-var PLUGIN_DATA_SLUG = "archive-claude-code-archive";
-var LEGACY_PLUGIN_SLUG = "claude-code-archive-plugin";
-function resolvePaths(env, homedir = os2.homedir) {
-  const claudeDir = resolveClaudeDir(env, homedir);
-  const dataDir = resolveDataDir(env, claudeDir);
-  return {
-    claudeDir,
-    projectsDir: path7.join(claudeDir, "projects"),
-    settingsFile: path7.join(claudeDir, "settings.json"),
-    dataDir,
-    dbFile: path7.join(dataDir, "archive.sqlite"),
-    logFile: path7.join(dataDir, "archive.log"),
-    tokenFile: path7.join(dataDir, "tokens.json"),
-    statusFile: path7.join(dataDir, "status.json"),
-    lockDir: path7.join(dataDir, "worker.lock"),
-    runtimeCacheFile: path7.join(dataDir, "runtime.json"),
-    stagingDir: path7.join(dataDir, "staging"),
-    restoreDir: path7.join(dataDir, "restoring")
-  };
-}
-function trimmed(value) {
-  if (value === void 0) return void 0;
-  const out = value.trim();
-  return out.length > 0 ? out : void 0;
-}
-
 // src/version.ts
 var ARCHIVER_VERSION = "0.1.0";
 
@@ -1919,7 +1957,7 @@ async function createRuntime(options = {}) {
 async function readConfigFile(dataDir) {
   let raw;
   try {
-    raw = await fsp5.readFile(path8.join(dataDir, "config.json"), "utf8");
+    raw = await fsp5.readFile(path9.join(dataDir, "config.json"), "utf8");
   } catch (err) {
     if (err.code === "ENOENT") return { status: "absent" };
     return { status: "unusable", reason: `config.json could not be read: ${String(err)}` };
@@ -1937,9 +1975,9 @@ async function readConfigFile(dataDir) {
 }
 
 // src/adapters/node-locator.ts
-import fs6 from "node:fs";
+import fs7 from "node:fs";
 import os3 from "node:os";
-import path9 from "node:path";
+import path10 from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/core/node-discovery.ts
@@ -1993,7 +2031,7 @@ function findCompatibleNode(options = {}) {
   const minVersion = options.minVersion ?? MIN_NODE_VERSION;
   const now = (options.now ?? Date.now)();
   const cached2 = readCache(options.cacheFile);
-  if (cached2 !== null && fs6.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
+  if (cached2 !== null && fs7.existsSync(cached2.path) && satisfiesFloor(cached2.version, minVersion)) {
     return cached2;
   }
   if (recentMiss(options.cacheFile, now)) return null;
@@ -2016,39 +2054,39 @@ function collectCandidates(env, homedir) {
   const addVersioned = (root, ...tail) => {
     let entries;
     try {
-      entries = fs6.readdirSync(root);
+      entries = fs7.readdirSync(root);
     } catch {
       return;
     }
     for (const entry of entries) {
-      const full = path9.join(root, entry, ...tail, exe);
-      if (fs6.existsSync(full)) add(full);
+      const full = path10.join(root, entry, ...tail, exe);
+      if (fs7.existsSync(full)) add(full);
     }
   };
   if (process.platform === "win32") {
     const appData = env["APPDATA"];
     const localAppData = env["LOCALAPPDATA"];
     const programFiles = env["ProgramFiles"];
-    if (appData !== void 0) addVersioned(path9.join(appData, "nvm"));
+    if (appData !== void 0) addVersioned(path10.join(appData, "nvm"));
     if (localAppData !== void 0) {
-      addVersioned(path9.join(localAppData, "fnm", "node-versions"), "installation");
-      addVersioned(path9.join(localAppData, "Volta", "tools", "image", "node"));
-      addIfPresent(path9.join(localAppData, "Programs", "nodejs", exe), add);
+      addVersioned(path10.join(localAppData, "fnm", "node-versions"), "installation");
+      addVersioned(path10.join(localAppData, "Volta", "tools", "image", "node"));
+      addIfPresent(path10.join(localAppData, "Programs", "nodejs", exe), add);
     }
-    if (programFiles !== void 0) addIfPresent(path9.join(programFiles, "nodejs", exe), add);
+    if (programFiles !== void 0) addIfPresent(path10.join(programFiles, "nodejs", exe), add);
   } else {
-    const nvm = env["NVM_DIR"] ?? path9.join(homedir, ".nvm");
-    addVersioned(path9.join(nvm, "versions", "node"), "bin");
+    const nvm = env["NVM_DIR"] ?? path10.join(homedir, ".nvm");
+    addVersioned(path10.join(nvm, "versions", "node"), "bin");
     for (const fnm of [
       env["FNM_DIR"],
-      path9.join(homedir, ".fnm"),
-      path9.join(homedir, ".local", "share", "fnm")
+      path10.join(homedir, ".fnm"),
+      path10.join(homedir, ".local", "share", "fnm")
     ]) {
-      if (fnm !== void 0) addVersioned(path9.join(fnm, "node-versions"), "installation", "bin");
+      if (fnm !== void 0) addVersioned(path10.join(fnm, "node-versions"), "installation", "bin");
     }
-    addVersioned(path9.join(homedir, ".volta", "tools", "image", "node"), "bin");
-    addVersioned(path9.join(homedir, ".local", "share", "mise", "installs", "node"), "bin");
-    addVersioned(path9.join(homedir, ".asdf", "installs", "nodejs"), "bin");
+    addVersioned(path10.join(homedir, ".volta", "tools", "image", "node"), "bin");
+    addVersioned(path10.join(homedir, ".local", "share", "mise", "installs", "node"), "bin");
+    addVersioned(path10.join(homedir, ".asdf", "installs", "nodejs"), "bin");
     for (const fixed of ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]) {
       addIfPresent(fixed, add);
     }
@@ -2056,7 +2094,7 @@ function collectCandidates(env, homedir) {
   return candidates;
 }
 function addIfPresent(candidatePath, add) {
-  if (fs6.existsSync(candidatePath)) add(candidatePath);
+  if (fs7.existsSync(candidatePath)) add(candidatePath);
 }
 function reexec(nodePath, env = process.env) {
   const result = spawnSync(nodePath, [...process.execArgv, ...process.argv.slice(1)], {
@@ -2073,7 +2111,7 @@ function alreadyReexeced(env) {
 function readCache(file) {
   if (file === void 0) return null;
   try {
-    const parsed = JSON.parse(fs6.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs7.readFileSync(file, "utf8"));
     if (typeof parsed !== "object" || parsed === null) return null;
     const { path: cachedPath, version } = parsed;
     if (typeof cachedPath !== "string" || typeof version !== "string") return null;
@@ -2086,7 +2124,7 @@ var MISS_TTL_MS = 10 * 6e4;
 function recentMiss(file, now) {
   if (file === void 0) return false;
   try {
-    const parsed = JSON.parse(fs6.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs7.readFileSync(file, "utf8"));
     const missedAt = parsed?.missedAt;
     return typeof missedAt === "number" && now - missedAt < MISS_TTL_MS;
   } catch {
@@ -2096,8 +2134,8 @@ function recentMiss(file, now) {
 function writeMiss(file, now) {
   if (file === void 0) return;
   try {
-    fs6.mkdirSync(path9.dirname(file), { recursive: true });
-    fs6.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
+    fs7.mkdirSync(path10.dirname(file), { recursive: true });
+    fs7.writeFileSync(file, `${JSON.stringify({ missedAt: now })}
 `, { mode: 384 });
   } catch {
   }
@@ -2105,8 +2143,8 @@ function writeMiss(file, now) {
 function writeCache(file, found) {
   if (file === void 0) return;
   try {
-    fs6.mkdirSync(path9.dirname(file), { recursive: true });
-    fs6.writeFileSync(file, `${JSON.stringify(found)}
+    fs7.mkdirSync(path10.dirname(file), { recursive: true });
+    fs7.writeFileSync(file, `${JSON.stringify(found)}
 `, { mode: 384 });
   } catch {
   }
@@ -2116,14 +2154,14 @@ function writeCache(file, found) {
 import fsp12 from "node:fs/promises";
 import os5 from "node:os";
 import { createHash as createHash3, randomBytes as randomBytes3 } from "node:crypto";
-import path15 from "node:path";
+import path16 from "node:path";
 
 // src/adapters/session-scan.ts
 import fsp6 from "node:fs/promises";
-import path11 from "node:path";
+import path12 from "node:path";
 
 // src/core/identifiers.ts
-import path10 from "node:path";
+import path11 from "node:path";
 var SAFE_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,253}$/;
 function isSafePathSegment(value) {
   if (!SAFE_SEGMENT.test(value)) return false;
@@ -2134,21 +2172,21 @@ function isSafePathSegment(value) {
 var isSafeSessionId = isSafePathSegment;
 var isSafeEncodedDir = isSafePathSegment;
 function assertInside(root, target, what) {
-  const resolvedRoot = path10.resolve(root);
-  const resolvedTarget = path10.resolve(target);
+  const resolvedRoot = path11.resolve(root);
+  const resolvedTarget = path11.resolve(target);
   if (resolvedTarget === resolvedRoot) {
     throw new BugError(`${what} resolved to the root itself: ${resolvedTarget}`);
   }
-  if (!resolvedTarget.startsWith(resolvedRoot + path10.sep)) {
+  if (!resolvedTarget.startsWith(resolvedRoot + path11.sep)) {
     throw new BugError(`${what} escaped ${resolvedRoot}: ${resolvedTarget}`);
   }
 }
 
 // src/adapters/session-scan.ts
 async function statSession(paths, encodedDir, sessionId) {
-  const dir = path11.join(paths.projectsDir, encodedDir);
-  const transcriptPath = path11.join(dir, `${sessionId}.jsonl`);
-  const sidecarDir = path11.join(dir, sessionId);
+  const dir = path12.join(paths.projectsDir, encodedDir);
+  const transcriptPath = path12.join(dir, `${sessionId}.jsonl`);
+  const sidecarDir = path12.join(dir, sessionId);
   let transcript;
   try {
     transcript = await fsp6.lstat(transcriptPath);
@@ -2187,7 +2225,7 @@ async function* scanSessions(paths, skipped) {
     }
     let entries;
     try {
-      entries = await fsp6.readdir(path11.join(paths.projectsDir, encodedDir));
+      entries = await fsp6.readdir(path12.join(paths.projectsDir, encodedDir));
     } catch (err) {
       if (err.code !== "ENOENT") {
         skipped?.push({ kind: "project", name: encodedDir, reason: "unreadable" });
@@ -2230,7 +2268,7 @@ async function measureDirectory(dir) {
   }
   let bytes = 0;
   let mtimeMs = 0;
-  const stack = entries.map((entry) => path11.join(dir, entry));
+  const stack = entries.map((entry) => path12.join(dir, entry));
   while (stack.length > 0) {
     const current = stack.pop();
     if (current === void 0) break;
@@ -2244,7 +2282,7 @@ async function measureDirectory(dir) {
     mtimeMs = Math.max(mtimeMs, stat.mtimeMs);
     if (stat.isDirectory()) {
       try {
-        for (const child of await fsp6.readdir(current)) stack.push(path11.join(current, child));
+        for (const child of await fsp6.readdir(current)) stack.push(path12.join(current, child));
       } catch (err) {
         if (err.code !== "ENOENT")
           return { bytes, mtimeMs, unreadable: true };
@@ -2749,12 +2787,12 @@ function toJob(row) {
 
 // src/worker/backup.ts
 import fsp10 from "node:fs/promises";
-import path13 from "node:path";
+import path14 from "node:path";
 
 // src/adapters/bundle.ts
 import fsp8 from "node:fs/promises";
-import fs8 from "node:fs";
-import path12 from "node:path";
+import fs9 from "node:fs";
+import path13 from "node:path";
 import zlib from "node:zlib";
 import { pipeline as pipeline3 } from "node:stream/promises";
 import { createHash as createHash2 } from "node:crypto";
@@ -4696,7 +4734,7 @@ var hr = /* @__PURE__ */ Symbol("entry");
 var cs = /* @__PURE__ */ Symbol("entryOpt");
 var ui = /* @__PURE__ */ Symbol("writeEntryClass");
 var lr = /* @__PURE__ */ Symbol("write");
-var fs7 = /* @__PURE__ */ Symbol("ondrain");
+var fs8 = /* @__PURE__ */ Symbol("ondrain");
 var wt = class extends A {
   sync = false;
   opt;
@@ -4730,8 +4768,8 @@ var wt = class extends A {
       if ((t.gzip ? 1 : 0) + (t.brotli ? 1 : 0) + (t.zstd ? 1 : 0) > 1) throw new TypeError("gzip, brotli, zstd are mutually exclusive");
       if (t.gzip && (typeof t.gzip != "object" && (t.gzip = {}), this.portable && (t.gzip.portable = true), this.zip = new ze(t.gzip)), t.brotli && (typeof t.brotli != "object" && (t.brotli = {}), this.zip = new We(t.brotli)), t.zstd && (typeof t.zstd != "object" && (t.zstd = {}), this.zip = new Ye(t.zstd)), !this.zip) throw new Error("impossible");
       let e = this.zip;
-      e.on("data", (i) => super.write(i)), e.on("end", () => super.end()), e.on("drain", () => this[fs7]()), this.on("resume", () => e.resume());
-    } else this.on("drain", this[fs7]);
+      e.on("data", (i) => super.write(i)), e.on("end", () => super.end()), e.on("drain", () => this[fs8]()), this.on("resume", () => e.resume());
+    } else this.on("drain", this[fs8]);
     this.noDirRecurse = !!t.noDirRecurse, this.follow = !!t.follow, this.noMtime = !!t.noMtime, t.mtime && (this.mtime = t.mtime), this.filter = typeof t.filter == "function" ? t.filter : () => true, this[W] = new hi(), this[G] = 0, this.jobs = Number(t.jobs) || 4, this[Ee] = false, this[me] = false;
   }
   [lr](t) {
@@ -4844,7 +4882,7 @@ var wt = class extends A {
       this.emit("error", e);
     }
   }
-  [fs7]() {
+  [fs8]() {
     this[Et] && this[Et].entry && this[Et].entry.resume();
   }
   [di](t) {
@@ -5792,7 +5830,7 @@ var DEFAULT_ZSTD_LEVEL = 19;
 var TAR_READ_OPTIONS = { maxDecompressionRatio: Infinity };
 async function createBundle(input) {
   const level = input.compressionLevel ?? DEFAULT_ZSTD_LEVEL;
-  await fsp8.mkdir(path12.dirname(input.outputPath), { recursive: true });
+  await fsp8.mkdir(path13.dirname(input.outputPath), { recursive: true });
   const temp = siblingTempPath(input.outputPath);
   const tee = createHashTee();
   try {
@@ -5816,7 +5854,7 @@ async function createBundle(input) {
     const compress = zlib.createZstdCompress({
       params: { [zlib.constants.ZSTD_c_compressionLevel]: level }
     });
-    const sink = fs8.createWriteStream(temp, { flags: "wx", mode: 384 });
+    const sink = fs9.createWriteStream(temp, { flags: "wx", mode: 384 });
     const options = input.signal === void 0 ? {} : { signal: input.signal };
     await pipeline3(pack, compress, tee.stream, sink, options);
     await fsyncPath(temp);
@@ -5850,7 +5888,7 @@ async function describeSessionFiles(args) {
   return described;
 }
 async function describeInto(out, cwd, relative, signal, optional = false) {
-  const absolute = path12.join(cwd, relative);
+  const absolute = path13.join(cwd, relative);
   let stat;
   try {
     stat = await fsp8.lstat(absolute);
@@ -5869,7 +5907,7 @@ async function describeInto(out, cwd, relative, signal, optional = false) {
   if (!stat.isDirectory()) return;
   const children = await fsp8.readdir(absolute);
   for (const child of children) {
-    await describeInto(out, cwd, path12.join(relative, child), signal);
+    await describeInto(out, cwd, path13.join(relative, child), signal);
   }
 }
 var NoLinkCache = class extends Map {
@@ -5878,7 +5916,7 @@ var NoLinkCache = class extends Map {
   }
 };
 function toPosix(relative) {
-  return relative.split(path12.sep).join("/");
+  return relative.split(path13.sep).join("/");
 }
 async function verifyBundleContents(bundlePath, expected) {
   const wanted = new Map(expected.map((file) => [file.path, file]));
@@ -6478,9 +6516,9 @@ async function buildBundle(ctx, session, index, now) {
   const stamp = (index.endedAt ?? index.startedAt ?? Math.trunc(session.mtimeMs)) || now;
   const title = index.title;
   const date = isoDate(stamp);
-  const outputPath = path13.join(ctx.paths.stagingDir, `${session.sessionId}.building.tar.zst`);
+  const outputPath = path14.join(ctx.paths.stagingDir, `${session.sessionId}.building.tar.zst`);
   const result = await createBundle({
-    cwd: path13.dirname(session.transcriptPath),
+    cwd: path14.dirname(session.transcriptPath),
     entries: bundleEntries(session),
     outputPath,
     compressionLevel: ctx.config.zstdLevel,
@@ -6518,7 +6556,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
   const parentId = await ctx.drive.ensureFolder(folderPath, ctx.signal);
   const before = await statSession(ctx.paths, session.encodedDir, session.sessionId);
   const files = await describeSessionFiles({
-    cwd: path13.dirname(session.transcriptPath),
+    cwd: path14.dirname(session.transcriptPath),
     entries: bundleEntries(session),
     ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
   });
@@ -6738,7 +6776,7 @@ function compareChecksums(remote, bundle) {
 
 // src/worker/reap.ts
 import fsp11 from "node:fs/promises";
-import path14 from "node:path";
+import path15 from "node:path";
 var SKIP_COOLDOWN_MS = 24 * 60 * 6e4;
 async function reapLocalCopies(ctx, now, limit) {
   let projectDirsCache = null;
@@ -6784,7 +6822,7 @@ async function reapLocalCopies(ctx, now, limit) {
       continue;
     }
     if (onDisk === null) {
-      const sidecar = path14.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
+      const sidecar = path15.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
       if (await isDirectory(sidecar)) {
         log.warn("reap.orphan_sidecar", { encoded_dir: record.encodedDir });
         markReapSkipped(ctx.db, record.sessionId, "orphan-sidecar", now + SKIP_COOLDOWN_MS, now);
@@ -6885,7 +6923,7 @@ async function describeDivergence(ctx, record, onDisk) {
   let current;
   try {
     current = await describeSessionFiles({
-      cwd: path14.dirname(onDisk.transcriptPath),
+      cwd: path15.dirname(onDisk.transcriptPath),
       entries: bundleEntries(onDisk),
       ...ctx.signal === void 0 ? {} : { signal: ctx.signal }
     });
@@ -6911,10 +6949,10 @@ function isSessionActive(ctx, sessionId, now) {
 }
 function safeTarget(ctx, record) {
   if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) return null;
-  const projectDir = path14.join(ctx.paths.projectsDir, record.encodedDir);
+  const projectDir = path15.join(ctx.paths.projectsDir, record.encodedDir);
   const target = {
-    transcriptPath: path14.join(projectDir, `${record.sessionId}.jsonl`),
-    sidecarDir: path14.join(projectDir, record.sessionId)
+    transcriptPath: path15.join(projectDir, `${record.sessionId}.jsonl`),
+    sidecarDir: path15.join(projectDir, record.sessionId)
   };
   try {
     assertInside(ctx.paths.projectsDir, projectDir, "project directory");
@@ -6973,7 +7011,7 @@ async function findSessionElsewhere(ctx, record, dirs) {
     if (dir === record.encodedDir || !isSafeEncodedDir(dir)) continue;
     try {
       const stat = await fsp11.lstat(
-        path14.join(ctx.paths.projectsDir, dir, `${record.sessionId}.jsonl`)
+        path15.join(ctx.paths.projectsDir, dir, `${record.sessionId}.jsonl`)
       );
       if (stat.isFile()) return dir;
     } catch {
@@ -7376,7 +7414,10 @@ function machineId(ctx) {
   return minted;
 }
 async function uploadCatalogCopy(ctx) {
-  const destination = path15.join(ctx.paths.stagingDir, "catalog.sqlite");
+  const destination = path16.join(
+    ctx.paths.stagingDir,
+    `catalog-${String(process.pid)}-${String(ctx.clock.now())}.sqlite.partial`
+  );
   try {
     await fsp12.mkdir(ctx.paths.stagingDir, { recursive: true });
     await fsp12.rm(destination, { force: true });
@@ -7550,6 +7591,7 @@ function unavailableDrive(reason) {
 }
 try {
   await main();
-} catch {
+} catch (err) {
+  logLastResort("worker.failed_to_start", err);
 }
 process.exit(0);

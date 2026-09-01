@@ -520,7 +520,12 @@ export function machineId(ctx: WorkerContext): string {
 }
 
 export async function uploadCatalogCopy(ctx: WorkerContext): Promise<boolean> {
-  const destination = path.join(ctx.paths.stagingDir, 'catalog.sqlite');
+  // Per run: two sweeps racing (possible only if the lock was broken as
+  // stale) shared one file, so one could read it while the other wrote.
+  const destination = path.join(
+    ctx.paths.stagingDir,
+    `catalog-${String(process.pid)}-${String(ctx.clock.now())}.sqlite.partial`,
+  );
   try {
     await fsp.mkdir(ctx.paths.stagingDir, { recursive: true });
     await fsp.rm(destination, { force: true });

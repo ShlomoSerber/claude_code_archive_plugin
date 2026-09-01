@@ -29,6 +29,7 @@ export function clearLastResort(event: string): void {
  * completely clean status page.
  */
 function markerName(event: string): string {
+  if (event.startsWith('worker.')) return 'worker-error.json';
   return event.startsWith('hook.session_start') ? 'hook-error-start.json' : 'hook-error-end.json';
 }
 

@@ -100,6 +100,7 @@ export async function runStatus(
     await Promise.all([
       readHookError(runtime.paths.dataDir, 'hook-error-end.json'),
       readHookError(runtime.paths.dataDir, 'hook-error-start.json'),
+      readHookError(runtime.paths.dataDir, 'worker-error.json'),
     ])
   )
     .filter((entry): entry is string => entry !== null)

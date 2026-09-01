@@ -57,12 +57,17 @@ function restrictToOwner(file: string): void {
 
 function applyPragmas(db: Db, options: OpenOptions): void {
   const busyTimeout = options.busyTimeoutMs ?? 5_000;
+  // First, before anything that can contend. Setting journal_mode takes a
+  // write lock, and on a database that is not yet in WAL — a fresh install, or
+  // one recovering the WAL a killed worker left — that ran under the default
+  // timeout of zero and threw SQLITE_BUSY instantly, so the hook enqueued
+  // nothing and the worker exited without sweeping.
+  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   // WAL lets the worker write while a hook reads. It is a persistent property
   // of the file, but setting it per connection costs nothing and documents it.
   if (options.readOnly !== true) {
     db.exec('PRAGMA journal_mode = WAL');
   }
-  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   db.exec('PRAGMA synchronous = NORMAL');
   db.exec('PRAGMA foreign_keys = ON');
 }

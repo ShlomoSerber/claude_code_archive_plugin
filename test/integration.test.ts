@@ -674,10 +674,11 @@ describe('deletion safety, second pass', () => {
       harness.clock.now(),
     );
 
-    // Past the mark's lifetime, which is deliberately longer than the retention
-    // window: written once at SessionStart and never refreshed, a shorter TTL
-    // could never protect anything.
-    harness.clock.advance(60 * DAY);
+    // Past the mark's lifetime, which is deliberately long: it is written once
+    // at SessionStart and cleared at SessionEnd, so it only outlives its
+    // session when Claude Code crashed — and a terminal left open for weeks
+    // with no messages in it is ordinary, not stale.
+    harness.clock.advance(200 * DAY);
     const report = await reapLocalCopies(harness.ctx, harness.clock.now());
     assert.equal(report.deleted, 2);
   });
@@ -3021,5 +3022,47 @@ describe('the warning about a damaged archive', () => {
         `the warning survives sweep ${String(sweep)}`,
       );
     }
+  });
+});
+
+/**
+ * Thirtieth round. Objective 1 held under three concurrent lock-free workers
+ * with SIGKILLs mid-sweep, 120 fuzz seeds, and injected failure at every Drive
+ * call — with a negative control proving the harness sees a real loss. The
+ * finding that mattered was about the day the plugin is installed.
+ */
+describe('a plugin that is installed but not set up', () => {
+  function runHook(home: string): { status: number | null; stdout: string } {
+    const result = spawnSync(
+      process.execPath,
+      ['--experimental-strip-types', '--no-warnings', path.resolve('src/hooks/session-start.ts')],
+      {
+        input: JSON.stringify({ session_id: SESSION_A, source: 'startup' }),
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+          ARCHIVE_DATA_DIR: path.join(home, 'data'),
+        },
+        encoding: 'utf8',
+      },
+    );
+    return { status: result.status, stdout: result.stdout };
+  }
+
+  it('says so in the session, where the user will see it', () => {
+    // Until /archive:setup runs, Claude Code is still deleting transcripts on
+    // its own schedule while the hooks run and the plugin looks installed.
+    // /archive:status would say so, but nobody runs a status command for a
+    // problem they do not know they have.
+    const home = tempDir();
+    fs.mkdirSync(path.join(home, '.claude', 'projects'), { recursive: true });
+
+    const first = runHook(home);
+    assert.equal(first.status, 0, 'and it still never disturbs the session');
+    assert.match(first.stdout, /systemMessage/);
+    assert.match(first.stdout, /archive:setup/);
+
+    // At most once a day: a warning on every session start is noise.
+    assert.equal(runHook(home).stdout.includes('systemMessage'), false);
   });
 });

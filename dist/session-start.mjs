@@ -413,10 +413,10 @@ function restrictToOwner(file) {
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
+  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   if (options.readOnly !== true) {
     db.exec("PRAGMA journal_mode = WAL");
   }
-  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
 }
@@ -625,6 +625,7 @@ async function writeFileAtomic(finalPath, data, options = {}) {
   }
 }
 var PARTIAL_GRACE_MS = 5 * 6e4;
+var RESTORE_GRACE_MS = 60 * 6e4;
 
 // src/ports/logger.ts
 var nullLogger = {
@@ -1415,6 +1416,7 @@ var DEFAULT_CONFIG = {
   enabled: true,
   keepLocalForever: false
 };
+var DAY_MS = 864e5;
 var KNOWN_CONFIG_KEYS = [
   "retentionDays",
   "driveRootFolder",
@@ -1430,6 +1432,7 @@ var KNOWN_CONFIG_KEYS = [
 function unknownConfigKeys(source) {
   return Object.keys(source).filter((key) => !KNOWN_CONFIG_KEYS.includes(key));
 }
+var CLEANUP_PERIOD_DAYS = 365e3;
 function resolveConfig(file, env) {
   const config = { ...DEFAULT_CONFIG };
   const fromEnv = envSource(env);
@@ -1735,6 +1738,8 @@ var KV = {
   orphanSidecars: "reap.orphan_sidecars",
   /** Reaped sessions whose Drive copy failed a re-check. */
   auditMismatched: "audit.mismatched",
+  /** Last time a session was told the plugin is installed but not set up. */
+  setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -1747,7 +1752,36 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1e3;
+
+// src/adapters/claude-settings.ts
+import fsp6 from "node:fs/promises";
+async function readCleanupPeriodDays(file) {
+  const read = await readSettings(file);
+  if (read.status !== "ok") return null;
+  const value = read.settings["cleanupPeriodDays"];
+  return typeof value === "number" ? value : null;
+}
+async function readSettings(file) {
+  let raw;
+  try {
+    raw = await fsp6.readFile(file, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { status: "absent" };
+    throw err;
+  }
+  const text = raw.replace(/^﻿/, "").trim();
+  if (text.length === 0) return { status: "absent" };
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { status: "unparseable" };
+    }
+    return { status: "ok", settings: parsed };
+  } catch {
+    return { status: "unparseable" };
+  }
+}
 
 // src/adapters/spawn-worker.ts
 import { spawn } from "node:child_process";
@@ -1858,6 +1892,7 @@ function clearLastResort(event) {
   }
 }
 function markerName(event) {
+  if (event.startsWith("worker.")) return "worker-error.json";
   return event.startsWith("hook.session_start") ? "hook-error-start.json" : "hook-error-end.json";
 }
 function logLastResort(event, err) {
@@ -2084,6 +2119,7 @@ async function main() {
     if (sessionId !== void 0 && isSafeSessionId(sessionId)) {
       kvSetNumber(runtime.db(), activeSessionKey(sessionId), now, now);
     }
+    await warnIfUnconfigured(runtime, now);
     const lastSweep = kvGetNumber(runtime.db(), KV.lastSweepAt) ?? 0;
     if (now - lastSweep < runtime.config.sweepMinIntervalMs) {
       runtime.logger.debug("hook.session_start.too_soon", { last_sweep_at: lastSweep });
@@ -2100,6 +2136,18 @@ async function main() {
   } finally {
     runtime.close();
   }
+}
+async function warnIfUnconfigured(runtime, now) {
+  const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
+  if (now - lastWarned < DAY_MS) return;
+  const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => true);
+  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => null);
+  const owned = cleanup === CLEANUP_PERIOD_DAYS;
+  if (signedIn && owned) return;
+  kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);
+  emitSystemMessage(
+    !signedIn ? "Claude Code Archive is installed but not signed in, so nothing is being backed up. Run /archive:setup." : `Claude Code Archive is installed but Claude Code is still deleting transcripts on its own schedule (cleanupPeriodDays: ${String(cleanup ?? "unset")}). Run /archive:setup.`
+  );
 }
 function workerPath() {
   return path10.join(path10.dirname(fileURLToPath(import.meta.url)), "worker.mjs");

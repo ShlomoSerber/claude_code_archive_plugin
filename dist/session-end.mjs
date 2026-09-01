@@ -413,10 +413,10 @@ function restrictToOwner(file) {
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
+  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   if (options.readOnly !== true) {
     db.exec("PRAGMA journal_mode = WAL");
   }
-  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
 }
@@ -618,6 +618,7 @@ async function writeFileAtomic(finalPath, data, options = {}) {
   }
 }
 var PARTIAL_GRACE_MS = 5 * 6e4;
+var RESTORE_GRACE_MS = 60 * 6e4;
 
 // src/ports/logger.ts
 var nullLogger = {
@@ -1788,6 +1789,8 @@ var KV = {
   orphanSidecars: "reap.orphan_sidecars",
   /** Reaped sessions whose Drive copy failed a re-check. */
   auditMismatched: "audit.mismatched",
+  /** Last time a session was told the plugin is installed but not set up. */
+  setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -1800,7 +1803,7 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1e3;
 
 // src/adapters/spawn-worker.ts
 import { spawn } from "node:child_process";
@@ -1911,6 +1914,7 @@ function clearLastResort(event) {
   }
 }
 function markerName(event) {
+  if (event.startsWith("worker.")) return "worker-error.json";
   return event.startsWith("hook.session_start") ? "hook-error-start.json" : "hook-error-end.json";
 }
 function logLastResort(event, err) {

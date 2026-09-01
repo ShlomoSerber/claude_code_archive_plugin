@@ -6,6 +6,9 @@ import { createRuntime } from '../composition.ts';
 import { kvGetNumber, kvSetNumber } from '../adapters/db.ts';
 import { isSafeSessionId } from '../core/identifiers.ts';
 import { KV, activeSessionKey } from '../core/state-keys.ts';
+import { readCleanupPeriodDays } from '../adapters/claude-settings.ts';
+import { CLEANUP_PERIOD_DAYS, DAY_MS } from '../core/config.ts';
+import type { Runtime } from '../composition.ts';
 import { spawnWorker } from '../adapters/spawn-worker.ts';
 import { emitSystemMessage, readHookInput } from './hook-input.ts';
 import { clearLastResort, logLastResort } from './last-resort.ts';
@@ -56,6 +59,8 @@ async function main(): Promise<void> {
       kvSetNumber(runtime.db(), activeSessionKey(sessionId), now, now);
     }
 
+    await warnIfUnconfigured(runtime, now);
+
     const lastSweep = kvGetNumber(runtime.db(), KV.lastSweepAt) ?? 0;
     if (now - lastSweep < runtime.config.sweepMinIntervalMs) {
       runtime.logger.debug('hook.session_start.too_soon', { last_sweep_at: lastSweep });
@@ -73,6 +78,39 @@ async function main(): Promise<void> {
   } finally {
     runtime.close();
   }
+}
+
+/**
+ * Tell the user, in the session, when the plugin is installed but not set up.
+ *
+ * Until /archive:setup runs, cleanupPeriodDays is whatever Claude Code's
+ * default is and every upload blocks on "not signed in" — so the hooks are
+ * running, the plugin looks installed, and Claude Code is still deleting
+ * transcripts on its own schedule. /archive:status would say so, but nobody
+ * runs a status command for a problem they do not know they have. Once a day
+ * at most, and never in a way that can delay the session.
+ */
+async function warnIfUnconfigured(runtime: Runtime, now: number): Promise<void> {
+  const lastWarned = kvGetNumber(runtime.db(), KV.setupWarnedAt) ?? 0;
+  if (now - lastWarned < DAY_MS) return;
+
+  const signedIn = await runtime.tokenStore
+    .read()
+    .then((tokens) => tokens !== null)
+    .catch(() => true);
+  const cleanup = await readCleanupPeriodDays(runtime.paths.settingsFile).catch(() => null);
+  const owned = cleanup === CLEANUP_PERIOD_DAYS;
+  if (signedIn && owned) return;
+
+  kvSetNumber(runtime.db(), KV.setupWarnedAt, now, now);
+  emitSystemMessage(
+    !signedIn
+      ? 'Claude Code Archive is installed but not signed in, so nothing is being ' +
+          'backed up. Run /archive:setup.'
+      : 'Claude Code Archive is installed but Claude Code is still deleting ' +
+          `transcripts on its own schedule (cleanupPeriodDays: ${String(cleanup ?? 'unset')}). ` +
+          'Run /archive:setup.',
+  );
 }
 
 function workerPath(): string {

@@ -412,10 +412,10 @@ function restrictToOwner(file) {
 }
 function applyPragmas(db, options) {
   const busyTimeout = options.busyTimeoutMs ?? 5e3;
+  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   if (options.readOnly !== true) {
     db.exec("PRAGMA journal_mode = WAL");
   }
-  db.exec(`PRAGMA busy_timeout = ${String(Math.trunc(busyTimeout))}`);
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
 }
@@ -645,6 +645,7 @@ var DISPOSABLE = [
   ".recover.tar.zst",
   ".retained.tar.zst"
 ];
+var RESTORE_GRACE_MS = 60 * 6e4;
 async function removePartials(dir, now = Date.now()) {
   let entries;
   try {
@@ -658,7 +659,8 @@ async function removePartials(dir, now = Date.now()) {
     const full = path3.join(dir, entry);
     try {
       const stat = await fsp.stat(full);
-      if (now - stat.mtimeMs < PARTIAL_GRACE_MS) continue;
+      const grace = entry.endsWith(".partial") || entry.endsWith(".building.tar.zst") ? PARTIAL_GRACE_MS : RESTORE_GRACE_MS;
+      if (now - stat.mtimeMs < grace) continue;
     } catch {
       continue;
     }
@@ -2543,6 +2545,7 @@ function countDamagedArchives(db) {
     `SELECT count(*) AS n FROM sessions
         WHERE local_present = 0
           AND verified_at IS NULL
+          AND audited_at IS NOT NULL
           AND remote_file_id IS NOT NULL
           AND verified_bundle_sha256 IS NOT NULL`
   ).get();
@@ -2911,6 +2914,8 @@ var KV = {
   orphanSidecars: "reap.orphan_sidecars",
   /** Reaped sessions whose Drive copy failed a re-check. */
   auditMismatched: "audit.mismatched",
+  /** Last time a session was told the plugin is installed but not set up. */
+  setupWarnedAt: "setup.warned_at",
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
@@ -2923,7 +2928,7 @@ var KV = {
 function activeSessionKey(sessionId) {
   return `active.${sessionId}`;
 }
-var ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+var ACTIVE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1e3;
 
 // src/worker/backup.ts
 import fsp10 from "node:fs/promises";
@@ -7924,7 +7929,10 @@ function machineId(ctx) {
   return minted;
 }
 async function uploadCatalogCopy(ctx) {
-  const destination = path15.join(ctx.paths.stagingDir, "catalog.sqlite");
+  const destination = path15.join(
+    ctx.paths.stagingDir,
+    `catalog-${String(process.pid)}-${String(ctx.clock.now())}.sqlite.partial`
+  );
   try {
     await fsp13.mkdir(ctx.paths.stagingDir, { recursive: true });
     await fsp13.rm(destination, { force: true });
@@ -9025,7 +9033,8 @@ async function runStatus(runtime, options) {
   const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 6e4;
   const hookError = (await Promise.all([
     readHookError(runtime.paths.dataDir, "hook-error-end.json"),
-    readHookError(runtime.paths.dataDir, "hook-error-start.json")
+    readHookError(runtime.paths.dataDir, "hook-error-start.json"),
+    readHookError(runtime.paths.dataDir, "worker-error.json")
   ])).filter((entry) => entry !== null).join("; ");
   const sweepNeverRan = stats.pendingBackup > 0 && lastSweepAt === null;
   const sweepStale = lastSweepAt !== null && stats.pendingBackup > 0 && now - lastSweepAt > 3 * DAY_MS;

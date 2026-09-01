@@ -31,6 +31,8 @@ export const KV = {
   orphanSidecars: 'reap.orphan_sidecars',
   /** Reaped sessions whose Drive copy failed a re-check. */
   auditMismatched: 'audit.mismatched',
+  /** Last time a session was told the plugin is installed but not set up. */
+  setupWarnedAt: 'setup.warned_at',
   /** When the reap last actually ran, so stale counters can say so. */
   reapRanAt: 'reap.ran_at',
   /** Why the last reap stopped asking Drive, if it did. */
@@ -52,9 +54,16 @@ export function activeSessionKey(sessionId: string): string {
 /**
  * How long an open-session mark is honoured without being refreshed.
  *
+ * Long, because the mark is written once at SessionStart and cleared at
+ * SessionEnd: it only outlives its session when Claude Code crashed. A
+ * terminal left open for weeks with no messages in it is an ordinary thing,
+ * and unlinking that transcript under its live writer loses everything the
+ * session writes afterwards. A mark left by a crash costs disk until it
+ * expires, which is the failure direction this plugin chooses everywhere.
+ *
  * Deliberately generous. The mark is only written at SessionStart, so a session
  * left open for days still holds one; and the two failure directions are not
  * symmetric. A mark that lingers too long delays a deletion, which costs disk.
  * A mark that expires too early unlinks a file under a live writer.
  */
-export const ACTIVE_SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+export const ACTIVE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1000;

@@ -152,6 +152,15 @@ const DISPOSABLE = [
   '.retained.tar.zst',
 ];
 
+/**
+ * A restore's download is only disposable long after its last write.
+ *
+ * /archive:resume does not take the worker lock, so a sweep can run beside it;
+ * five minutes is not enough for hashing and unpacking a large bundle, and
+ * deleting one mid-restore turns a working restore into a retry.
+ */
+const RESTORE_GRACE_MS = 60 * 60_000;
+
 export async function removePartials(dir: string, now = Date.now()): Promise<string[]> {
   let entries: string[];
   try {
@@ -171,7 +180,10 @@ export async function removePartials(dir: string, now = Date.now()): Promise<str
       // A restore downloads through a temp file with the same suffix, and a
       // sweep running beside it would otherwise delete the file mid-download.
       const stat = await fsp.stat(full);
-      if (now - stat.mtimeMs < PARTIAL_GRACE_MS) continue;
+      const grace = entry.endsWith('.partial') || entry.endsWith('.building.tar.zst')
+        ? PARTIAL_GRACE_MS
+        : RESTORE_GRACE_MS;
+      if (now - stat.mtimeMs < grace) continue;
     } catch {
       continue;
     }

@@ -450,10 +450,16 @@ export function markReapSkipped(
  */
 export function countDamagedArchives(db: Db): number {
   const row = db
+    // audited_at, so this counts sessions *this machine* checked and found
+    // wanting. A catalog recovered from a dead laptop can carry rows whose
+    // verification was withdrawn there for reasons that say nothing about the
+    // bundle, and greeting someone mid-recovery with "your archive is damaged"
+    // is both alarming and wrong.
     .prepare(
       `SELECT count(*) AS n FROM sessions
         WHERE local_present = 0
           AND verified_at IS NULL
+          AND audited_at IS NOT NULL
           AND remote_file_id IS NOT NULL
           AND verified_bundle_sha256 IS NOT NULL`,
     )

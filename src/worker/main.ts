@@ -1,6 +1,7 @@
 // Must come first: it silences the node:sqlite warning before SQLite loads.
 import '../core/quiet.ts';
 import { acquireLock } from '../adapters/lock.ts';
+import { logLastResort } from '../hooks/last-resort.ts';
 import { kvSetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
 import { createRuntime } from '../composition.ts';
@@ -129,7 +130,12 @@ function unavailableDrive(reason: string): WorkerContext['drive'] {
 
 try {
   await main();
-} catch {
-  // Already logged; the exit code stays 0 so nothing upstream reacts.
+} catch (err) {
+  // Not "already logged": createRuntime, the database open and the lock
+  // directory all run before the worker's own error handling, and a failure in
+  // any of them — a corrupt catalog, ENOSPC, a root-owned data directory —
+  // reached this catch having written nothing anywhere. This path uses node:fs
+  // alone, so it works when the catalog does not.
+  logLastResort('worker.failed_to_start', err);
 }
 process.exit(0);
