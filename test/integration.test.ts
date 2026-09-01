@@ -1498,3 +1498,103 @@ describe('the archive is not replaced by a smaller one', () => {
     assert.equal(report.ok, 1);
   });
 });
+
+/**
+ * Tenth round. The recurring defect appeared a fourth time, in a fix from an
+ * earlier round: upsertSession nulled every verified_* column when a project
+ * directory was renamed, and indexSession calls it on every backup attempt — so
+ * the shrink guard erased its own floors as it fired.
+ *
+ * The property these tests really assert is the one the codebase kept failing:
+ * a bundle that gets retired must be contained in the bundle that replaced it.
+ */
+describe('a retired archive is never larger than its replacement', () => {
+  it('keeps refusing after the project directory is renamed', async () => {
+    const harness = makeHarness();
+    for (const name of ['tool-a.json', 'tool-b.json']) {
+      fs.writeFileSync(
+        path.join(harness.projectDir, SESSION_B, name),
+        JSON.stringify({ output: 'x'.repeat(3000) }),
+      );
+    }
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_B)?.remoteFileId ?? '';
+
+    // Rename the project, and damage the session, as a user reorganising a
+    // directory tree would.
+    const renamed = path.join(harness.ctx.paths.projectsDir, '-home-a-shop-renamed');
+    fs.renameSync(harness.projectDir, renamed);
+    fs.rmSync(path.join(renamed, SESSION_B), { recursive: true, force: true });
+
+    for (const pass of [1, 2, 3]) {
+      const report = await runSweep(harness.ctx);
+      assert.equal(report.verified, 0, `sweep ${String(pass)} must not archive the remains`);
+      assert.equal(harness.drive.trashedIds.has(original), false, `sweep ${String(pass)}`);
+      assert.equal(harness.drive.files.has(original), true, `sweep ${String(pass)}`);
+      harness.clock.advance(60_000);
+    }
+  });
+
+  it('keeps the description of the Drive copy when a session moves project', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const before = getSession(harness.ctx.db, SESSION_A);
+
+    upsertSession(
+      harness.ctx.db,
+      { sessionId: SESSION_A, encodedDir: '-home-a-elsewhere' },
+      harness.clock.now(),
+    );
+    const after = getSession(harness.ctx.db, SESSION_A);
+
+    // The local fingerprint goes: those files moved. The measurements of what
+    // Drive holds stay, because Drive did not move.
+    assert.equal(after?.verifiedAt, null);
+    assert.equal(after?.verifiedLocalMtime, null);
+    assert.equal(after?.verifiedTranscriptBytes, before?.verifiedTranscriptBytes);
+    assert.equal(after?.verifiedSidecarBytes, before?.verifiedSidecarBytes);
+    assert.equal(after?.verifiedBundleSha256, before?.verifiedBundleSha256);
+  });
+
+  it('never retires a bundle whose size it does not know', async () => {
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const original = getSession(harness.ctx.db, SESSION_A)?.remoteFileId ?? '';
+    // A row from before migration 5, or one whose measurements were lost.
+    harness.ctx.db
+      .prepare('UPDATE sessions SET verified_sidecar_bytes = NULL WHERE session_id = ?')
+      .run(SESSION_A);
+
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), later, later);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    assert.equal(
+      harness.drive.trashedIds.has(original),
+      false,
+      'an unknown floor is not a grown one',
+    );
+  });
+
+  it('refuses to hand back an empty recovery directory', async () => {
+    const harness = makeHarness();
+    for (const name of ['tool-a.json']) {
+      fs.writeFileSync(path.join(harness.projectDir, SESSION_B, name), 'x'.repeat(3000));
+    }
+    await runSweep(harness.ctx);
+    fs.rmSync(path.join(harness.projectDir, SESSION_B), { recursive: true, force: true });
+
+    // The bundle on Drive is replaced with something that is not this session.
+    const record = getSession(harness.ctx.db, SESSION_B);
+    const stored = harness.drive.files.get(record?.remoteFileId ?? '');
+    if (stored !== undefined) stored.content = Buffer.from('not a bundle at all');
+
+    await assert.rejects(restoreSession(harness.ctx, SESSION_B), /does not match/);
+    const leftovers = fs
+      .readdirSync(harness.projectDir)
+      .filter((entry) => entry.includes('.archived-'));
+    assert.deepEqual(leftovers, [], 'no empty recovery directory is left behind');
+  });
+});

@@ -57,6 +57,12 @@ export function dedupeKey(kind: JobKind, sessionId: string | null): string {
 }
 
 export type EnqueueArgs = {
+  /**
+   * Clear a block. True for a hook, which means a person really used the
+   * session again; false for the sweep, whose rescan would otherwise unblock
+   * every parked job on every pass and retry a fault nobody has fixed.
+   */
+  unblock?: boolean;
   kind: JobKind;
   sessionId?: string | null;
   payload?: unknown;
@@ -85,7 +91,7 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
-         blocked     = 0,
+         blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -94,7 +100,8 @@ export function enqueue(db: Db, args: EnqueueArgs, now: number): number {
          updated_at  = excluded.updated_at
        RETURNING id`,
     )
-    .get(key, args.kind, sessionId, payload, notBefore, now, now) as { id: number } | undefined;
+    .get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0) as
+    { id: number } | undefined;
   return row?.id ?? 0;
 }
 

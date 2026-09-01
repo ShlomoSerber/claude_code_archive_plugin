@@ -48,8 +48,12 @@ export async function statSession(
   let transcript: Awaited<ReturnType<typeof fsp.stat>>;
   try {
     transcript = await fsp.stat(transcriptPath);
-  } catch {
-    return null;
+  } catch (err) {
+    // Only absence is absence. Swallowing a permission error here made the
+    // reaper record a session as locally deleted while its files sat on disk,
+    // and made the guard written to prevent that unreachable.
+    if ((err as { code?: string }).code === 'ENOENT') return null;
+    throw err;
   }
   if (!transcript.isFile()) return null;
 

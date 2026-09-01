@@ -85,13 +85,21 @@ describe('enqueue', () => {
     assert.deepEqual(parsePayload(job!), { encodedDir: '-a-b' });
   });
 
-  it('unblocks a job that the user has since fixed', () => {
+  it('unblocks a job only when a real session event says to', () => {
     const db = freshDb();
     const id = enqueue(db, { kind: 'backup', sessionId: 's1' }, 1000);
     const job = claim(db, 1000, 60_000)!;
     block(db, job, { error: 'invalid_grant', now: 1001 });
     assert.equal(getJob(db, id)?.blocked, true);
+
+    // The sweep rescans constantly. If its enqueue cleared the block, a parked
+    // job would be retried every pass and "stop and make a person look" would
+    // mean nothing.
     enqueue(db, { kind: 'backup', sessionId: 's1' }, 2000);
+    assert.equal(getJob(db, id)?.blocked, true, 'a rescan does not unblock');
+
+    // A hook fires when someone actually used the session again.
+    enqueue(db, { kind: 'backup', sessionId: 's1', unblock: true }, 3000);
     assert.equal(getJob(db, id)?.blocked, false);
   });
 });

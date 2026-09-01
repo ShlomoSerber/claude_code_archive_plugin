@@ -71,25 +71,51 @@ export async function restoreSession(
     // sidecar, a truncated write. Unpacking over it would destroy whatever the
     // live session has added since, so the archived copy goes beside it and the
     // user decides. Without this the session was simply stuck.
+    // The directory is created only once verified bytes exist to put in it,
+    // so a failed recovery leaves nothing behind to be mistaken for one.
     const recovery = path.join(targetDir, `${sessionId}.archived-${String(ctx.clock.now())}`);
-    await fsp.mkdir(recovery, { recursive: true });
     const staged = path.join(ctx.paths.stagingDir, `${sessionId}.recover.tar.zst`);
+    let recovered: string[] = [];
     try {
       await ctx.drive.downloadToFile(
         { fileId: requireRemote(record), destination: staged },
         ctx.signal,
       );
-      await extractBundle({ bundlePath: staged, targetDir: recovery, onlySession: sessionId });
+      // The same check the main restore path makes. This branch is what the
+      // shrink guard's remediation tells the user to run, and it ends with
+      // "remove whichever you do not want" — so handing them an empty or
+      // partial directory in silence is a route to deleting the good copy.
+      const actual = await sha256File(staged, ctx.signal);
+      if (actual !== record.verifiedBundleSha256) {
+        throw new RetryableError(
+          `the downloaded bundle does not match the catalog hash for ${sessionId}`,
+        );
+      }
+      await fsp.mkdir(recovery, { recursive: true });
+      const result = await extractBundle({
+        bundlePath: staged,
+        targetDir: recovery,
+        onlySession: sessionId,
+      });
+      recovered = result.entries;
     } finally {
       await fsp.rm(staged, { force: true }).catch(() => undefined);
     }
-    ctx.logger.warn('restore.recovered_beside', { session_id: sessionId, path: recovery });
+    if (recovered.length === 0) {
+      await fsp.rm(recovery, { recursive: true, force: true }).catch(() => undefined);
+      throw new RetryableError(`nothing could be recovered for ${sessionId}`);
+    }
+    ctx.logger.warn('restore.recovered_beside', {
+      session_id: sessionId,
+      path: recovery,
+      entries: recovered.length,
+    });
     return {
       sessionId,
       encodedDir: record.encodedDir,
       projectCwd: record.projectCwd,
       transcriptPath: existing.transcriptPath,
-      entries: [],
+      entries: recovered,
       alreadyLocal: true,
       recoveredTo: recovery,
       resumeCommand: resumeCommand(sessionId),

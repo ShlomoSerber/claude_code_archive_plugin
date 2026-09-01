@@ -1528,7 +1528,7 @@ function enqueue(db, args, now) {
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
-         blocked     = 0,
+         blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -1536,7 +1536,7 @@ function enqueue(db, args, now) {
          upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
-  ).get(key, args.kind, sessionId, payload, notBefore, now, now);
+  ).get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0);
   return row?.id ?? 0;
 }
 
@@ -1841,7 +1841,9 @@ async function main() {
         payload: { encodedDir },
         // The debounce coalesces the burst of fires a resumed session produces
         // into a single backup of its final state.
-        notBefore: now + runtime.config.debounceMs
+        notBefore: now + runtime.config.debounceMs,
+        // A person closed this session, so a previous block is worth retrying.
+        unblock: true
       },
       now
     );

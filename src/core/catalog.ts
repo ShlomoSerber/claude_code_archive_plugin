@@ -128,24 +128,22 @@ export function upsertSession(db: Db, session: SessionUpsert, now: number): void
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT (session_id) DO UPDATE SET
        -- A row that moves to a different project directory is describing
-       -- different files, so the fingerprint that authorises deleting them
-       -- stops applying the moment the directory changes.
+       -- different local files, so the fingerprint that authorises deleting
+       -- them stops applying. Only those two columns, and verified_at, are
+       -- about the disk.
+       --
+       -- The rest describe the copy on Drive, which did not move. Nulling them
+       -- here was the fourth appearance of one defect: a guard reading a column
+       -- that an earlier step of the same attempt rewrites. indexSession calls
+       -- this on every backup attempt, so the shrink guard destroyed its own
+       -- floors as it fired and let the retry replace a good archive with a
+       -- damaged one. This statement no longer mentions those columns at all.
        verified_at = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                           THEN sessions.verified_at ELSE NULL END,
        verified_local_mtime = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                    THEN sessions.verified_local_mtime ELSE NULL END,
        verified_local_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                    THEN sessions.verified_local_bytes ELSE NULL END,
-       verified_bundle_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                     THEN sessions.verified_bundle_sha256 ELSE NULL END,
-       verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                         THEN sessions.verified_transcript_sha256 ELSE NULL END,
-       verified_transcript_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                        THEN sessions.verified_transcript_bytes ELSE NULL END,
-       verified_sidecar_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                     THEN sessions.verified_sidecar_bytes ELSE NULL END,
-       verified_bundle_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                    THEN sessions.verified_bundle_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),

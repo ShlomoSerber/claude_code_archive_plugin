@@ -78,6 +78,8 @@ async function main(): Promise<void> {
         // The debounce coalesces the burst of fires a resumed session produces
         // into a single backup of its final state.
         notBefore: now + runtime.config.debounceMs,
+        // A person closed this session, so a previous block is worth retrying.
+        unblock: true,
       },
       now,
     );

@@ -1896,8 +1896,9 @@ async function statSession(paths, encodedDir, sessionId) {
   let transcript;
   try {
     transcript = await fsp6.stat(transcriptPath);
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
   }
   if (!transcript.isFile()) return null;
   const sidecar = await measureDirectory(sidecarDir);
@@ -2010,24 +2011,22 @@ function upsertSession(db, session, now) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT (session_id) DO UPDATE SET
        -- A row that moves to a different project directory is describing
-       -- different files, so the fingerprint that authorises deleting them
-       -- stops applying the moment the directory changes.
+       -- different local files, so the fingerprint that authorises deleting
+       -- them stops applying. Only those two columns, and verified_at, are
+       -- about the disk.
+       --
+       -- The rest describe the copy on Drive, which did not move. Nulling them
+       -- here was the fourth appearance of one defect: a guard reading a column
+       -- that an earlier step of the same attempt rewrites. indexSession calls
+       -- this on every backup attempt, so the shrink guard destroyed its own
+       -- floors as it fired and let the retry replace a good archive with a
+       -- damaged one. This statement no longer mentions those columns at all.
        verified_at = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                           THEN sessions.verified_at ELSE NULL END,
        verified_local_mtime = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                    THEN sessions.verified_local_mtime ELSE NULL END,
        verified_local_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
                                    THEN sessions.verified_local_bytes ELSE NULL END,
-       verified_bundle_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                     THEN sessions.verified_bundle_sha256 ELSE NULL END,
-       verified_transcript_sha256 = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                         THEN sessions.verified_transcript_sha256 ELSE NULL END,
-       verified_transcript_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                        THEN sessions.verified_transcript_bytes ELSE NULL END,
-       verified_sidecar_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                     THEN sessions.verified_sidecar_bytes ELSE NULL END,
-       verified_bundle_bytes = CASE WHEN sessions.encoded_dir = excluded.encoded_dir
-                                    THEN sessions.verified_bundle_bytes ELSE NULL END,
        encoded_dir       = excluded.encoded_dir,
        project_cwd       = COALESCE(excluded.project_cwd, sessions.project_cwd),
        title             = COALESCE(excluded.title, sessions.title),
@@ -2240,7 +2239,7 @@ function enqueue(db, args, now) {
        ON CONFLICT (dedupe_key) DO UPDATE SET
          payload     = excluded.payload,
          not_before  = max(jobs.not_before, excluded.not_before),
-         blocked     = 0,
+         blocked     = CASE WHEN ? THEN 0 ELSE jobs.blocked END,
          claim_token = NULL,
          -- New work means a new bundle. A URI opened for the previous one would
          -- otherwise be resumed against different bytes, and the "already
@@ -2248,7 +2247,7 @@ function enqueue(db, args, now) {
          upload_uri  = NULL,
          updated_at  = excluded.updated_at
        RETURNING id`
-  ).get(key, args.kind, sessionId, payload, notBefore, now, now);
+  ).get(key, args.kind, sessionId, payload, notBefore, now, now, args.unblock === true ? 1 : 0);
   return row?.id ?? 0;
 }
 function claim(db, now, visibilityMs) {
@@ -6131,7 +6130,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  const grewEverywhere = describeShrink(previous, {
+  const grewEverywhere = hasAllFloors(previous) && describeShrink(previous, {
     transcript: archivedTranscript,
     sidecar: archivedSidecar,
     total: archivedBytes
@@ -6159,6 +6158,9 @@ async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   clearVerification(ctx.db, sessionId, ctx.clock.now());
   await ctx.drive.deleteFile(uploaded.id, ctx.signal).catch(() => void 0);
   throw new RetryableError(`Drive copy did not match the local bundle: ${problem}`);
+}
+function hasAllFloors(previous) {
+  return previous?.verifiedTranscriptBytes != null && previous.verifiedSidecarBytes !== null && previous.verifiedLocalBytes !== null;
 }
 function describeShrink(previous, now) {
   if (previous?.remoteFileId == null) return null;

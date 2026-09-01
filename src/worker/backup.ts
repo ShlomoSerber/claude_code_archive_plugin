@@ -353,6 +353,7 @@ async function publish(
   // here. This is the second lock on the door: retiring the previous archive is
   // the one remaining act in this codebase that can make data unrecoverable.
   const grewEverywhere =
+    hasAllFloors(previous) &&
     describeShrink(previous, {
       transcript: archivedTranscript,
       sidecar: archivedSidecar,
@@ -415,6 +416,21 @@ export async function verifyRemote(
  * does not change just because an earlier step of this attempt rewrote the
  * row — which is how the two previous versions of this guard became one-shots.
  */
+/**
+ * Do we know how big every part of the archived copy is?
+ *
+ * A missing measurement means "unknown", never "smaller than this". Retiring a
+ * bundle on the strength of a floor we do not have is how a complete archive
+ * ends up in the wastebasket with nothing pointing at it.
+ */
+export function hasAllFloors(previous: SessionRecord | null): boolean {
+  return (
+    previous?.verifiedTranscriptBytes != null &&
+    previous.verifiedSidecarBytes !== null &&
+    previous.verifiedLocalBytes !== null
+  );
+}
+
 export function describeShrink(
   previous: SessionRecord | null,
   now: { transcript: number; sidecar: number; total: number },
