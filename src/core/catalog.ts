@@ -408,6 +408,34 @@ export function clearVerification(db: Db, sessionId: string, now: number): void 
   );
 }
 
+/**
+ * Remember that the reaper passed this row over, and why.
+ *
+ * Written for the reasons that do not clear themselves: an orphan sidecar, a
+ * sidecar that cannot be read. `until` keeps the row out of the candidate
+ * window so it cannot starve every other session of ever being examined.
+ */
+export function markReapSkipped(
+  db: Db,
+  sessionId: string,
+  reason: string,
+  until: number,
+  now: number,
+): void {
+  db.prepare(
+    `UPDATE sessions SET reap_skip_reason = ?, reap_skip_until = ?, updated_at = ?
+      WHERE session_id = ?`,
+  ).run(reason, until, now, sessionId);
+}
+
+/** How many rows the reaper is currently passing over for this reason. */
+export function countReapSkipped(db: Db, reason: string): number {
+  const row = db
+    .prepare('SELECT count(*) AS n FROM sessions WHERE reap_skip_reason = ?')
+    .get(reason) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 export function markLocalDeleted(db: Db, sessionId: string, now: number): void {
   db.prepare(
     `UPDATE sessions SET local_present = 0, local_deleted_at = ?, updated_at = ? WHERE session_id = ?`,
@@ -417,7 +445,8 @@ export function markLocalDeleted(db: Db, sessionId: string, now: number): void {
 export function markLocalPresent(db: Db, sessionId: string, mtime: number, now: number): void {
   db.prepare(
     `UPDATE sessions
-        SET local_present = 1, local_deleted_at = NULL, last_local_mtime = ?, updated_at = ?
+        SET local_present = 1, local_deleted_at = NULL, last_local_mtime = ?,
+            reap_skip_reason = NULL, reap_skip_until = NULL, updated_at = ?
       WHERE session_id = ?`,
   ).run(mtime, now, sessionId);
 }
@@ -447,7 +476,12 @@ export function getFiles(db: Db, sessionId: string, limit = 50): string[] {
  * Sessions whose local copy may be deleted: verified on Drive, still on disk,
  * and untouched for longer than the retention window.
  */
-export function listReapable(db: Db, idleBefore: number, limit = 500): SessionRecord[] {
+export function listReapable(
+  db: Db,
+  idleBefore: number,
+  now: number,
+  limit = 500,
+): SessionRecord[] {
   const rows = db
     .prepare(
       `SELECT ${SESSION_COLUMNS} FROM sessions
@@ -457,10 +491,13 @@ export function listReapable(db: Db, idleBefore: number, limit = 500): SessionRe
           AND remote_file_id IS NOT NULL
           AND verified_local_mtime IS NOT NULL
           AND verified_local_mtime < ?
+          -- A row the reaper keeps passing over does not get to occupy the
+          -- window for ever; it comes back when its cool-off expires.
+          AND (reap_skip_until IS NULL OR reap_skip_until <= ?)
         ORDER BY verified_local_mtime ASC
         LIMIT ?`,
     )
-    .all(idleBefore, limit) as SessionRow[];
+    .all(idleBefore, now, limit) as SessionRow[];
   return rows.map(toRecord);
 }
 
@@ -497,8 +534,13 @@ export function catalogStats(db: Db): CatalogStats {
          sum(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END) AS verified,
          sum(CASE WHEN local_present = 1 THEN 1 ELSE 0 END) AS local_present,
          sum(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END) AS pending_backup,
-         sum(CASE WHEN local_present = 1
+         -- An orphan-sidecar row is local_present = 1 with no transcript, so
+         -- counting its transcript_bytes overstated the disk by the size of a
+         -- file that is not there.
+         sum(CASE WHEN local_present = 1 AND reap_skip_reason IS NOT 'orphan-sidecar'
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
+                  WHEN local_present = 1
+                  THEN COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS local_bytes,
          -- verified_bundle_bytes, not bundle_bytes: the latter describes a
          -- bundle that was *built*, so a session that never uploaded still

@@ -13,8 +13,11 @@ import type { ArchivePaths } from '../core/paths.ts';
 export type ScanSkip = {
   kind: 'project' | 'session';
   name: string;
-  /** 'name' when the name is unusable, 'unreadable' when access failed. */
-  reason: 'name' | 'unreadable';
+  /**
+   * 'name' when the name is unusable, 'unreadable' when access failed,
+   * 'duplicate' when the same session id exists under two project directories.
+   */
+  reason: 'name' | 'unreadable' | 'duplicate';
 };
 
 export type LocalSession = {

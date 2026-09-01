@@ -179,6 +179,25 @@ export const MIGRATIONS: readonly string[] = [
   `
   ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
   `,
+
+  // 9 — why the reaper last passed a row over, and until when.
+  //
+  // listReapable takes the 500 oldest candidates. A row the reaper always
+  // skips — an orphan sidecar, a sidecar it cannot read — keeps its old
+  // verified_local_mtime for ever, so it sorts to the front of that window on
+  // every run. Past 500 of them, no session that could actually be reclaimed
+  // was ever looked at again: deletion stopped completely, and the only sign
+  // was that nothing was ever freed.
+  //
+  // The backfill covers jobs blocked before migration 8, which added
+  // blocked_at: without it unblockStale can never fire for them, which is the
+  // very bug migration 8 exists to fix.
+  `
+  ALTER TABLE sessions ADD COLUMN reap_skip_reason TEXT;
+  ALTER TABLE sessions ADD COLUMN reap_skip_until INTEGER;
+
+  UPDATE jobs SET blocked_at = updated_at WHERE blocked = 1 AND blocked_at IS NULL;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

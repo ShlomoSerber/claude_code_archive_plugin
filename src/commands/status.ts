@@ -1,4 +1,4 @@
-import { catalogStats, listRetainedBundles } from '../core/catalog.ts';
+import { catalogStats, countReapSkipped, listRetainedBundles } from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGet, kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
@@ -68,8 +68,21 @@ export async function runStatus(
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
-  const orphanSidecars = kvGetNumber(db, KV.orphanSidecars) ?? 0;
+  // Counted from the catalog, not from the last run: the reaper looks at a
+  // capped window, so 505 orphans were reported as 500.
+  const orphanSidecars = countReapSkipped(db, 'orphan-sidecar');
+  const unreadableSidecars = countReapSkipped(db, 'sidecar-unreadable');
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? '';
+  // The reap does not run on a sweep that exhausted its budget or saw a wild
+  // clock, so these numbers can describe an earlier run. Saying when keeps a
+  // fault that was fixed hours ago from reading as current.
+  const reapRanAt = kvGetNumber(db, KV.reapRanAt) ?? null;
+  const reapAge =
+    reapRanAt === null
+      ? ''
+      : lastSweepAt !== null && lastSweepAt - reapRanAt > 60_000
+        ? ` (as of ${formatRelative(reapRanAt, now)})`
+        : '';
   const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
   const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
   // A worker that dies on its first line looks exactly like a healthy one:
@@ -120,7 +133,9 @@ export async function runStatus(
       unreadable,
       unconfirmable,
       reapUnverified,
+      reapRanAt,
       orphanSidecars,
+      unreadableSidecars,
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
@@ -221,12 +236,16 @@ export async function runStatus(
     // The remediation Drive's refusal came with. It used to be swallowed here,
     // so a revoked token showed up only as an archive that had stopped being
     // verified, with nothing saying why.
-    print(`  WARNING:            Drive would not answer the last check:`);
+    print(`  WARNING:            Drive would not answer the last check${reapAge}:`);
     print(`                      ${reapBlocked}`);
   }
   if (orphanSidecars > 0) {
     print(`  ${String(orphanSidecars)} session(s) have a sidecar directory but no transcript.`);
     print(`  Nothing removes those, and their bytes are not counted as reclaimed.`);
+  }
+  if (unreadableSidecars > 0) {
+    print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);
+    print(`                      plugin cannot read, so they are not being archived.`);
   }
   if (reapUnverified > 0) {
     print(

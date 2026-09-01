@@ -267,7 +267,7 @@ describe('listReapable', () => {
     const db = freshDb();
     seed(db);
     assert.deepEqual(
-      listReapable(db, 50_000).map((session) => session.sessionId),
+      listReapable(db, 50_000, 60_000).map((session) => session.sessionId),
       ['verified-old'],
     );
   });
@@ -275,7 +275,9 @@ describe('listReapable', () => {
   it('never offers an unverified session, which is SPEC invariant 1', () => {
     const db = freshDb();
     seed(db);
-    const ids = listReapable(db, Number.MAX_SAFE_INTEGER).map((session) => session.sessionId);
+    const ids = listReapable(db, Number.MAX_SAFE_INTEGER, 60_000).map(
+      (session) => session.sessionId,
+    );
     assert.ok(!ids.includes('unverified-old'));
   });
 
@@ -283,14 +285,14 @@ describe('listReapable', () => {
     const db = freshDb();
     seed(db);
     clearVerification(db, 'verified-old', 2);
-    assert.deepEqual(listReapable(db, 50_000), []);
+    assert.deepEqual(listReapable(db, 50_000, 60_000), []);
   });
 
   it('skips a session whose local copy is already gone', () => {
     const db = freshDb();
     seed(db);
     markLocalDeleted(db, 'verified-old', 2);
-    assert.deepEqual(listReapable(db, 50_000), []);
+    assert.deepEqual(listReapable(db, 50_000, 60_000), []);
   });
 });
 

@@ -2617,3 +2617,59 @@ describe('a sidecar that is a symbolic link', () => {
     assert.match(message, /cannot be read as a plain directory/);
   });
 });
+
+/**
+ * Twenty-fourth round. Objective 1 held under ~5 500 sweeps and ~570 real
+ * deletions, including a Drive that answered with another file's metadata and
+ * two workers racing on one catalog. The finding was starvation: rows the
+ * reaper always skips crowding out every row it could act on.
+ */
+describe('rows the reaper can never act on', () => {
+  it('do not stop it from reclaiming everything else', async () => {
+    const harness = makeHarness({ retentionDays: 30, archiveGraceDays: 0 });
+    // More orphans than the candidate window holds, plus one healthy session.
+    for (let index = 0; index < 12; index++) {
+      const id = `cccccccc-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      fs.writeFileSync(
+        path.join(harness.projectDir, `${id}.jsonl`),
+        transcriptLines(id, `Session ${String(index)}`, 'something happened'),
+      );
+      fs.mkdirSync(path.join(harness.projectDir, id), { recursive: true });
+      fs.writeFileSync(path.join(harness.projectDir, id, 'tool.json'), '{"ok":true}');
+    }
+    await runSweep(harness.ctx);
+
+    const old = new Date(harness.clock.now() - 40 * DAY_MS);
+    for (const entry of fs.readdirSync(harness.projectDir)) {
+      if (entry.endsWith('.jsonl')) fs.utimesSync(path.join(harness.projectDir, entry), old, old);
+    }
+    harness.ctx.db.prepare('UPDATE sessions SET verified_local_mtime = ?').run(old.getTime());
+    // The orphans are older, so they sort to the front of the window — which
+    // is what let them hold it for ever.
+    harness.ctx.db
+      .prepare("UPDATE sessions SET verified_local_mtime = ? WHERE session_id LIKE 'cccccccc%'")
+      .run(old.getTime() - 10 * DAY_MS);
+    harness.clock.advance(40 * DAY_MS);
+
+    // Claude Code's own reaper takes the transcripts and leaves the sidecars.
+    for (let index = 0; index < 12; index++) {
+      const id = `cccccccc-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      fs.rmSync(path.join(harness.projectDir, `${id}.jsonl`));
+    }
+
+    const first = await reapLocalCopies(harness.ctx, harness.clock.now(), 4);
+    assert.ok(first.orphanSidecars > 0, 'the orphans are seen');
+
+    // The window is small, so on the old code the orphans would fill it for
+    // ever and nothing else would ever be examined again.
+    for (let pass = 0; pass < 4; pass++) {
+      harness.clock.advance(60_000);
+      await reapLocalCopies(harness.ctx, harness.clock.now(), 4);
+    }
+    assert.equal(
+      fs.existsSync(harness.transcriptOf(SESSION_A)),
+      false,
+      'a session that could be reclaimed still is',
+    );
+  });
+});

@@ -146,6 +146,7 @@ export async function runSweep(
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at);
     kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at);
+    kvSetNumber(ctx.db, KV.reapRanAt, at, at);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? '', at);
   }
 
@@ -181,9 +182,22 @@ async function discover(
   let enqueued = 0;
   const skipped: ScanSkip[] = [];
 
+  // One catalog row per session id, so a second copy under another project
+  // directory can only ever overwrite the first's job. Recorded rather than
+  // dropped: the copy that loses is never archived, and nothing else says so.
+  const seen = new Set<string>();
   for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
+    if (seen.has(session.sessionId)) {
+      skipped.push({ kind: 'session', name: session.sessionId, reason: 'duplicate' });
+      ctx.logger.warn('sweep.duplicate_session', {
+        session_id: session.sessionId,
+        encoded_dir: session.encodedDir,
+      });
+      continue;
+    }
+    seen.add(session.sessionId);
     const mtime = Math.trunc(session.mtimeMs);
     const known = getSession(ctx.db, session.sessionId);
 

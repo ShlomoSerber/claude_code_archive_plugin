@@ -353,6 +353,24 @@ var MIGRATIONS = [
   // session parked by one transient failure was never archived again.
   `
   ALTER TABLE jobs ADD COLUMN blocked_at INTEGER;
+  `,
+  // 9 — why the reaper last passed a row over, and until when.
+  //
+  // listReapable takes the 500 oldest candidates. A row the reaper always
+  // skips — an orphan sidecar, a sidecar it cannot read — keeps its old
+  // verified_local_mtime for ever, so it sorts to the front of that window on
+  // every run. Past 500 of them, no session that could actually be reclaimed
+  // was ever looked at again: deletion stopped completely, and the only sign
+  // was that nothing was ever freed.
+  //
+  // The backfill covers jobs blocked before migration 8, which added
+  // blocked_at: without it unblockStale can never fire for them, which is the
+  // very bug migration 8 exists to fix.
+  `
+  ALTER TABLE sessions ADD COLUMN reap_skip_reason TEXT;
+  ALTER TABLE sessions ADD COLUMN reap_skip_until INTEGER;
+
+  UPDATE jobs SET blocked_at = updated_at WHERE blocked = 1 AND blocked_at IS NULL;
   `
 ];
 var SCHEMA_VERSION = MIGRATIONS.length;
@@ -2488,6 +2506,16 @@ function clearVerification(db, sessionId, now) {
     sessionId
   );
 }
+function markReapSkipped(db, sessionId, reason, until, now) {
+  db.prepare(
+    `UPDATE sessions SET reap_skip_reason = ?, reap_skip_until = ?, updated_at = ?
+      WHERE session_id = ?`
+  ).run(reason, until, now, sessionId);
+}
+function countReapSkipped(db, reason) {
+  const row = db.prepare("SELECT count(*) AS n FROM sessions WHERE reap_skip_reason = ?").get(reason);
+  return row?.n ?? 0;
+}
 function markLocalDeleted(db, sessionId, now) {
   db.prepare(
     `UPDATE sessions SET local_present = 0, local_deleted_at = ?, updated_at = ? WHERE session_id = ?`
@@ -2496,7 +2524,8 @@ function markLocalDeleted(db, sessionId, now) {
 function markLocalPresent(db, sessionId, mtime, now) {
   db.prepare(
     `UPDATE sessions
-        SET local_present = 1, local_deleted_at = NULL, last_local_mtime = ?, updated_at = ?
+        SET local_present = 1, local_deleted_at = NULL, last_local_mtime = ?,
+            reap_skip_reason = NULL, reap_skip_until = NULL, updated_at = ?
       WHERE session_id = ?`
   ).run(mtime, now, sessionId);
 }
@@ -2508,7 +2537,7 @@ function getFiles(db, sessionId, limit = 50) {
   const rows = db.prepare("SELECT path FROM session_files WHERE session_id = ? ORDER BY path ASC LIMIT ?").all(sessionId, limit);
   return rows.map((row) => row.path);
 }
-function listReapable(db, idleBefore, limit = 500) {
+function listReapable(db, idleBefore, now, limit = 500) {
   const rows = db.prepare(
     `SELECT ${SESSION_COLUMNS} FROM sessions
         WHERE local_present = 1
@@ -2517,9 +2546,12 @@ function listReapable(db, idleBefore, limit = 500) {
           AND remote_file_id IS NOT NULL
           AND verified_local_mtime IS NOT NULL
           AND verified_local_mtime < ?
+          -- A row the reaper keeps passing over does not get to occupy the
+          -- window for ever; it comes back when its cool-off expires.
+          AND (reap_skip_until IS NULL OR reap_skip_until <= ?)
         ORDER BY verified_local_mtime ASC
         LIMIT ?`
-  ).all(idleBefore, limit);
+  ).all(idleBefore, now, limit);
   return rows.map(toRecord);
 }
 function listUnverified(db, limit = 500) {
@@ -2538,8 +2570,13 @@ function catalogStats(db) {
          sum(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END) AS verified,
          sum(CASE WHEN local_present = 1 THEN 1 ELSE 0 END) AS local_present,
          sum(CASE WHEN verified_at IS NULL THEN 1 ELSE 0 END) AS pending_backup,
-         sum(CASE WHEN local_present = 1
+         -- An orphan-sidecar row is local_present = 1 with no transcript, so
+         -- counting its transcript_bytes overstated the disk by the size of a
+         -- file that is not there.
+         sum(CASE WHEN local_present = 1 AND reap_skip_reason IS NOT 'orphan-sidecar'
                   THEN COALESCE(transcript_bytes, 0) + COALESCE(sidecar_bytes, 0)
+                  WHEN local_present = 1
+                  THEN COALESCE(sidecar_bytes, 0)
                   ELSE 0 END) AS local_bytes,
          -- verified_bundle_bytes, not bundle_bytes: the latter describes a
          -- bundle that was *built*, so a session that never uploaded still
@@ -2796,6 +2833,8 @@ var KV = {
   workerRanAt: "worker.ran_at",
   /** Sidecar directories left on disk by a transcript that vanished. */
   orphanSidecars: "reap.orphan_sidecars",
+  /** When the reap last actually ran, so stale counters can say so. */
+  reapRanAt: "reap.ran_at",
   /** Why the last reap stopped asking Drive, if it did. */
   reapBlockedReason: "reap.blocked_reason",
   /** Archived sessions the last reap found missing or changed on Drive. */
@@ -6320,6 +6359,7 @@ function truncateUtf8(input, maxBytes) {
 
 // src/worker/upload.ts
 import fsp9 from "node:fs/promises";
+var UNKNOWN_CHECKSUM_LIMIT = 8;
 async function uploadWithResume(ctx, args) {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? "", name: args.name });
   const chunkSize = alignChunkSize(args.chunkSize ?? CHUNK_SIZE);
@@ -6364,6 +6404,12 @@ async function uploadWithResume(ctx, args) {
       return existing;
     }
     if (existing !== null && verdict === "unknown") {
+      if (args.job.attempts >= UNKNOWN_CHECKSUM_LIMIT) {
+        throw new FatalError(
+          `Drive has never reported a checksum for the existing ${args.name}`,
+          "Check that file in Drive: if it is not this session's bundle, move it to the wastebasket and run /archive:now."
+        );
+      }
       throw new RetryableError(
         `Drive has not reported a checksum for the existing ${args.name}; leaving it alone`
       );
@@ -6798,7 +6844,8 @@ function compareChecksums(remote, bundle) {
 // src/worker/reap.ts
 import fsp11 from "node:fs/promises";
 import path13 from "node:path";
-async function reapLocalCopies(ctx, now) {
+var SKIP_COOLDOWN_MS = 24 * 60 * 6e4;
+async function reapLocalCopies(ctx, now, limit) {
   let projectDirsCache = null;
   const projectDirs = async () => {
     projectDirsCache ??= await fsp11.readdir(ctx.paths.projectsDir).catch(() => []);
@@ -6816,7 +6863,7 @@ async function reapLocalCopies(ctx, now) {
   };
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
   const cutoff = reapCutoff(now, ctx.config.retentionDays);
-  for (const record of listReapable(ctx.db, cutoff)) {
+  for (const record of listReapable(ctx.db, cutoff, now, limit)) {
     ctx.signal?.throwIfAborted();
     const log = ctx.logger.child({ session_id: record.sessionId });
     const target = safeTarget(ctx, record);
@@ -6844,6 +6891,7 @@ async function reapLocalCopies(ctx, now) {
       const sidecar = path13.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
       if (await isDirectory(sidecar)) {
         log.warn("reap.orphan_sidecar", { encoded_dir: record.encodedDir });
+        markReapSkipped(ctx.db, record.sessionId, "orphan-sidecar", now + SKIP_COOLDOWN_MS, now);
         report.orphanSidecars++;
         report.skipped++;
         continue;
@@ -6858,6 +6906,7 @@ async function reapLocalCopies(ctx, now) {
       continue;
     }
     if (onDisk.sidecarUnreadable) {
+      markReapSkipped(ctx.db, record.sessionId, "sidecar-unreadable", now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }
@@ -7084,6 +7133,7 @@ async function runSweep(ctx, options = {}) {
     kvSetNumber(ctx.db, KV.unconfirmableCount, report.reap.unconfirmable, at2);
     kvSetNumber(ctx.db, KV.reapUnverified, report.reap.unverified, at2);
     kvSetNumber(ctx.db, KV.orphanSidecars, report.reap.orphanSidecars, at2);
+    kvSetNumber(ctx.db, KV.reapRanAt, at2, at2);
     kvSet(ctx.db, KV.reapBlockedReason, report.reap.blockedReason ?? "", at2);
   }
   if (report.verified > 0 || report.reap.deleted > 0 || catalogCopyIsStale(ctx)) {
@@ -7105,9 +7155,19 @@ async function discover(ctx, now, flags) {
   let discovered = 0;
   let enqueued = 0;
   const skipped = [];
+  const seen = /* @__PURE__ */ new Set();
   for await (const session of scanSessions(ctx.paths, skipped)) {
     ctx.signal?.throwIfAborted();
     discovered++;
+    if (seen.has(session.sessionId)) {
+      skipped.push({ kind: "session", name: session.sessionId, reason: "duplicate" });
+      ctx.logger.warn("sweep.duplicate_session", {
+        session_id: session.sessionId,
+        encoded_dir: session.encodedDir
+      });
+      continue;
+    }
+    seen.add(session.sessionId);
     const mtime = Math.trunc(session.mtimeMs);
     const known = getSession(ctx.db, session.sessionId);
     if (known === null) {
@@ -8699,8 +8759,11 @@ async function runStatus(runtime, options) {
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
   const reapUnverified = kvGetNumber(db, KV.reapUnverified) ?? 0;
-  const orphanSidecars = kvGetNumber(db, KV.orphanSidecars) ?? 0;
+  const orphanSidecars = countReapSkipped(db, "orphan-sidecar");
+  const unreadableSidecars = countReapSkipped(db, "sidecar-unreadable");
   const reapBlocked = kvGet(db, KV.reapBlockedReason) ?? "";
+  const reapRanAt = kvGetNumber(db, KV.reapRanAt) ?? null;
+  const reapAge = reapRanAt === null ? "" : lastSweepAt !== null && lastSweepAt - reapRanAt > 6e4 ? ` (as of ${formatRelative(reapRanAt, now)})` : "";
   const workerSpawnedAt = kvGetNumber(db, KV.workerSpawnedAt) ?? 0;
   const workerRanAt = kvGetNumber(db, KV.workerRanAt) ?? 0;
   const workerNeverRan = workerSpawnedAt > 0 && workerSpawnedAt - workerRanAt > 30 * 6e4;
@@ -8734,7 +8797,9 @@ async function runStatus(runtime, options) {
       unreadable,
       unconfirmable,
       reapUnverified,
+      reapRanAt,
       orphanSidecars,
+      unreadableSidecars,
       workerSpawnedAt,
       workerRanAt,
       workerNeverRan,
@@ -8827,12 +8892,16 @@ async function runStatus(runtime, options) {
     print(`                      ${formatRelative(lastSweepAt, now)}. Run /archive:now.`);
   }
   if (reapBlocked !== "") {
-    print(`  WARNING:            Drive would not answer the last check:`);
+    print(`  WARNING:            Drive would not answer the last check${reapAge}:`);
     print(`                      ${reapBlocked}`);
   }
   if (orphanSidecars > 0) {
     print(`  ${String(orphanSidecars)} session(s) have a sidecar directory but no transcript.`);
     print(`  Nothing removes those, and their bytes are not counted as reclaimed.`);
+  }
+  if (unreadableSidecars > 0) {
+    print(`  WARNING:            ${String(unreadableSidecars)} session(s) have a sidecar this`);
+    print(`                      plugin cannot read, so they are not being archived.`);
   }
   if (reapUnverified > 0) {
     print(

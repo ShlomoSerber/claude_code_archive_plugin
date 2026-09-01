@@ -4,6 +4,7 @@ import {
   clearVerification,
   listReapable,
   markLocalDeleted,
+  markReapSkipped,
   markLocalPresent,
 } from '../core/catalog.ts';
 import type { SessionRecord } from '../core/catalog.ts';
@@ -59,7 +60,15 @@ export type ReapReport = {
   orphanSidecars: number;
 };
 
-export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<ReapReport> {
+/** How long a row the reaper cannot act on stays out of the candidate window. */
+const SKIP_COOLDOWN_MS = 24 * 60 * 60_000;
+
+export async function reapLocalCopies(
+  ctx: WorkerContext,
+  now: number,
+  /** Candidate window size. Only tests narrow it; the default is the query's. */
+  limit?: number,
+): Promise<ReapReport> {
   // Read once. A readdir per reapable row is seconds on an SSD with a few
   // hundred project directories, and minutes on a network home directory.
   let projectDirsCache: string[] | null = null;
@@ -82,7 +91,7 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
   if (!ctx.config.enabled || ctx.config.keepLocalForever) return report;
 
   const cutoff = reapCutoff(now, ctx.config.retentionDays);
-  for (const record of listReapable(ctx.db, cutoff)) {
+  for (const record of listReapable(ctx.db, cutoff, now, limit)) {
     ctx.signal?.throwIfAborted();
     const log = ctx.logger.child({ session_id: record.sessionId });
 
@@ -120,6 +129,10 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
       const sidecar = path.join(ctx.paths.projectsDir, record.encodedDir, record.sessionId);
       if (await isDirectory(sidecar)) {
         log.warn('reap.orphan_sidecar', { encoded_dir: record.encodedDir });
+        // Stamped so it leaves the candidate window: this row will be skipped
+        // every run, and 500 of them would otherwise crowd out every session
+        // that could actually be reclaimed.
+        markReapSkipped(ctx.db, record.sessionId, 'orphan-sidecar', now + SKIP_COOLDOWN_MS, now);
         report.orphanSidecars++;
         report.skipped++;
         continue;
@@ -141,6 +154,9 @@ export async function reapLocalCopies(ctx: WorkerContext, now: number): Promise<
 
     if (onDisk.sidecarUnreadable) {
       // We cannot tell what is in there, so we cannot know it is archived.
+      // Stamped for the same reason as an orphan: this will not clear itself,
+      // and a pile of them must not crowd out the sessions that can be freed.
+      markReapSkipped(ctx.db, record.sessionId, 'sidecar-unreadable', now + SKIP_COOLDOWN_MS, now);
       report.skipped++;
       continue;
     }

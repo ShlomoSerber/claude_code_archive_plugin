@@ -1,5 +1,5 @@
 import fsp from 'node:fs/promises';
-import { UploadSessionExpired, RetryableError } from '../core/errors.ts';
+import { UploadSessionExpired, RetryableError, FatalError } from '../core/errors.ts';
 import { setUploadUri, type Job } from '../core/queue.ts';
 import { CHUNK_SIZE, alignChunkSize } from '../adapters/drive-http.ts';
 import type { RemoteFile } from '../ports/drive.ts';
@@ -27,6 +27,9 @@ export type UploadArgs = {
   appProperties?: Record<string, string>;
   chunkSize?: number;
 };
+
+/** Attempts at a same-named remote Drive will not vouch for, before we stop. */
+const UNKNOWN_CHECKSUM_LIMIT = 8;
 
 export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Promise<RemoteFile> {
   const log = ctx.logger.child({ session_id: args.job.sessionId ?? '', name: args.name });
@@ -86,6 +89,18 @@ export async function uploadWithResume(ctx: WorkerContext, args: UploadArgs): Pr
       // Leave it alone. Drive has not answered the question yet, and the only
       // destructive options here — trash it, or overwrite it — are both wrong
       // if the answer turns out to be "that is your archive".
+      //
+      // A retryable error never blocks, and its backoff window is short, so a
+      // Drive that will never answer wedged this session with /archive:status
+      // showing nothing wrong. After enough attempts it becomes a fault with a
+      // name and a remediation.
+      if (args.job.attempts >= UNKNOWN_CHECKSUM_LIMIT) {
+        throw new FatalError(
+          `Drive has never reported a checksum for the existing ${args.name}`,
+          "Check that file in Drive: if it is not this session's bundle, move it to " +
+            'the wastebasket and run /archive:now.',
+        );
+      }
       throw new RetryableError(
         `Drive has not reported a checksum for the existing ${args.name}; leaving it alone`,
       );
