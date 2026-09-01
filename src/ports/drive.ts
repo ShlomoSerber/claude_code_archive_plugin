@@ -25,6 +25,8 @@ export type RemoteFile = {
    */
   /** null when Drive did not say, which is never read as "not trashed". */
   trashed: boolean | null;
+  /** What the uploader stamped on the file, including its own sha256. */
+  appProperties?: Record<string, string>;
 };
 
 export type UploadProgress = {

@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  projectCleanupSettings,
   readCleanupPeriodDays,
   readSettings,
   setCleanupPeriodDays,
@@ -271,5 +272,25 @@ describe('the catalog file', () => {
     db.exec('CREATE TABLE t (a INTEGER)');
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     db.close();
+  });
+});
+
+describe('cleanupPeriodDays in another project', () => {
+  it('is found, not only the one you happen to be standing in', async () => {
+    // Project settings outrank the user file this plugin writes. Checking only
+    // process.cwd() meant Claude Code kept deleting another project's
+    // transcripts while /archive:status said the plugin owned deletion.
+    const projectA = tempDir();
+    const projectB = tempDir();
+    fs.mkdirSync(path.join(projectB, '.claude'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectB, '.claude', 'settings.json'),
+      JSON.stringify({ cleanupPeriodDays: 30 }),
+    );
+
+    const found = await projectCleanupSettings([projectA, projectB]);
+    assert.equal(found.length, 1);
+    assert.equal(found[0]?.value, 30);
+    assert.match(found[0]?.file ?? '', /settings\.json$/);
   });
 });

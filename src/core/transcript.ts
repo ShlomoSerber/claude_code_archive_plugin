@@ -57,6 +57,7 @@ export function createExtractor(): Extractor {
   let messageCount = 0;
   let malformedLines = 0;
   const prompts: ExtractedPrompt[] = [];
+  let nextPromptSeq = 0;
   const files = new Set<string>();
 
   const noteTimestamp = (record: Record_): void => {
@@ -124,8 +125,13 @@ export function createExtractor(): Extractor {
       // the cap: a long session's *later* prompts are the ones a person
       // remembers, and keeping only the first N made them unsearchable.
       if (prompts.length >= MAX_PROMPTS) prompts.splice(KEEP_FIRST_PROMPTS, 1);
+      // A counter, not the array length. The splice above makes the length go
+      // back down, so deriving seq from it handed every prompt past the cap
+      // the same number — and (session_id, seq) is the prompts primary key, so
+      // the insert threw and that session could never be archived again while
+      // /archive:status still called it verified.
       prompts.push({
-        seq: prompts.length,
+        seq: nextPromptSeq++,
         ts: parseTimestamp(record['timestamp']),
         text: text.slice(0, MAX_PROMPT_CHARS),
       });

@@ -108,6 +108,37 @@ export function competingSettingsPaths(claudeDir: string, cwd = process.cwd()): 
   ];
 }
 
+/**
+ * The same check, for every project the catalog has ever seen.
+ *
+ * Project settings outrank the user file this plugin writes, and the check
+ * only looked at the project you happened to run the command from — so a
+ * cleanupPeriodDays in any other project left Claude Code's own reaper
+ * deleting that project's transcripts while /archive:status said the plugin
+ * owned deletion. Advisory rather than fatal: it is one project's problem, and
+ * refusing to run everywhere because of it would help nobody.
+ */
+export async function projectCleanupSettings(
+  projectDirs: readonly string[],
+): Promise<{ file: string; value: number }[]> {
+  const found: { file: string; value: number }[] = [];
+  for (const dir of projectDirs) {
+    for (const name of ['settings.json', 'settings.local.json']) {
+      const file = path.join(dir, '.claude', name);
+      let read: SettingsRead;
+      try {
+        read = await readSettings(file);
+      } catch {
+        continue;
+      }
+      if (read.status !== 'ok') continue;
+      const value = read.settings['cleanupPeriodDays'];
+      if (typeof value === 'number') found.push({ file, value });
+    }
+  }
+  return found;
+}
+
 export async function competingCleanupSettings(
   claudeDir: string,
   cwd = process.cwd(),

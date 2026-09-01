@@ -240,13 +240,11 @@ export function importCatalogFile(runtime: Runtime, file: string): number {
     // could not be proved to contain — so it holds data nothing else holds.
     // The table travels inside the catalog copy; only this import ignored it,
     // which left a replacement machine with no way to name or fetch them.
-    const selectRetained = available.has('session_id')
-      ? tryPrepare(
-          source,
-          `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
-             FROM retained_bundles WHERE session_id = ?`,
-        )
-      : null;
+    const selectRetained = tryPrepare(
+      source,
+      `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
+         FROM retained_bundles WHERE session_id = ?`,
+    );
 
     for (const row of rows) {
       const record = toRecord(row);

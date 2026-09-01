@@ -986,7 +986,7 @@ import { pipeline } from "node:stream/promises";
 var API = "https://www.googleapis.com/drive/v3";
 var UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
-var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed";
+var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed,appProperties";
 var CHUNK_SIZE = 8 * 1024 * 1024;
 var CHUNK_ALIGNMENT = 256 * 1024;
 function createDriveTransport(deps) {
@@ -1341,7 +1341,8 @@ function toRemoteFile(value) {
     md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
     // Unknown, not false: false is the direction that would let the reaper
     // authorise a deletion against a file in the wastebasket.
-    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null
+    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null,
+    appProperties: asStringRecord(record["appProperties"])
   };
 }
 function asNumber(value) {
@@ -1349,6 +1350,14 @@ function asNumber(value) {
   if (typeof value !== "string") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+function asStringRecord(value) {
+  if (typeof value !== "object" || value === null) return {};
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string") out[key] = entry;
+  }
+  return out;
 }
 function isRateLimited(body) {
   const text = JSON.stringify(body ?? "");

@@ -187,7 +187,10 @@ export function replacePrompts(db: Db, sessionId: string, prompts: ExtractedProm
   inTransaction(db, () => {
     db.prepare('DELETE FROM prompts WHERE session_id = ?').run(sessionId);
     const insert = db.prepare(
-      'INSERT INTO prompts (session_id, seq, ts, text) VALUES (?, ?, ?, ?)',
+      // OR REPLACE: an extractor that ever hands back two prompts with the
+      // same seq should lose one line of index, not the session's whole
+      // backup.
+      'INSERT OR REPLACE INTO prompts (session_id, seq, ts, text) VALUES (?, ?, ?, ?)',
     );
     for (const prompt of prompts) {
       insert.run(sessionId, prompt.seq, prompt.ts, prompt.text);

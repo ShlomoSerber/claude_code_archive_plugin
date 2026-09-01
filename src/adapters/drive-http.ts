@@ -27,7 +27,7 @@ import { REAUTH_REMEDIATION, type AuthProvider } from './google-auth.ts';
 const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const FILE_FIELDS = 'id,name,size,sha256Checksum,md5Checksum,trashed';
+const FILE_FIELDS = 'id,name,size,sha256Checksum,md5Checksum,trashed,appProperties';
 
 /** Drive wants chunks in multiples of 256 KiB; 8 MiB balances retries and calls. */
 export const CHUNK_SIZE = 8 * 1024 * 1024;
@@ -468,6 +468,7 @@ export function toRemoteFile(value: unknown): RemoteFile {
     // Unknown, not false: false is the direction that would let the reaper
     // authorise a deletion against a file in the wastebasket.
     trashed: typeof record['trashed'] === 'boolean' ? record['trashed'] : null,
+    appProperties: asStringRecord(record['appProperties']),
   };
 }
 
@@ -477,6 +478,16 @@ function asNumber(value: unknown): number | null {
   if (typeof value !== 'string') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** appProperties as Drive returns it: a flat string map, or nothing. */
+function asStringRecord(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null) return {};
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === 'string') out[key] = entry;
+  }
+  return out;
 }
 
 function isRateLimited(body: unknown): boolean {

@@ -2,7 +2,11 @@ import { catalogStats, listRetainedBundles } from '../core/catalog.ts';
 import { countJobs, listJobs } from '../core/queue.ts';
 import { kvGet, kvGetNumber } from '../adapters/db.ts';
 import { KV } from '../core/state-keys.ts';
-import { competingCleanupSettings, readCleanupPeriodDays } from '../adapters/claude-settings.ts';
+import {
+  competingCleanupSettings,
+  projectCleanupSettings,
+  readCleanupPeriodDays,
+} from '../adapters/claude-settings.ts';
 import { CLEANUP_PERIOD_DAYS, DAY_MS } from '../core/config.ts';
 import { readStatusFile } from '../worker/status.ts';
 import fsp from 'node:fs/promises';
@@ -30,6 +34,17 @@ async function readHookError(dataDir: string, file: string): Promise<string | nu
   }
 }
 
+/** Every project the catalog knows, newest first, capped so status stays fast. */
+function knownProjectDirs(db: ReturnType<Runtime['db']>): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT project_cwd FROM sessions
+        WHERE project_cwd IS NOT NULL ORDER BY updated_at DESC LIMIT 100`,
+    )
+    .all() as { project_cwd: string }[];
+  return rows.map((row) => row.project_cwd);
+}
+
 export async function runStatus(
   runtime: Runtime,
   options: { json?: boolean; quota?: boolean },
@@ -43,6 +58,7 @@ export async function runStatus(
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  const competingProjects = await projectCleanupSettings(knownProjectDirs(db));
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
@@ -63,7 +79,9 @@ export async function runStatus(
     .join('; ');
   // A sweep that throws leaves lastSweepAt unwritten. Without this the page is
   // clean while nothing has ever been archived.
-  const sweepNeverRan = stats.sessions > 0 && lastSweepAt === null;
+  // pendingBackup, not sessions: /archive:setup --skip-backfill imports rows
+  // from Drive without sweeping, and there is nothing wrong with that.
+  const sweepNeverRan = stats.pendingBackup > 0 && lastSweepAt === null;
   const sweepStale =
     lastSweepAt !== null && stats.pendingBackup > 0 && now - lastSweepAt > 3 * DAY_MS;
   const retained = listRetainedBundles(db);
@@ -91,6 +109,7 @@ export async function runStatus(
       config: runtime.config,
       cleanupPeriodDays,
       competingCleanupSettings: competing,
+      competingProjectSettings: competingProjects,
       unarchivable: skipped,
       unreadable,
       unconfirmable,
@@ -157,6 +176,10 @@ export async function runStatus(
     print(
       `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`,
     );
+  }
+  for (const other of competingProjects) {
+    print(`  WARNING:            ${other.file} sets cleanupPeriodDays=${String(other.value)}`);
+    print(`                      Claude Code still deletes that project's transcripts.`);
   }
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);

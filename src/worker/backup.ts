@@ -150,13 +150,26 @@ async function indexSession(
     // An extraction that found nothing is not evidence there is nothing: a
     // format change makes every line unparseable, and replacing a good index
     // with an empty one loses the session in search while it sits on Drive.
-    if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
-      replacePrompts(ctx.db, session.sessionId, summary.prompts);
+    // Wrapped, like the extraction itself. SPEC invariant 2 says the archive
+    // does not depend on parsing succeeding, and a failure here used to
+    // propagate out of the whole backup — the session was then never archived
+    // again, while the row still said verified because the throw came before
+    // anything withdrew it.
+    try {
+      if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+        replacePrompts(ctx.db, session.sessionId, summary.prompts);
+      }
+    } catch (err) {
+      log.warn('catalog.prompts_failed', {}, err);
     }
     // Same reasoning for the file list: a format change that yields nothing is
     // not a session that touched nothing.
-    if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
-      replaceFiles(ctx.db, session.sessionId, summary.files);
+    try {
+      if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
+        replaceFiles(ctx.db, session.sessionId, summary.files);
+      }
+    } catch (err) {
+      log.warn('catalog.files_failed', {}, err);
     }
     if (summary.malformedLines > 0) {
       log.warn('catalog.malformed_lines', { count: summary.malformedLines });
@@ -404,11 +417,16 @@ async function publish(
   // contains the old one — not merely that it is bigger. Three integer
   // comparisons let one sidecar file be swapped for a larger one, and the
   // archived subagent transcript then existed nowhere.
-  if (contains !== null && supersededId !== null && supersededId !== remote.id) {
+  const retiring = supersededId !== null && supersededId !== remote.id && sameProject;
+  // Every bundle left behind, not only the ones containment refused: a session
+  // that moved project keeps its old bundle too, and that one had no row
+  // either, so nothing pointed at it.
+  if (supersededId !== null && supersededId !== remote.id && (contains !== null || !sameProject)) {
+    const reason = contains ?? 'the session moved to another project directory';
     ctx.logger.warn('backup.superseded_kept', {
       session_id: session.sessionId,
       file_id: supersededId,
-      reason: contains,
+      reason,
     });
     // remote_file_id has already moved to the replacement, so without this row
     // the kept bundle is unreferenced: its unique contents survive on Drive but
@@ -421,12 +439,12 @@ async function publish(
         remotePath: previous?.remotePath ?? null,
         bundleSha256: previous?.verifiedBundleSha256 ?? null,
         manifest: previous?.verifiedManifest ?? null,
-        reason: contains,
+        reason,
       },
       ctx.clock.now(),
     );
   }
-  if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
+  if (retiring && contains === null) {
     try {
       // Trashed, not deleted. This bundle was a good archive a moment ago, and
       // every chain that has destroyed data in this codebase ended with a

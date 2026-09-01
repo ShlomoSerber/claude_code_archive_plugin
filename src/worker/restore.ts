@@ -130,11 +130,18 @@ export async function restoreRetainedBundle(
   };
 }
 
-/** The sha256 the uploader stamped on the file, when the catalog lacks one. */
+/**
+ * The sha256 the uploader stamped into appProperties, when the catalog has none.
+ *
+ * Drive's own checksum would only prove the download arrived intact; this one
+ * was written by the process that built the bundle, so it also says the bytes
+ * are the bytes that were archived.
+ */
 async function stampedSha256(ctx: WorkerContext, fileId: string): Promise<string | null> {
   try {
     const remote = await ctx.drive.getFile(fileId, ctx.signal);
-    return remote.sha256;
+    const stamped = remote.appProperties?.['sha256'];
+    return typeof stamped === 'string' && /^[0-9a-f]{64}$/.test(stamped) ? stamped : null;
   } catch {
     return null;
   }

@@ -232,3 +232,26 @@ describe('a session with more prompts than the cap', () => {
     );
   });
 });
+
+describe('the sequence numbers a long session produces', () => {
+  it('never repeats one, however far past the cap it runs', () => {
+    // seq used to be derived from the array length, which the cap's splice
+    // makes go back down — so every prompt past 1 000 got the same number,
+    // (session_id, seq) is the prompts primary key, and the insert threw.
+    // The session could then never be archived again while the catalog still
+    // reported it verified.
+    const extractor = createExtractor();
+    for (let index = 0; index < MAX_PROMPTS + 300; index++) {
+      extractor.pushLine(
+        JSON.stringify({
+          type: 'user',
+          userType: 'external',
+          message: { role: 'user', content: `prompt ${String(index)}` },
+        }),
+      );
+    }
+    const prompts = extractor.finish().prompts;
+    assert.equal(prompts.length, MAX_PROMPTS);
+    assert.equal(new Set(prompts.map((prompt) => prompt.seq)).size, MAX_PROMPTS, 'all distinct');
+  });
+});

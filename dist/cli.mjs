@@ -1303,7 +1303,7 @@ import { pipeline } from "node:stream/promises";
 var API = "https://www.googleapis.com/drive/v3";
 var UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 var FOLDER_MIME = "application/vnd.google-apps.folder";
-var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed";
+var FILE_FIELDS = "id,name,size,sha256Checksum,md5Checksum,trashed,appProperties";
 var CHUNK_SIZE = 8 * 1024 * 1024;
 var CHUNK_ALIGNMENT = 256 * 1024;
 function createDriveTransport(deps) {
@@ -1662,7 +1662,8 @@ function toRemoteFile(value) {
     md5: typeof record["md5Checksum"] === "string" ? record["md5Checksum"] : null,
     // Unknown, not false: false is the direction that would let the reaper
     // authorise a deletion against a file in the wastebasket.
-    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null
+    trashed: typeof record["trashed"] === "boolean" ? record["trashed"] : null,
+    appProperties: asStringRecord(record["appProperties"])
   };
 }
 function asNumber(value) {
@@ -1670,6 +1671,14 @@ function asNumber(value) {
   if (typeof value !== "string") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+function asStringRecord(value) {
+  if (typeof value !== "object" || value === null) return {};
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string") out[key] = entry;
+  }
+  return out;
 }
 function isRateLimited(body) {
   const text = JSON.stringify(body ?? "");
@@ -2371,7 +2380,10 @@ function replacePrompts(db, sessionId, prompts) {
   inTransaction(db, () => {
     db.prepare("DELETE FROM prompts WHERE session_id = ?").run(sessionId);
     const insert = db.prepare(
-      "INSERT INTO prompts (session_id, seq, ts, text) VALUES (?, ?, ?, ?)"
+      // OR REPLACE: an extractor that ever hands back two prompts with the
+      // same seq should lose one line of index, not the session's whole
+      // backup.
+      "INSERT OR REPLACE INTO prompts (session_id, seq, ts, text) VALUES (?, ?, ?, ?)"
     );
     for (const prompt of prompts) {
       insert.run(sessionId, prompt.seq, prompt.ts, prompt.text);
@@ -6006,6 +6018,7 @@ function createExtractor() {
   let messageCount = 0;
   let malformedLines = 0;
   const prompts = [];
+  let nextPromptSeq = 0;
   const files = /* @__PURE__ */ new Set();
   const noteTimestamp = (record) => {
     const ts2 = parseTimestamp(record["timestamp"]);
@@ -6060,7 +6073,7 @@ function createExtractor() {
       if (text === null) return;
       if (prompts.length >= MAX_PROMPTS) prompts.splice(KEEP_FIRST_PROMPTS, 1);
       prompts.push({
-        seq: prompts.length,
+        seq: nextPromptSeq++,
         ts: parseTimestamp(record["timestamp"]),
         text: text.slice(0, MAX_PROMPT_CHARS)
       });
@@ -6491,11 +6504,19 @@ async function indexSession(ctx, session, previous, now) {
     });
   }
   if (summary !== null && !shrunk) {
-    if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
-      replacePrompts(ctx.db, session.sessionId, summary.prompts);
+    try {
+      if (summary.prompts.length > 0 || countPrompts(ctx.db, session.sessionId) === 0) {
+        replacePrompts(ctx.db, session.sessionId, summary.prompts);
+      }
+    } catch (err) {
+      log.warn("catalog.prompts_failed", {}, err);
     }
-    if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
-      replaceFiles(ctx.db, session.sessionId, summary.files);
+    try {
+      if (summary.files.length > 0 || countSessionFiles(ctx.db, session.sessionId) === 0) {
+        replaceFiles(ctx.db, session.sessionId, summary.files);
+      }
+    } catch (err) {
+      log.warn("catalog.files_failed", {}, err);
     }
     if (summary.malformedLines > 0) {
       log.warn("catalog.malformed_lines", { count: summary.malformedLines });
@@ -6647,11 +6668,13 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     ctx.clock.now()
   );
   const sameProject = previous?.encodedDir === session.encodedDir;
-  if (contains !== null && supersededId !== null && supersededId !== remote.id) {
+  const retiring = supersededId !== null && supersededId !== remote.id && sameProject;
+  if (supersededId !== null && supersededId !== remote.id && (contains !== null || !sameProject)) {
+    const reason = contains ?? "the session moved to another project directory";
     ctx.logger.warn("backup.superseded_kept", {
       session_id: session.sessionId,
       file_id: supersededId,
-      reason: contains
+      reason
     });
     recordRetainedBundle(
       ctx.db,
@@ -6661,12 +6684,12 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
         remotePath: previous?.remotePath ?? null,
         bundleSha256: previous?.verifiedBundleSha256 ?? null,
         manifest: previous?.verifiedManifest ?? null,
-        reason: contains
+        reason
       },
       ctx.clock.now()
     );
   }
-  if (supersededId !== null && supersededId !== remote.id && sameProject && contains === null) {
+  if (retiring && contains === null) {
     try {
       await ctx.drive.trashFile(supersededId, ctx.signal);
     } catch (err) {
@@ -7893,7 +7916,8 @@ async function restoreRetainedBundle(ctx, fileId) {
 async function stampedSha256(ctx, fileId) {
   try {
     const remote = await ctx.drive.getFile(fileId, ctx.signal);
-    return remote.sha256;
+    const stamped = remote.appProperties?.["sha256"];
+    return typeof stamped === "string" && /^[0-9a-f]{64}$/.test(stamped) ? stamped : null;
   } catch {
     return null;
   }
@@ -8312,6 +8336,24 @@ function competingSettingsPaths(claudeDir, cwd = process.cwd()) {
     managed
   ];
 }
+async function projectCleanupSettings(projectDirs) {
+  const found = [];
+  for (const dir of projectDirs) {
+    for (const name of ["settings.json", "settings.local.json"]) {
+      const file = path17.join(dir, ".claude", name);
+      let read;
+      try {
+        read = await readSettings(file);
+      } catch {
+        continue;
+      }
+      if (read.status !== "ok") continue;
+      const value = read.settings["cleanupPeriodDays"];
+      if (typeof value === "number") found.push({ file, value });
+    }
+  }
+  return found;
+}
 async function competingCleanupSettings(claudeDir, cwd = process.cwd()) {
   const found = [];
   for (const file of competingSettingsPaths(claudeDir, cwd)) {
@@ -8500,11 +8542,11 @@ function importCatalogFile(runtime, file) {
     );
     const selectPrompts = source.prepare("SELECT seq, ts, text FROM prompts WHERE session_id = ?");
     const selectFiles = source.prepare("SELECT path FROM session_files WHERE session_id = ?");
-    const selectRetained = available.has("session_id") ? tryPrepare(
+    const selectRetained = tryPrepare(
       source,
       `SELECT session_id, file_id, remote_path, bundle_sha256, manifest, reason, created_at
-             FROM retained_bundles WHERE session_id = ?`
-    ) : null;
+         FROM retained_bundles WHERE session_id = ?`
+    );
     for (const row of rows) {
       const record = toRecord(row);
       if (!isSafeSessionId(record.sessionId) || !isSafeEncodedDir(record.encodedDir)) {
@@ -8575,6 +8617,13 @@ async function readHookError(dataDir, file) {
     return null;
   }
 }
+function knownProjectDirs(db) {
+  const rows = db.prepare(
+    `SELECT DISTINCT project_cwd FROM sessions
+        WHERE project_cwd IS NOT NULL ORDER BY updated_at DESC LIMIT 100`
+  ).all();
+  return rows.map((row) => row.project_cwd);
+}
 async function runStatus(runtime, options) {
   const db = runtime.db();
   const now = runtime.clock.now();
@@ -8585,6 +8634,7 @@ async function runStatus(runtime, options) {
   const circuitUntil = kvGetNumber(db, KV.circuitUntil) ?? null;
   const cleanupPeriodDays = await readCleanupPeriodDays(runtime.paths.settingsFile);
   const competing = await competingCleanupSettings(runtime.paths.claudeDir);
+  const competingProjects = await projectCleanupSettings(knownProjectDirs(db));
   const skipped = kvGetNumber(db, KV.skippedCount) ?? 0;
   const unreadable = kvGetNumber(db, KV.unreadableCount) ?? 0;
   const unconfirmable = kvGetNumber(db, KV.unconfirmableCount) ?? 0;
@@ -8597,7 +8647,7 @@ async function runStatus(runtime, options) {
     readHookError(runtime.paths.dataDir, "hook-error-end.json"),
     readHookError(runtime.paths.dataDir, "hook-error-start.json")
   ])).filter((entry) => entry !== null).join("; ");
-  const sweepNeverRan = stats.sessions > 0 && lastSweepAt === null;
+  const sweepNeverRan = stats.pendingBackup > 0 && lastSweepAt === null;
   const sweepStale = lastSweepAt !== null && stats.pendingBackup > 0 && now - lastSweepAt > 3 * DAY_MS;
   const retained = listRetainedBundles(db);
   const signedIn = await runtime.tokenStore.read().then((tokens) => tokens !== null).catch(() => false);
@@ -8618,6 +8668,7 @@ async function runStatus(runtime, options) {
       config: runtime.config,
       cleanupPeriodDays,
       competingCleanupSettings: competing,
+      competingProjectSettings: competingProjects,
       unarchivable: skipped,
       unreadable,
       unconfirmable,
@@ -8679,6 +8730,10 @@ async function runStatus(runtime, options) {
     print(
       `                      ${String(unreadable)} could not be read; the rest have unusable names. See the log.`
     );
+  }
+  for (const other of competingProjects) {
+    print(`  WARNING:            ${other.file} sets cleanupPeriodDays=${String(other.value)}`);
+    print(`                      Claude Code still deletes that project's transcripts.`);
   }
   for (const other of competing) {
     print(`  WARNING:            ${other.file} also sets cleanupPeriodDays=${String(other.value)}`);

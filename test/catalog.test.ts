@@ -379,3 +379,20 @@ describe('catalogStats', () => {
     assert.equal(stats.archivedBytes, 120);
   });
 });
+
+describe('writing the prompts of a session past the cap', () => {
+  it('stores them without a primary-key collision', () => {
+    const db = freshDb();
+    upsertSession(db, { ...BASE, sessionId: 'long' }, 1);
+    const prompts = Array.from({ length: 1_200 }, (_, index) => ({
+      seq: index,
+      ts: null,
+      text: `prompt ${String(index)}`,
+    }));
+    replacePrompts(db, 'long', prompts);
+    const row = db
+      .prepare('SELECT count(*) AS n FROM prompts WHERE session_id = ?')
+      .get('long') as { n: number };
+    assert.equal(row.n, 1_200);
+  });
+});
