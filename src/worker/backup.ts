@@ -212,6 +212,44 @@ type StagedBundle = {
   year: string;
 };
 
+/**
+ * Say what actually happened when tar or zstd fails on a moving file.
+ *
+ * A session being written while it is packed produces a bundle that ends
+ * before its own end marker, and node-tar reports that as "did not encounter
+ * expected EOF" — which tells the user nothing, and looks like corruption
+ * rather than the ordinary consequence of archiving a conversation that is
+ * still going. The archive is untouched either way; the next attempt after the
+ * session closes succeeds.
+ */
+export async function bundleOrExplain<T>(
+  ctx: WorkerContext,
+  session: LocalSession,
+  work: () => Promise<T>,
+): Promise<T> {
+  const before = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+  try {
+    return await work();
+  } catch (err) {
+    if (err instanceof FatalError || err instanceof RetryableError) throw err;
+    const after = await statSession(ctx.paths, session.encodedDir, session.sessionId);
+    const moved =
+      before === null ||
+      after === null ||
+      after.transcriptBytes !== before.transcriptBytes ||
+      after.sidecarBytes !== before.sidecarBytes ||
+      Math.trunc(after.mtimeMs) !== Math.trunc(before.mtimeMs);
+    const detail = err instanceof Error ? err.message : 'unknown error';
+    throw new RetryableError(
+      moved
+        ? 'the session was written to while it was being archived; it will be archived ' +
+            `when it next closes (${detail})`
+        : `the bundle could not be built or read back: ${detail}`,
+      { cause: err },
+    );
+  }
+}
+
 async function buildBundle(
   ctx: WorkerContext,
   session: LocalSession,
@@ -230,13 +268,15 @@ async function buildBundle(
   // the bytes that actually get written, which is not known until then.
   const outputPath = path.join(ctx.paths.stagingDir, `${session.sessionId}.building.tar.zst`);
 
-  const result = await createBundle({
-    cwd: path.dirname(session.transcriptPath),
-    entries: bundleEntries(session),
-    outputPath,
-    compressionLevel: ctx.config.zstdLevel,
-    ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
-  });
+  const result = await bundleOrExplain(ctx, session, () =>
+    createBundle({
+      cwd: path.dirname(session.transcriptPath),
+      entries: bundleEntries(session),
+      outputPath,
+      compressionLevel: ctx.config.zstdLevel,
+      ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+    }),
+  );
 
   const name = `${bundleBaseName({
     date,
@@ -296,7 +336,9 @@ async function publish(
     entries: bundleEntries(session),
     ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
   });
-  const contentProblem = await verifyBundleContents(bundle.path, files);
+  const contentProblem = await bundleOrExplain(ctx, session, () =>
+    verifyBundleContents(bundle.path, files),
+  );
   if (contentProblem !== null) {
     throw new RetryableError(`the bundle does not match the session on disk: ${contentProblem}`);
   }

@@ -1590,7 +1590,7 @@ function trimmed(value) {
 }
 
 // src/version.ts
-var ARCHIVER_VERSION = "0.1.1";
+var ARCHIVER_VERSION = "0.1.2";
 
 // src/composition.ts
 async function createRuntime(options = {}) {

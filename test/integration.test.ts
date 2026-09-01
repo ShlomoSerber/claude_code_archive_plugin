@@ -49,6 +49,8 @@ import {
   verifyRetained,
 } from '../src/worker/restore.ts';
 import { reapLocalCopies } from '../src/worker/reap.ts';
+import { bundleOrExplain } from '../src/worker/backup.ts';
+import { statSession } from '../src/adapters/session-scan.ts';
 import type { WorkerContext } from '../src/worker/context.ts';
 import { nullLogger } from '../src/ports/logger.ts';
 import {
@@ -3276,5 +3278,47 @@ describe('the same session id under two project directories', () => {
       );
     }
     assert.equal(listRetainedBundles(harness.ctx.db).length, 0, 'and nothing is left behind');
+  });
+});
+
+describe('archiving a session that is still being written', () => {
+  it('says so, instead of reporting a tar error', async () => {
+    // A live conversation grows while it is packed, so the bundle ends before
+    // its own end marker and node-tar reports "did not encounter expected
+    // EOF". That reads as corruption; it is the ordinary consequence of
+    // archiving a session that is still going, and it clears itself when the
+    // session closes.
+    const harness = makeHarness();
+    const session = await statSession(harness.ctx.paths, ENCODED, SESSION_A);
+    assert.ok(session);
+
+    const thrown = await bundleOrExplain(harness.ctx, session, async () => {
+      fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+      await Promise.resolve();
+      throw new Error('did not encounter expected EOF');
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    assert.ok(thrown instanceof RetryableError, 'retryable, not a fault to park');
+    assert.match(thrown.message, /written to while it was being archived/);
+    assert.match(thrown.message, /when it next closes/);
+  });
+
+  it('does not blame the session when nothing moved', async () => {
+    const harness = makeHarness();
+    const session = await statSession(harness.ctx.paths, ENCODED, SESSION_A);
+    assert.ok(session);
+
+    const thrown = await bundleOrExplain(harness.ctx, session, () => {
+      throw new Error('zstd: unexpected end of stream');
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    assert.ok(thrown instanceof RetryableError);
+    assert.match(thrown.message, /could not be built or read back/);
   });
 });

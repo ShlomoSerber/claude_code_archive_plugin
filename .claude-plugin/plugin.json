@@ -1,7 +1,7 @@
 {
   "name": "archive",
   "displayName": "Claude Code Archive",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Keeps every Claude Code session forever in Google Drive while your disk holds only the recent ones. Sessions are backed up when they close, hash-verified, searchable in natural language offline, and restorable on any machine.",
   "author": {
     "name": "Shlomo Serber"
