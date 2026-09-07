@@ -164,6 +164,14 @@ function makeHarness(overrides: Partial<ArchiveConfig> = {}, drive = new FakeDri
   };
 }
 
+/** The manifests still on Drive, excluding anything in the wastebasket. */
+function manifestNames(harness: Harness): string[] {
+  return [...harness.drive.files.values()]
+    .filter((file) => !harness.drive.trashedIds.has(file.id))
+    .map((file) => file.name)
+    .filter((name) => name.endsWith('.manifest.json'));
+}
+
 describe('a full sweep', () => {
   it('discovers, archives and verifies every local session', async () => {
     const harness = makeHarness();
@@ -936,6 +944,61 @@ describe('deletion safety, fourth pass', () => {
     // recoverable for the thirty days Drive keeps its wastebasket.
     assert.equal(harness.drive.trashedIds.has(original), true, 'the old one was retired after');
     assert.equal(harness.drive.files.has(original), true, 'and is still recoverable');
+  });
+
+  it('retires the superseded manifest along with its bundle', async () => {
+    // A bundle's name embeds the hash of its contents, so re-archiving writes a
+    // new manifest beside the old one instead of over it. Leaving the old one
+    // behind put a dead manifest on Drive for every re-upload, for ever.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+    const before = manifestNames(harness);
+    assert.equal(before.length, 2);
+
+    fs.appendFileSync(harness.transcriptOf(SESSION_A), '{"type":"user"}\n');
+    const touched = new Date(Date.now() + 5_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_A), touched, touched);
+    harness.clock.advance(60_000);
+    await runSweep(harness.ctx);
+
+    const after = manifestNames(harness);
+    assert.equal(after.length, 2, 'one manifest per bundle, not one per upload');
+    const bundles = [...harness.drive.files.values()]
+      .filter((file) => !harness.drive.trashedIds.has(file.id) && file.name.endsWith('.tar.zst'))
+      .map((file) => file.name.replace(/\.tar\.zst$/, ''))
+      .sort();
+    assert.deepEqual(
+      after.map((name) => name.replace(/\.manifest\.json$/, '')).sort(),
+      bundles,
+      'every surviving manifest names a bundle that is still there',
+    );
+  });
+
+  it('keeps the manifest of a bundle it refused to retire', async () => {
+    // The kept bundle is the only copy of what it holds, and /archive:status
+    // points the user at it. Removing the manifest that describes it would take
+    // away the one plain file on Drive that says what is inside.
+    const harness = makeHarness();
+    await runSweep(harness.ctx);
+
+    // Rewrite a sidecar file, so the replacement is not a superset of the
+    // bundle it supersedes and containment refuses to retire it.
+    const sidecar = path.join(harness.projectDir, SESSION_B, 'tool-result.json');
+    fs.writeFileSync(sidecar, '{"stdout":"something else entirely"}');
+    const touched = new Date(harness.clock.now() + 60_000);
+    fs.utimesSync(harness.transcriptOf(SESSION_B), touched, touched);
+    harness.clock.advance(120_000);
+    await runSweep(harness.ctx);
+
+    const kept = listRetainedBundles(harness.ctx.db);
+    assert.equal(kept.length, 1, 'the bundle with unique contents was kept');
+    const keptId = kept[0]?.fileId ?? '';
+    assert.equal(harness.drive.trashedIds.has(keptId), false, 'and was not trashed');
+    const keptName = harness.drive.files.get(keptId)?.name ?? '';
+    assert.ok(
+      manifestNames(harness).includes(`${keptName.replace(/\.tar\.zst$/, '')}.manifest.json`),
+      'its manifest was kept too',
+    );
   });
 
   it('refuses to archive over a good copy when the session has shrunk', async () => {

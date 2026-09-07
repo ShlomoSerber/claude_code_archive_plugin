@@ -1869,7 +1869,7 @@ function reapCutoff(now, retentionDays) {
 }
 
 // src/version.ts
-var ARCHIVER_VERSION = "0.1.2";
+var ARCHIVER_VERSION = "0.1.3";
 
 // src/composition.ts
 async function createRuntime(options = {}) {
@@ -6426,6 +6426,7 @@ function matchesLocal(remote, args) {
 }
 
 // src/worker/backup.ts
+var BUNDLE_SUFFIX = ".tar.zst";
 async function backupSession(ctx, job, args) {
   const log = ctx.logger.child({ session_id: args.sessionId });
   const session = await statSession(ctx.paths, args.encodedDir, args.sessionId);
@@ -6647,7 +6648,7 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     compressionLevel: ctx.config.zstdLevel,
     files
   });
-  const manifestName = `${bundle.name.replace(/\.tar\.zst$/, "")}.manifest.json`;
+  const manifestName = `${bundle.name.slice(0, -BUNDLE_SUFFIX.length)}.manifest.json`;
   const existingManifest = await ctx.drive.findFile({ name: manifestName, parentId }, ctx.signal);
   await ctx.drive.uploadSmallFile(
     {
@@ -6714,8 +6715,31 @@ async function publish(ctx, job, session, bundle, index, previous, now) {
     } catch (err) {
       ctx.logger.warn("backup.superseded_cleanup_failed", { file_id: supersededId }, err);
     }
+    await trashSupersededManifest(ctx, session.sessionId, previous, manifestName);
   }
   return remote;
+}
+async function trashSupersededManifest(ctx, sessionId, previous, currentManifestName) {
+  const remotePath = previous?.remotePath ?? null;
+  if (remotePath === null) return;
+  const segments = remotePath.split("/").filter((segment) => segment.length > 0);
+  const bundleName = segments.pop();
+  if (!bundleName?.endsWith(BUNDLE_SUFFIX)) return;
+  if (segments.length === 0) return;
+  const staleName = `${bundleName.slice(0, -BUNDLE_SUFFIX.length)}.manifest.json`;
+  if (staleName === currentManifestName) return;
+  try {
+    const parentId = await ctx.drive.ensureFolder(segments, ctx.signal);
+    const stale = await ctx.drive.findFile({ name: staleName, parentId }, ctx.signal);
+    if (stale === null) return;
+    await ctx.drive.trashFile(stale.id, ctx.signal);
+    ctx.logger.info("backup.superseded_manifest_retired", {
+      session_id: sessionId,
+      file_id: stale.id
+    });
+  } catch (err) {
+    ctx.logger.warn("backup.superseded_manifest_failed", { session_id: sessionId }, err);
+  }
 }
 async function verifyRemote(ctx, sessionId, uploaded, bundle) {
   let meta = await ctx.drive.getFile(uploaded.id, ctx.signal);

@@ -166,12 +166,17 @@ are enough:
 
 ```
 ClaudeArchive/
-  catalog.sqlite
+  catalog-9f3ac71e.sqlite
   -home-you-project/
     2026/
-      2026-08-31_fix-auth-redirect_1a2b3c4d.tar.zst
-      2026-08-31_fix-auth-redirect_1a2b3c4d.manifest.json
+      2026-08-31_fix-auth-redirect_1a2b3c4d_7e04b9f2.tar.zst
+      2026-08-31_fix-auth-redirect_1a2b3c4d_7e04b9f2.manifest.json
 ```
+
+The catalog copy is named after the machine that wrote it, so two computers
+sharing one Drive do not overwrite each other. The last part of a bundle's name
+is a prefix of its sha256: the name follows the content, so a re-archived
+session is uploaded as a new file before the one it replaces is retired.
 
 Each manifest names the session, its original working directory, and the sha256
 of every file inside the bundle.

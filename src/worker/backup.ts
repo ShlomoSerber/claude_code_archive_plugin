@@ -25,6 +25,9 @@ import type { SessionRecord } from '../core/catalog.ts';
 import type { WorkerContext } from './context.ts';
 import { uploadWithResume } from './upload.ts';
 
+/** What a bundle's name ends in, and what a manifest's name replaces. */
+const BUNDLE_SUFFIX = '.tar.zst';
+
 /**
  * One session, from disk to verified on Drive (SPEC §1).
  *
@@ -427,7 +430,7 @@ async function publish(
     compressionLevel: ctx.config.zstdLevel,
     files,
   });
-  const manifestName = `${bundle.name.replace(/\.tar\.zst$/, '')}.manifest.json`;
+  const manifestName = `${bundle.name.slice(0, -BUNDLE_SUFFIX.length)}.manifest.json`;
   const existingManifest = await ctx.drive.findFile({ name: manifestName, parentId }, ctx.signal);
   await ctx.drive.uploadSmallFile(
     {
@@ -519,8 +522,59 @@ async function publish(
     } catch (err) {
       ctx.logger.warn('backup.superseded_cleanup_failed', { file_id: supersededId }, err);
     }
+    await trashSupersededManifest(ctx, session.sessionId, previous, manifestName);
   }
   return remote;
+}
+
+/**
+ * The manifest that described the bundle just retired.
+ *
+ * A bundle's name embeds the hash of its contents, so re-archiving a resumed
+ * session produces a new name, and with it a new manifest beside the old one.
+ * The bundle above is trashed; before this, its manifest was not. That left one
+ * dead manifest per re-upload, for ever, each pointing at a bundle that no
+ * longer exists — 107 of them after a week of ordinary use, and the Drive
+ * folder of an active project is meant to be readable by a person (SPEC §8).
+ *
+ * Only reached when the bundle itself was retired, so a manifest is never
+ * removed while the bundle it describes is still on Drive.
+ */
+async function trashSupersededManifest(
+  ctx: WorkerContext,
+  sessionId: string,
+  previous: SessionRecord | null,
+  currentManifestName: string,
+): Promise<void> {
+  const remotePath = previous?.remotePath ?? null;
+  if (remotePath === null) return;
+  const segments = remotePath.split('/').filter((segment) => segment.length > 0);
+  const bundleName = segments.pop();
+  // A path we cannot read is not a licence to guess at what to delete.
+  if (!bundleName?.endsWith(BUNDLE_SUFFIX)) return;
+  if (segments.length === 0) return;
+  const staleName = `${bundleName.slice(0, -BUNDLE_SUFFIX.length)}.manifest.json`;
+  // The replacement bundle kept the old name, so the manifest upload above
+  // already rewrote this exact file in place. Nothing is stale.
+  if (staleName === currentManifestName) return;
+  try {
+    // The chain resolves to the folder the retired bundle was in, which exists
+    // because the bundle was in it a moment ago. ensureFolder only creates when
+    // a segment is missing, and a missing segment means the manifest is gone too.
+    const parentId = await ctx.drive.ensureFolder(segments, ctx.signal);
+    const stale = await ctx.drive.findFile({ name: staleName, parentId }, ctx.signal);
+    if (stale === null) return;
+    await ctx.drive.trashFile(stale.id, ctx.signal);
+    ctx.logger.info('backup.superseded_manifest_retired', {
+      session_id: sessionId,
+      file_id: stale.id,
+    });
+  } catch (err) {
+    // The backup itself has already succeeded and been recorded. A manifest
+    // left behind is untidy; failing the job over it would re-upload a whole
+    // session to fix a metadata file.
+    ctx.logger.warn('backup.superseded_manifest_failed', { session_id: sessionId }, err);
+  }
 }
 
 /**

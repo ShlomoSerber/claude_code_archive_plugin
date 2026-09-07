@@ -94,14 +94,15 @@ Per-session bundles (not monthly batches), human-readable, plain files openable 
 
 ```
 ClaudeArchive/
-  catalog.sqlite                  (disaster-recovery copy)
+  catalog-<machine-id>.sqlite     (disaster-recovery copy, one per machine)
   <encoded-project-dir>/
     2026/
-      2026-08-31_fix-auth-redirect_<short-id>.tar.zst
-      2026-08-31_fix-auth-redirect_<short-id>.manifest.json
+      2026-08-31_fix-auth-redirect_<short-id>_<content-hash>.tar.zst
+      2026-08-31_fix-auth-redirect_<short-id>_<content-hash>.manifest.json
 ```
 
-- Filename = date + session-title slug + short session id (titles alone can duplicate and contain invalid characters).
+- Filename = date + session-title slug + short session id + a prefix of the bundle's sha256 (titles alone can duplicate and contain invalid characters; the hash makes the name describe the content, so a replacement can be uploaded before the copy it supersedes is retired).
+- Exactly one manifest per bundle: retiring a superseded bundle retires its manifest with it, or a resumed session leaves a dead manifest on Drive on every re-upload.
 - Manifest per bundle: session id, original cwd, encoded dir, dates, sha256 of each contained file, uncompressed sizes.
 - Year subfolders keep Drive listings sane; the catalog, not Drive listing, is the source of truth for search.
 - Why per-session, not monthly: granular restore (one session ≠ one 100 MB month), resumed sessions re-upload one small file instead of rewriting a batch, and continuous backup uploads sessions individually anyway. Monthly compresses marginally better; a trained zstd dictionary can recover most of that later if wanted.
