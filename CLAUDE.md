@@ -4,12 +4,16 @@ A cross-platform (macOS / Windows / Linux) Claude Code plugin that continuously 
 
 ## Current state
 
-Docs-only phase. No implementation code yet.
+Implemented and running in production on this machine since 2026-09-01. Version
+0.1.3. The full cycle is proven against real data: sessions back up on close,
+hash-verify on Drive, get reaped locally after the retention window, and restore
+byte-for-byte.
 
 - `docs/SPEC.md` — the definitive product specification; it encodes decisions already made with the user.
 - `docs/ARCHITECTURE.md` — technical architecture and code-quality standards for the implementation.
+- `src/` — the implementation, laid out as `docs/ARCHITECTURE.md` describes. `dist/` holds the committed esbuild bundles; CI fails if they drift from `src/`.
 
-Both are imported below and load with every session:
+The two documents are imported below and load with every session:
 
 @docs/SPEC.md
 @docs/ARCHITECTURE.md
